@@ -1,0 +1,170 @@
+# VisControl default configuration.
+# User-edited values are stored in config/local.yaml (gitignored). Local values
+# override these defaults at startup via deep-merge.
+
+app:
+  mode: "demo"             # "demo" or "production"
+  language: "en"           # "en" or "de"
+  active_profile: "Default"
+
+camera:
+  source: "auto"           # auto | basler | mock
+  serial: ""
+  pixel_format: "Mono8"
+
+mock_camera:
+  image_dir: "assets/test_images"
+  fps: 5
+
+# Raw-frame recording for offline calibration. See io/recorder.py.
+capture:
+  output_dir: "captures"
+
+# Recorded-frame playback source for offline calibration. See io/camera.py
+# PlaybackCamera. Switching to playback is done from SERVICE > Frame source;
+# these are just the remembered defaults for that picker.
+playback:
+  folder: ""
+  fps: 5
+  loop: true
+
+orientation:
+  rotation: 0              # 0, 90, 180, 270
+  flip_horizontal: false
+  row_direction: "vertical"
+
+inspection:
+  delay_after_pull_ms: 200
+  fault_clear_frames: 5
+  empty_cloth_threshold: 3
+  empty_cloth_seconds: 30
+  belt_fault_debounce_frames: 3
+  belt_fault_clear_frames: 3
+  tripwire_check_interval: 1
+  belt_check_interval: 1
+  display_detection_interval: 1
+  line_clear_debounce_frames: 3
+  transfer_timeout_ms: 5000
+  unknown_is_fault: false   # FIX 6: True = legacy behavior (every "unknown" blob is a hard fault)
+
+profiles:
+  - name: "Default"
+    expected_area_px: 60000
+    expected_width_px: 290
+    expected_height_px: 290
+    fused_threshold: 1.5
+    noise_threshold: 0.5
+    single_min_ratio: 0.5
+    unknown_max_ratio: 2.5
+    belt_adaptive_block: 0
+    camera_exposure_us: 2000
+    camera_gain: 0
+    roi_split_x: 1768
+    transfer_line_x: 2400
+    dough_is_darker: true
+    belt_dough_is_darker: false
+    belt_min_solidity: 0.80
+    belt_max_aspect_ratio: 3.0
+    circularity_tolerance: 0.7
+    solidity_tolerance: 0.85
+    fused_merge_distance_factor: 1.15
+    transfer_bridge_width_px: 40   # SECTION 4: bridge band width (px), centered on transfer_line_x
+    tripwire_half_width_px: 15
+    tripwire_occupancy_threshold: 0.12
+    tripwire_debounce_frames: 2
+    belt_crop:
+      top: 0
+      bottom: 0
+      left: 0
+      right: 0
+    cloth_crop:
+      top: 0
+      bottom: 0
+      left: 0
+      right: 0
+
+# Cloth-side piece-detection method selection. See viscontrol/detection/classical.py
+# and viscontrol/detection/pipeline.py. Belt detection always uses the classical
+# blob method; only cloth tracking switches with `method`. Change `method` (and
+# restart is NOT required — it's read live every frame) to A/B compare against
+# the default "blob" behavior without removing it.
+detection:
+  method: "blob"            # blob | contour_external | hough | bg_subtract
+  use_row_grouping: false   # cloth side: false = legacy single-line tripwire (unchanged);
+                            # true = group pieces into rows and fire StopTuchabzug once per
+                            # row as each row-line crosses the transfer line (row_grouping.py)
+  row_grouping_gap_diameters: 0.6  # row split tolerance = this × median detected piece
+                                   # diameter. Lower = more rows; higher = fewer. Typical 0.5-1.0
+  grid_columns: 8            # SECTION 6: pieces per row in the loaded grid. Row grouping
+                             # uses this to identify the front/current row (N closest pieces)
+  grid_rows: 0               # SECTION 6: expected rows on the cloth (0 = unknown). Informational.
+  detection_zone_width_px: 600  # pixels of approach-side cloth beyond the bridge where Hough runs;
+                                # 0 = full ROI (no restriction). Outer edge drawn on cloth view.
+  fill_mask_holes: false     # blob-only: pre-fill enclosed mask holes before extraction
+  fill_mask_holes_kernel: 9  # odd, px — morphological-close kernel for the fill step
+  shape_filter:              # SECTION 2: reject non-dough (reflections) by shape+size
+    enabled: true
+    min_circularity: 0.6     # blob/contour roundness floor (Hough returns ideal circles)
+    size_tolerance: 0.4      # accept diameter within (1 ± this) × learned dough diameter
+  band:                      # SECTION 3: only pieces near the transfer line drive stops
+    enabled: true
+    ahead_px: 600            # band reach on the approach side (where pieces arrive)
+    behind_px: 150           # band reach past the transfer line
+  contour_external:
+    min_circularity: 0.55    # 4*pi*area/perimeter^2 floor on the outer contour; 1.0 = perfect circle
+  hough:
+    dp: 1.2                  # inverse ratio of accumulator resolution to image resolution
+    min_dist_px: 0           # minimum center-to-center distance; 0 = auto (~1.6x expected radius)
+    param1: 80.0              # Canny high threshold for the internal edge detector
+    param2: 45.0              # accumulator threshold; raised from 30 (FIX 2) so weak/partial
+                               # circle patterns (mesh texture, reflections) are rejected
+    min_radius_px: 0         # 0 = auto ((1 - radius_tolerance) × expected radius)
+    max_radius_px: 0         # 0 = auto ((1 + radius_tolerance) × expected radius)
+    radius_tolerance: 0.2    # SECTION 2: half-width of the auto radius band as a fraction
+                             # of the expected radius (0.2 → 0.8…1.2). Lower = stricter size gate.
+    gate_to_cloth: true      # FIX 1/3 (HOUGH_GATE_TO_CLOTH): dough only sits on bright cloth,
+                              # never on dark metal grating/mesh — blank that region before Hough
+                              # runs (also the main speed win) and reject any circle centered off it
+    cloth_brightness_threshold: 120  # FIX 1: simple brightness split, cloth (bright) vs metal (dark)
+    downscale_factor: 2.0    # SECTION 1: extra Hough-only downscale on top of max_detect_width.
+                             # 2.0 ≈ 4x fewer pixels → the main speed lever (1.0 = off)
+    hough_interval_ms: 100   # FIX 1: min ms between Hough runs (100 ms = 10 det/s).
+                             # Belt inspection and Hough are staggered to avoid same-frame stacking.
+    cloth_reference_path: ""  # set automatically by the wizard Calibration step ("Save Cloth Reference")
+  bg_subtract:
+    threshold: 30             # pixel intensity diff (0-255) above which a pixel counts as "changed"
+    reference_path: ""        # set automatically when capturing an empty-cloth reference (Service > Detection)
+
+opcua:
+  endpoint: "opc.tcp://0.0.0.0:4840/viscontrol/"
+  namespace: "http://opelka.com/viscontrol"
+
+plc:
+  url: "opc.tcp://192.168.178.150:4840"
+  node_ext_tuchabzug_stop: "ns=6;s=::TUA:fromext_stop_Tuchabzug"
+  node_ext_tuchabzug_status: "ns=6;s=::TUA:toext_Tuchabzug_running"
+  node_ext_error: "ns=6;s=::AsGlobalPV:fromext_Error_idx"
+  node_ext_viscontrol_alive: "ns=6;s=::Signal:fromext_viscontrol_alive"
+  node_ext_error_quit: "ns=6;s=::Signal:toext_Error_quit"
+  node_ext_einlaufband_running: "ns=6;s=::Einlauf:toext_Einlaufband_running"
+  poll_interval_s: 0.1
+  stop_pulse_ms: 100
+  fault_error_code: 2
+  reconnect_delay_s: 2.0
+
+web:
+  enabled: true
+  port: 8080
+  password_hash: ""
+
+ui:
+  service_pin_hash: ""
+  recent_defects_max: 20
+  startup_banner_seconds: 30
+
+storage:
+  log_dir: "logs"
+  defect_image_dir: "logs/defects"
+  app_log_rotation_mb: 10
+  app_log_keep_files: 7
+  csv_log_keep_days: 90

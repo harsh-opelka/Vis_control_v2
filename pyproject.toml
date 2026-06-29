@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "viscontrol"
+version = "1.0.0"
+description = "VisControl — OPELKA dough sheet inspection (Tucheinzug / Tuchabzug visual control)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+authors = [{ name = "OPELKA" }]
+dependencies = [
+    "PySide6>=6.6",
+    "opencv-python-headless>=4.9",
+    "numpy>=1.26",
+    "asyncua>=1.0",
+    "opcua",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "pyyaml",
+    "pydantic>=2.0",
+    "loguru",
+    "pillow",
+    "bcrypt",
+]
+
+[project.optional-dependencies]
+basler = ["pypylon"]
+dev = [
+    "pytest",
+    "pytest-qt",
+    "pytest-asyncio",
+    "ruff",
+    "mypy",
+]
+
+[project.scripts]
+viscontrol = "viscontrol.main:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["viscontrol*"]
+
+[tool.setuptools.package-data]
+viscontrol = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+qt_api = "pyside6"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "N"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+strict_optional = true
+warn_unused_ignores = true
+ignore_missing_imports = true
