@@ -311,9 +311,11 @@ class _Canvas(QWidget):
         radius_px = (max(det.width_px, det.height_px) / 2) * max(sx, sy)
         # Row color overrides label color when grid grouping is active.
         if row_num == 1:
-            color = QColor("#FF2BD6")   # magenta — Row 1 (front row)
+            color = QColor("#FF2BD6")        # magenta — Row 1 (front row)
         elif row_num == 2:
-            color = QColor("#00E5FF")   # cyan — Row 2
+            color = QColor("#00E5FF")        # cyan — Row 2
+        elif row_num == -1:
+            color = QColor(130, 130, 130)    # gray — boundary-excluded (already handled)
         else:
             color = QColor(self._color_for(det.label))
 
@@ -364,7 +366,12 @@ class _Canvas(QWidget):
         r_img = max(det.width_px or 0.0, det.height_px or 0.0) / 2.0
         if r_img > 0:
             x_tang = dx + (cx - r_img) * sx
-            tang_color = QColor("#FF2BD6") if row_num == 1 else QColor(255, 220, 0)
+            if row_num == 1:
+                tang_color = QColor("#FF2BD6")       # magenta
+            elif row_num == -1:
+                tang_color = QColor(130, 130, 130)   # gray — boundary-excluded
+            else:
+                tang_color = QColor(255, 220, 0)     # yellow-gold
             tang_pen = QPen(tang_color)
             tang_pen.setWidth(2)
             p.setPen(tang_pen)

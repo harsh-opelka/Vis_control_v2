@@ -224,6 +224,7 @@ class MainWindow(QMainWindow):
         self._active_row_index: int = 0
         self._row_status: list[str] = ["WAITING"] * max(0, config.detection.grid_rows)
         self._row_advance_pending_log: bool = False  # diagnostic only: set True when row advances
+        self._committed_boundary_x: float | None = None  # leading_edge_x of last fired row; filters leftovers
         self._cycle_partial_warned: bool = False     # True once partial-detection warning logged
         self._cycle_front_row: list = []             # active-row detections (for display + stop)
         self._cycle_row2: list = []                  # next-row detections (for display)
@@ -562,6 +563,7 @@ class MainWindow(QMainWindow):
         self._detection_zone_outer_x = None
         self._active_row_index = 0
         self._row_status = ["WAITING"] * max(0, self._cfg.detection.grid_rows)
+        self._committed_boundary_x = None
         self._cycle_partial_warned = False
         self._cycle_front_row = []
         self._cycle_row2 = []
@@ -701,6 +703,13 @@ class MainWindow(QMainWindow):
                                 "active_row_index=0, row_status reset to {}",
                                 self._row_status,
                             )
+                            _old_bnd = self._committed_boundary_x
+                            self._committed_boundary_x = None
+                            if _old_bnd is not None:
+                                logger.info(
+                                    "Committed boundary RESET: cleared (was {}) for new cycle",
+                                    int(round(_old_bnd)),
+                                )
 
                 # FIX 1: rate-limit Hough to hough_interval_ms between runs.
                 # Stagger: if belt is also due this frame, defer Hough unless it
@@ -954,13 +963,27 @@ class MainWindow(QMainWindow):
             # cloth_detections for coloring in _draw_detection.
             _row_count_display: int | None = None
             if self._cfg.detection.use_row_grouping and cloth_detections:
-                # Count-based grouping (single source of truth with stop decision):
-                # sort by leading_edge_x, slice into groups of grid_columns.
-                _grouped = slice_rows_by_count(cloth_detections, self._cfg.detection.grid_columns)
+                # Count-based grouping with boundary filter (same filter as stop decision).
+                # Excluded pieces (X <= committed_boundary_x) are drawn gray (-1);
+                # only eligible pieces participate in the sort+slice row coloring.
+                _disp_bnd = self._committed_boundary_x
+                _disp_eligible = [
+                    d for d in cloth_detections
+                    if _disp_bnd is None or leading_edge_x(d) > _disp_bnd
+                ]
+                _disp_excluded = [
+                    d for d in cloth_detections
+                    if _disp_bnd is not None and leading_edge_x(d) <= _disp_bnd
+                ]
+                _grouped = slice_rows_by_count(_disp_eligible, self._cfg.detection.grid_columns)
                 _row_count_display = len(_grouped)
                 # Map detection object → index for O(1) lookup; assign row colours.
                 _det_to_idx = {id(det): i for i, det in enumerate(cloth_detections)}
                 _grid_row_asgn: dict[int, int] = {}
+                for _det in _disp_excluded:
+                    _di = _det_to_idx.get(id(_det))
+                    if _di is not None:
+                        _grid_row_asgn[_di] = -1  # gray — boundary-excluded
                 for _gi, _grp in enumerate(_grouped[:2]):
                     for _det in _grp:
                         _di = _det_to_idx.get(id(_det))
@@ -1229,14 +1252,40 @@ class MainWindow(QMainWindow):
 
         grid_cols = self._cfg.detection.grid_columns
         grid_rows = self._cfg.detection.grid_rows
-        grouped_rows = slice_rows_by_count(all_detections, grid_cols)
+
+        # Boundary filter: exclude pieces already handled by a previously-fired row.
+        # Pieces with leading_edge_x <= committed_boundary_x are leftovers from a
+        # row whose stop already fired and must not be regrouped as the new active row.
+        _bnd_x = self._committed_boundary_x
+        _eligible = [d for d in all_detections if _bnd_x is None or leading_edge_x(d) > _bnd_x]
+        _excluded = [d for d in all_detections if _bnd_x is not None and leading_edge_x(d) <= _bnd_x]
+        logger.info(
+            "Boundary filter: {} pieces detected, {} excluded (X<=boundary {}), "
+            "{} eligible for grouping",
+            len(all_detections),
+            len(_excluded),
+            int(round(_bnd_x)) if _bnd_x is not None else "none",
+            len(_eligible),
+        )
+        if _excluded:
+            _all_sorted_for_cand = sorted(all_detections, key=leading_edge_x)
+            _candidate_ids = {id(d) for d in _all_sorted_for_cand[:grid_cols]}
+            for _excl_d in _excluded:
+                if id(_excl_d) in _candidate_ids:
+                    logger.info(
+                        "Boundary filter EXCLUDED piece at X={} from grouping "
+                        "(would have been row candidate)",
+                        int(round(leading_edge_x(_excl_d))),
+                    )
+
+        grouped_rows = slice_rows_by_count(_eligible, grid_cols)
 
         # Sort-slice grouping log (unthrottled — diagnostic).
-        _log_xs = [int(round(leading_edge_x(d))) for d in sorted(all_detections, key=leading_edge_x)]
+        _log_xs = [int(round(leading_edge_x(d))) for d in sorted(_eligible, key=leading_edge_x)]
         _log_groups = [[int(round(leading_edge_x(d))) for d in grp] for grp in grouped_rows]
         logger.info(
             "Sort-slice grouping: {} pieces detected, sorted X={}, sliced into groups_of_{}={}",
-            len(all_detections), _log_xs, grid_cols, _log_groups,
+            len(_eligible), _log_xs, grid_cols, _log_groups,
         )
 
         active_idx = self._active_row_index
@@ -1360,6 +1409,11 @@ class MainWindow(QMainWindow):
                     int(effective_tang_x),
                     transfer_x,
                     self._row_status,
+                )
+                self._committed_boundary_x = effective_tang_x
+                logger.info(
+                    "Committed boundary SET: X={} (row {} fired here)",
+                    int(round(effective_tang_x)), active_idx + 1,
                 )
                 self._sm.handle_stop_tuchabzug_trigger()
                 self._push_signals_to_opcua()
@@ -2000,7 +2054,7 @@ class MainWindow(QMainWindow):
         self._save_cfg()
         self._active_row_index = 0
         self._row_status = ["WAITING"] * max(0, self._cfg.detection.grid_rows)
-
+        self._committed_boundary_x = None
         logger.info("grid rows set to {}", rows)
 
     def _on_row_grouping_changed(self, enabled: bool) -> None:
@@ -2018,7 +2072,7 @@ class MainWindow(QMainWindow):
         self._row_count = 0
         self._active_row_index = 0
         self._row_status = ["WAITING"] * max(0, self._cfg.detection.grid_rows)
-
+        self._committed_boundary_x = None
         self._cycle_partial_warned = False
         self._cycle_front_row = []
         self._cycle_row2 = []
