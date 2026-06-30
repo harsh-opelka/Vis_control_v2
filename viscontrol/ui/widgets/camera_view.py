@@ -228,6 +228,15 @@ class _Canvas(QWidget):
             p.setPen(ref_pen)
             p.drawLine(ref_x, dy - 6, ref_x, dy + pixmap.height() + 6)
 
+        # FIX 1: row count badge — "Rows: N" text only (no row-lines drawn).
+        if state.row_count is not None:
+            font = QFont()
+            font.setPointSize(max(8, FONT_NORMAL))
+            font.setBold(True)
+            p.setFont(font)
+            p.setPen(QColor("#00E5A0"))
+            p.drawText(dx + 8, dy + 20, f"Rows: {state.row_count}")
+
         # Grid label: "Row 1: N | Ref: Xpx" — drawn in yellow-gold at top-left.
         if state.grid_label:
             font = QFont()

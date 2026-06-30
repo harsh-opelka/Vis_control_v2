@@ -341,6 +341,40 @@ class _DetectionSection(BaseModel):
             "row reaches the bridge, not by this count."
         ),
     )
+    max_memory_frames: int = Field(
+        5, ge=0,
+        description=(
+            "USE_ROW_GROUPING only. Number of frames to hold the last known "
+            "front-row leading-edge position when detection drops or returns "
+            "fewer pieces than expected (frame drop fallback). 0 = disabled. "
+            "See MainWindow._apply_tangent_stop_edge."
+        ),
+    )
+    row_x_tolerance_px: int = Field(
+        0, ge=0,
+        description=(
+            "USE_ROW_GROUPING only. Tolerance in pixels for grouping staggered "
+            "pieces into the same row by leading-edge X. 0 = auto (1× detected "
+            "piece diameter). Pieces whose leading_edge_x differs from the "
+            "previous piece by at most this value belong to the same row. Set "
+            "to ~1 piece diameter to absorb stagger within a row while still "
+            "splitting clearly separated rows. Used identically by the stop "
+            "decision and the display coloring (single source of truth)."
+        ),
+    )
+    min_fresh_row_tangent_margin: int = Field(
+        150, ge=0,
+        description=(
+            "USE_ROW_GROUPING only. Minimum distance (px) ABOVE transfer_x that "
+            "the active row's front tangent must be seen at least once before the "
+            "stop-fire condition is armed. Prevents instant-fire on leftover or "
+            "straggler pieces that are already at/past the transfer line when a "
+            "new row becomes active. A newly-active row's fire gate stays closed "
+            "until its tangent exceeds (transfer_x + this margin); after that the "
+            "normal tangent <= transfer_x condition applies. 0 = disabled (no "
+            "fresh-approach requirement)."
+        ),
+    )
     contour_external: _ContourExternalSection = Field(default_factory=_ContourExternalSection)
     hough: _HoughSection = Field(default_factory=_HoughSection)
     bg_subtract: _BgSubtractSection = Field(default_factory=_BgSubtractSection)

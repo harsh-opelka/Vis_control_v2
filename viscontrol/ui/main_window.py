@@ -45,6 +45,7 @@ from viscontrol.detection.classical import ClassicalDetector
 from viscontrol.detection.pipeline import InspectionPipeline
 from viscontrol.detection.row_grouping import (
     RowLineTracker,
+    group_rows,
     leading_edge_x,
     median_piece_diameter,
 )
@@ -217,15 +218,23 @@ class MainWindow(QMainWindow):
         # Detection zone outer boundary (approach-side, cloth-local x), for
         # display; None when zone disabled or detection hasn't run yet.
         self._detection_zone_outer_x: int | None = None
-        # Grid-aware tangent stop (USE_ROW_GROUPING=ON, Option B): per-cycle state.
-        # Reset on every TuchabzugRunning rising edge (via _reset_tracking_session).
-        # No continuous tracking across cycles — each cycle is fully independent.
-        self._cycle_stop_fired: bool = False         # True once stop pulse sent this cycle
+        # Grid-aware tangent stop (USE_ROW_GROUPING=ON): explicit per-row state machine.
+        # _active_row_index advances on TuchabzugRunning rising edge once the active row
+        # is STOPPED. All rows DONE triggers a full-cycle reset.
+        self._active_row_index: int = 0
+        self._row_status: list[str] = ["WAITING"] * max(0, config.detection.grid_rows)
+        self._row_advance_pending_log: bool = False  # diagnostic only: set True when row advances
+        self._row_fresh_seen: bool = False  # True once active row's tangent seen above fresh-margin
         self._cycle_partial_warned: bool = False     # True once partial-detection warning logged
-        self._cycle_front_row: list = []             # Row 1 detections (for display + stop)
-        self._cycle_row2: list = []                  # Row 2 detections (for display)
-        self._cycle_ref_tangent_x: float | None = None  # rightmost Row-1 tangent x
+        self._cycle_front_row: list = []             # active-row detections (for display + stop)
+        self._cycle_row2: list = []                  # next-row detections (for display)
+        self._cycle_ref_tangent_x: float | None = None  # effective active-row leading tangent x
         self._cycle_log_next_time: float = 0.0      # throttle gate for per-cycle state log
+        # FIX 2: position memory fallback (USE_ROW_GROUPING only).
+        # Stores last known active-row leftmost tangent for up to max_memory_frames
+        # frames when detection drops. Cleared on every TuchabzugRunning rising edge.
+        self._last_known_row_leading_x: float | None = None
+        self._memory_frame_count: int = 0
         # DIAGNOSTIC (temporary — two-rows-at-once investigation, see
         # InspectionPipeline.DIAGNOSTIC_ROW_PROFILE). Throttle gate for the
         # ~3 Hz bump/valley log; does not affect detection or tripwire state.
@@ -552,12 +561,16 @@ class MainWindow(QMainWindow):
         self._cached_tripwire_occupied = False
         self._active_bridge_width_px = 0
         self._detection_zone_outer_x = None
-        self._cycle_stop_fired = False
+        self._active_row_index = 0
+        self._row_status = ["WAITING"] * max(0, self._cfg.detection.grid_rows)
+        self._row_fresh_seen = False
         self._cycle_partial_warned = False
         self._cycle_front_row = []
         self._cycle_row2 = []
         self._cycle_ref_tangent_x = None
         self._cycle_log_next_time = 0.0
+        self._last_known_row_leading_x = None
+        self._memory_frame_count = 0
         self._belt_inspect_window_open = False
         self._belt_window_fault_latched = False
         self._clear_sticky_overlay()
@@ -661,7 +674,37 @@ class MainWindow(QMainWindow):
                 if _is_rising_edge:
                     self._reset_tracking_session()
                     if self._cfg.detection.use_row_grouping:
-                        logger.info("Tangent stop: rising edge — cycle reset, re-armed")
+                        _grid_rows = self._cfg.detection.grid_rows
+                        logger.info(
+                            "Row-SM rising edge: active_row={} status_before={}",
+                            self._active_row_index,
+                            self._row_status,
+                        )
+                        if (
+                            self._active_row_index < _grid_rows
+                            and self._row_status[self._active_row_index] == "STOPPED"
+                        ):
+                            _old_idx = self._active_row_index
+                            self._row_status[self._active_row_index] = "DONE"
+                            self._active_row_index += 1
+                            logger.info(
+                                "Row-SM ADVANCE: row {} marked DONE -> "
+                                "new active_row={} row_status={}",
+                                _old_idx + 1,
+                                self._active_row_index,
+                                self._row_status,
+                            )
+                            self._row_advance_pending_log = True
+                            self._row_fresh_seen = False
+                        if self._active_row_index >= _grid_rows:
+                            self._active_row_index = 0
+                            self._row_status = ["WAITING"] * max(0, _grid_rows)
+                            self._row_fresh_seen = False
+                            logger.info(
+                                "Row-SM FULL RESET: all rows complete -> "
+                                "active_row_index=0, row_status reset to {}",
+                                self._row_status,
+                            )
 
                 # FIX 1: rate-limit Hough to hough_interval_ms between runs.
                 # Stagger: if belt is also due this frame, defer Hough unless it
@@ -913,22 +956,31 @@ class MainWindow(QMainWindow):
             )
             # Grid visualization: compute row assignments from current
             # cloth_detections for coloring in _draw_detection.
+            _row_count_display: int | None = None
             if self._cfg.detection.use_row_grouping and cloth_detections:
-                _grid_cols = self._cfg.detection.grid_columns
-                _sorted_idx = sorted(
-                    range(len(cloth_detections)),
-                    key=lambda i: leading_edge_x(cloth_detections[i]),
-                )
+                # Tolerance-based grouping — same algorithm as the stop decision
+                # (single source of truth: both use group_rows with gap_diams).
+                _diam = median_piece_diameter(cloth_detections) or float(profile.expected_width_px)
+                _tol_px = self._cfg.detection.row_x_tolerance_px
+                _gap_diams = (_tol_px / _diam) if (_tol_px > 0 and _diam > 0) else 1.0
+                _grouped = group_rows(cloth_detections, gap_diameters=_gap_diams, piece_diameter=_diam)
+                _row_count_display = len(_grouped)
+                # Map detection object → index for O(1) lookup; assign row colours.
+                _det_to_idx = {id(det): i for i, det in enumerate(cloth_detections)}
                 _grid_row_asgn: dict[int, int] = {}
-                for _rank, _idx in enumerate(_sorted_idx):
-                    if _rank < _grid_cols:
-                        _grid_row_asgn[_idx] = 1
-                    elif _rank < 2 * _grid_cols:
-                        _grid_row_asgn[_idx] = 2
+                for _gi, _grp in enumerate(_grouped[:2]):
+                    for _det in _grp:
+                        _di = _det_to_idx.get(id(_det))
+                        if _di is not None:
+                            _grid_row_asgn[_di] = _gi + 1  # 1 = front/magenta, 2 = second/cyan
                 _ref_x = self._cycle_ref_tangent_x
-                _n1 = sum(1 for v in _grid_row_asgn.values() if v == 1)
                 _ref_lbl = f"{int(_ref_x)}" if _ref_x is not None else "—"
-                _grid_label = f"Row 1: {_n1} | Ref: {_ref_lbl}px"
+                _grs = self._cfg.detection.grid_rows
+                _grid_label = (
+                    f"Active Row: {self._active_row_index + 1}/"
+                    f"{_grs if _grs > 0 else '?'} "
+                    f"| Status: {self._row_status} | Ref: {_ref_lbl}px"
+                )
             else:
                 _grid_row_asgn = None
                 _ref_x = None
@@ -954,10 +1006,10 @@ class MainWindow(QMainWindow):
                 row_profile=_diag_row_profile,
                 row_profile_x_offset=cloth_crop_rect[0],
                 row_profile_scale=_diag_row_profile_scale,
-                # Row-line overlay removed: tangent-stop path draws per-piece
-                # leading-edge lines directly inside _draw_detection.
+                # Tangent-stop path draws per-piece leading-edge lines inside
+                # _draw_detection; vertical row-position lines not shown.
                 row_lines=None,
-                row_count=None,
+                row_count=_row_count_display,
                 # Bridge IS the detection band (FIX 2 unified): don't double-draw
                 # the same region. Pass None so only the bridge overlay renders.
                 detection_band=None,
@@ -1164,17 +1216,16 @@ class MainWindow(QMainWindow):
         return [d for d in detections if x_left <= leading_edge_x(d) <= x_right]
 
     def _apply_tangent_stop_edge(self, r: object, profile: "ProductProfile") -> None:
-        """USE_ROW_GROUPING=ON firing path — Option B (per-cycle, independent).
+        """USE_ROW_GROUPING=ON firing path — explicit per-row state machine.
 
-        On each Hough run within a TuchabzugRunning cycle:
-        1. Sort band-filtered detections by leading_edge_x (smallest = closest
-           to transfer line = most advanced piece).
-        2. Front row = first grid_columns pieces.
-        3. Reference tangent = rightmost (largest leading_edge_x) of Row 1 —
-           the trailing piece. Stop fires when this crosses bridge_right.
-        4. Stop fires at most ONCE per cycle (_cycle_stop_fired gate). The gate
-           is reset by _reset_tracking_session on the next rising edge.
-        5. Row data is stored for live display visualization.
+        Each frame while TuchabzugRunning is True:
+        1. Skip entirely if the cycle is complete (_active_row_index >= grid_rows).
+        2. Look ONLY at grouped_rows[_active_row_index] for the stop decision.
+        3. Fire StopTuchabzug when that row's leftmost tangent <= transfer_x
+           and its status is WAITING; set status to STOPPED.
+        Row advancement (STOPPED -> DONE, index++) happens in the rising-edge
+        handler. Full-cycle reset (index -> 0, all WAITING) also happens there
+        once all rows are DONE.
         """
         transfer_x = float(profile.transfer_line_x - profile.roi_split_x)
         all_detections = r.detections  # type: ignore[attr-defined]
@@ -1182,62 +1233,157 @@ class MainWindow(QMainWindow):
         raw_diameter = median_piece_diameter(all_detections) or float(profile.expected_width_px)
         effective_width = max(float(profile.transfer_bridge_width_px), raw_diameter)
         self._active_bridge_width_px = int(effective_width)
-        bridge_right = transfer_x + effective_width / 2.0
 
-        detections = self._band_filter(all_detections, transfer_x, effective_width)
+        tol_px = self._cfg.detection.row_x_tolerance_px
+        gap_diams = (tol_px / raw_diameter) if (tol_px > 0 and raw_diameter > 0) else 1.0
+        grouped_rows = group_rows(all_detections, gap_diameters=gap_diams, piece_diameter=raw_diameter)
 
-        # Sort by leading edge (ascending = most advanced toward transfer line).
+        grid_rows = self._cfg.detection.grid_rows
+        active_idx = self._active_row_index
+
+        # --- Step 1: cycle complete — skip stop evaluation ---
+        if active_idx >= grid_rows:
+            self._cycle_front_row = []
+            self._cycle_row2 = []
+            self._cycle_ref_tangent_x = None
+            _now_log = time.monotonic()
+            if _now_log >= self._cycle_log_next_time:
+                self._cycle_log_next_time = _now_log + 0.2
+                logger.info(
+                    "Row-SM: cycle already complete, waiting for full reset "
+                    "(active_row_index={} >= grid_rows={})",
+                    active_idx, grid_rows,
+                )
+            return
+
+        # --- Step 2: look ONLY at the active row's group ---
+        # Always use grouped_rows[0]: once the previous row's pieces leave the
+        # cloth the list shrinks, so the current active row is always the
+        # front-most (smallest tangent) group regardless of active_row_index.
+        active_row = grouped_rows[0] if grouped_rows else []
+        row2 = grouped_rows[1] if len(grouped_rows) > 1 else []
+
+        # Partial-detection warning: fires once when active row smaller than expected.
         grid_cols = self._cfg.detection.grid_columns
-        sorted_dets = sorted(detections, key=lambda d: leading_edge_x(d))
-
-        front_row = sorted_dets[:grid_cols] if sorted_dets else []
-        row2 = sorted_dets[grid_cols : 2 * grid_cols] if len(sorted_dets) > grid_cols else []
-
-        # Partial-detection warning: fires once per cycle when total in-band
-        # pieces < expected, NOT when grouping simply assigns fewer to Row 1.
-        if not self._cycle_partial_warned and len(detections) < grid_cols:
+        if not self._cycle_partial_warned and 0 < len(active_row) < grid_cols:
             self._cycle_partial_warned = True
             logger.warning(
-                "Partial detection: expected {} in-band pieces, got {} "
-                "(row1={}, row2={}) — proceeding",
-                grid_cols, len(detections), len(front_row), len(row2),
+                "Partial detection: expected {} pieces in active row {}, got {} "
+                "(groups={}) — proceeding",
+                grid_cols, active_idx, len(active_row), len(grouped_rows),
             )
 
-        ref_tang_x = max(leading_edge_x(d) for d in front_row) if front_row else None
+        # Leftmost tangent of the active row
+        min_tang_x = min(leading_edge_x(d) for d in active_row) if active_row else None
+
+        # ---- DIAGNOSTIC: group-selection tracing ----
+        _dbg_groups_str = "[" + ", ".join(
+            f"(idx={gi}, tangent={int(round(min(leading_edge_x(d) for d in grp)))})"
+            if grp else f"(idx={gi}, tangent=None)"
+            for gi, grp in enumerate(grouped_rows)
+        ) + "]"
+        _dbg_sel_idx: int | str = 0 if grouped_rows else "N/A"
+        _dbg_sel_method = (
+            "grouped_rows[0] (front-most group)"
+            if grouped_rows
+            else "grouped_rows[0] out of range (no groups detected), used []"
+        )
+        if self._row_advance_pending_log:
+            self._row_advance_pending_log = False
+            logger.info(
+                "Row-SM POST-ADVANCE CHECK: active_row_index just became {} "
+                "this frame's all_groups={} about to select using method='{}'",
+                active_idx, _dbg_groups_str, _dbg_sel_method,
+            )
+        logger.info(
+            "Row-SM SELECT DEBUG: active_row_index={} all_groups={} "
+            "selected_group_list_index={} selection_method='{}' fresh_tangent={}",
+            active_idx,
+            _dbg_groups_str,
+            _dbg_sel_idx,
+            _dbg_sel_method,
+            int(round(min_tang_x)) if min_tang_x is not None else "none",
+        )
+        # ---- END DIAGNOSTIC ----
+
+        # Position memory fallback — applied to the active row's tracked position.
+        max_mem = self._cfg.detection.max_memory_frames
+        if min_tang_x is not None:
+            self._last_known_row_leading_x = min_tang_x
+            self._memory_frame_count = 0
+            effective_tang_x = min_tang_x
+            _using_fallback = False
+        elif (
+            self._last_known_row_leading_x is not None
+            and self._memory_frame_count < max_mem
+        ):
+            self._memory_frame_count += 1
+            effective_tang_x = self._last_known_row_leading_x
+            _using_fallback = True
+            logger.info(
+                "Fallback row position: {}px (frame {}/{})",
+                int(self._last_known_row_leading_x),
+                self._memory_frame_count,
+                max_mem,
+            )
+        else:
+            effective_tang_x = None
+            _using_fallback = False
 
         # Update display state (consumed by display block every frame).
-        self._cycle_front_row = front_row
+        self._cycle_front_row = active_row
         self._cycle_row2 = row2
-        self._cycle_ref_tangent_x = ref_tang_x
+        self._cycle_ref_tangent_x = effective_tang_x
 
-        # Throttled state log (~5 Hz) — shows the stop-condition decision each
-        # Hough run so cycle-2+ failures are immediately visible in the log.
+        # Throttled state log (~5 Hz).
         _now_log = time.monotonic()
         if _now_log >= self._cycle_log_next_time:
             self._cycle_log_next_time = _now_log + 0.2
-            _cond = ref_tang_x is not None and ref_tang_x <= bridge_right
             logger.info(
-                "Grid-stop state: "
-                "band={} row1={} row2={} "
-                "ref_x={} bridge_right={:.0f} "
-                "condition={} fired={}",
-                len(detections), len(front_row), len(row2),
-                f"{int(ref_tang_x)}" if ref_tang_x is not None else "—",
-                bridge_right,
-                _cond,
-                self._cycle_stop_fired,
+                "Row-SM state: active_row={} status={} this_row_tangent={} "
+                "transfer_x={:.0f} grid_rows={}",
+                active_idx,
+                self._row_status,
+                f"{int(effective_tang_x)}" if effective_tang_x is not None else "none",
+                transfer_x,
+                grid_rows,
             )
 
-        # One stop per cycle: fires when trailing Row-1 tangent ≤ bridge_right.
-        # Condition is checked every Hough run — no transition required; if the
-        # row starts a cycle already past the bridge it fires on the first frame.
-        if not self._cycle_stop_fired and ref_tang_x is not None:
-            if ref_tang_x <= bridge_right:
-                self._cycle_stop_fired = True
+        # --- Step 3: stop trigger for the active row ---
+        if self._row_status[active_idx] == "WAITING":
+            # Fresh-row guard: a newly-active row must first be seen with its
+            # tangent ABOVE (transfer_x + fresh_margin) at least once before the
+            # fire condition is armed. This rejects straggler/leftover pieces that
+            # are already sitting at or past the transfer line when the row becomes
+            # active. 0 margin disables the guard entirely.
+            _fresh_margin = self._cfg.detection.min_fresh_row_tangent_margin
+            if not self._row_fresh_seen:
+                if effective_tang_x is not None and effective_tang_x > transfer_x + _fresh_margin:
+                    self._row_fresh_seen = True
+                    logger.info(
+                        "Row-SM: fresh row confirmed — tangent {} > transfer_x+margin {:.0f} "
+                        "(active_row={})",
+                        int(effective_tang_x), transfer_x + _fresh_margin, active_idx,
+                    )
+                elif effective_tang_x is not None:
+                    _now_log = time.monotonic()
+                    if _now_log >= self._cycle_log_next_time:
+                        self._cycle_log_next_time = _now_log + 0.2
+                        logger.info(
+                            "Row-SM: rejecting instant-fire for newly active row — "
+                            "tangent {} too close to transfer_x {:.0f} (likely leftover, "
+                            "not fresh row). Waiting for fresh approach.",
+                            int(effective_tang_x), transfer_x,
+                        )
+            if self._row_fresh_seen and effective_tang_x is not None and effective_tang_x <= transfer_x:
+                self._row_status[active_idx] = "STOPPED"
                 logger.info(
-                    "Grid stop: Row 1 ({} pieces) ref tangent {:.0f} ≤ "
-                    "bridge_right {:.0f} → StopTuchabzug",
-                    len(front_row), ref_tang_x, bridge_right,
+                    "Row-SM FIRE: row {} tangent {} <= transfer_x {:.0f} "
+                    "-> StopTuchabzug | row_status={}",
+                    active_idx + 1,
+                    int(effective_tang_x),
+                    transfer_x,
+                    self._row_status,
                 )
                 self._sm.handle_stop_tuchabzug_trigger()
                 self._push_signals_to_opcua()
@@ -1380,6 +1526,13 @@ class MainWindow(QMainWindow):
             else:
                 self._row_phase = RowPhase.IDLE
                 self._line_clear_debounce_count = 0
+        if self._cfg.detection.use_row_grouping:
+            logger.info(
+                "Row-SM pulse reset: StopTuchabzug=False | "
+                "active_row={} status={} (unchanged)",
+                self._active_row_index,
+                self._row_status,
+            )
 
     def _on_simulate_pulse(self) -> None:
         if self._cfg.app.mode != "demo":
@@ -1869,6 +2022,9 @@ class MainWindow(QMainWindow):
         """Persist number-of-rows on the cloth (app-level detection setting)."""
         self._cfg.detection.grid_rows = max(0, rows)
         self._save_cfg()
+        self._active_row_index = 0
+        self._row_status = ["WAITING"] * max(0, self._cfg.detection.grid_rows)
+        self._row_fresh_seen = False
         logger.info("grid rows set to {}", rows)
 
     def _on_row_grouping_changed(self, enabled: bool) -> None:
@@ -1884,11 +2040,15 @@ class MainWindow(QMainWindow):
         self._row_group_stop_active = False
         self._row_lines = []
         self._row_count = 0
-        self._cycle_stop_fired = False
+        self._active_row_index = 0
+        self._row_status = ["WAITING"] * max(0, self._cfg.detection.grid_rows)
+        self._row_fresh_seen = False
         self._cycle_partial_warned = False
         self._cycle_front_row = []
         self._cycle_row2 = []
         self._cycle_ref_tangent_x = None
+        self._last_known_row_leading_x = None
+        self._memory_frame_count = 0
         self._wizard_view.set_detection_settings(self._cfg.detection)
         logger.info("cloth row grouping (per-row stop): {}", "ON" if enabled else "OFF")
 
@@ -2160,16 +2320,17 @@ class MainWindow(QMainWindow):
         self._cached_tripwire_occupied = False
         self._active_bridge_width_px = 0
         self._detection_zone_outer_x = None
-        # Clear the SM stop signal from the previous cycle before re-arming.
-        if self._cycle_stop_fired:
-            self._sm.handle_stop_tuchabzug_clear()
-            self._push_signals_to_opcua()
-        self._cycle_stop_fired = False
+        # USE_ROW_GROUPING: _active_row_index/_row_status state machine persists
+        # across rising edges and is managed in the rising-edge handler (_on_frame).
+        # handle_tuchabzug_falling() already cleared stop_tuchabzug on the falling
+        # edge, so no manual clear is needed here.
         self._cycle_partial_warned = False
         self._cycle_front_row = []
         self._cycle_row2 = []
         self._cycle_ref_tangent_x = None
         self._cycle_log_next_time = 0.0  # log immediately on first Hough run
+        self._last_known_row_leading_x = None  # clear per-cycle position memory
+        self._memory_frame_count = 0
         self._clear_sticky_overlay()
         logger.debug("Tracking session reset — new cycle")
 
