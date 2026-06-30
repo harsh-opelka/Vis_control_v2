@@ -362,6 +362,19 @@ class _DetectionSection(BaseModel):
             "decision and the display coloring (single source of truth)."
         ),
     )
+    boundary_safety_margin_px: int = Field(
+        80, ge=0,
+        description=(
+            "USE_ROW_GROUPING only. Minimum distance (px) that committed_boundary_x "
+            "must stay BEHIND transfer_x. When a row fires, the boundary is set to "
+            "min(fired_tangent_x, transfer_x - boundary_safety_margin_px). This "
+            "prevents the boundary from overlapping the fire zone of the next row "
+            "when the previous row fired very close to the transfer line. "
+            "~half a dough diameter (default 80px) ensures the next row's pieces "
+            "are never excluded at the instant they would otherwise satisfy the "
+            "tangent <= transfer_x fire condition. 0 = no safety cap."
+        ),
+    )
     contour_external: _ContourExternalSection = Field(default_factory=_ContourExternalSection)
     hough: _HoughSection = Field(default_factory=_HoughSection)
     bg_subtract: _BgSubtractSection = Field(default_factory=_BgSubtractSection)

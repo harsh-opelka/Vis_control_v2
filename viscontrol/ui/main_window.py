@@ -1410,10 +1410,14 @@ class MainWindow(QMainWindow):
                     transfer_x,
                     self._row_status,
                 )
-                self._committed_boundary_x = effective_tang_x
+                _safety = self._cfg.detection.boundary_safety_margin_px
+                _capped_bnd = min(effective_tang_x, transfer_x - _safety)
+                self._committed_boundary_x = _capped_bnd
                 logger.info(
-                    "Committed boundary SET: X={} (row {} fired here)",
-                    int(round(effective_tang_x)), active_idx + 1,
+                    "Committed boundary SET: X={} (row {} fired at tangent={}, "
+                    "transfer_x={:.0f}, capped to transfer_x - {})",
+                    int(round(_capped_bnd)), active_idx + 1,
+                    int(effective_tang_x), transfer_x, _safety,
                 )
                 self._sm.handle_stop_tuchabzug_trigger()
                 self._push_signals_to_opcua()

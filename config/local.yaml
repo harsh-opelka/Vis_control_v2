@@ -1,0 +1,141 @@
+app:
+  mode: production
+  language: en
+  active_profile: Default
+camera:
+  source: auto
+  serial: ''
+  pixel_format: Mono8
+mock_camera:
+  image_dir: assets/test_images
+  fps: 5.0
+capture:
+  output_dir: captures
+playback:
+  folder: C:/Users/harshkumar.rai/PyCharmMiscProject/Vis_control/viscontrol/captures/20260625_100957
+  fps: 5.0
+  loop: true
+orientation:
+  rotation: 270
+  flip_horizontal: true
+  row_direction: vertical
+inspection:
+  delay_after_pull_ms: 200
+  fault_clear_frames: 5
+  empty_cloth_threshold: 3
+  empty_cloth_seconds: 30
+  inspection_overlay_hold_seconds: 3.0
+  belt_fault_debounce_frames: 3
+  belt_fault_clear_frames: 3
+  tripwire_check_interval: 1
+  belt_check_interval: 1
+  display_detection_interval: 1
+  line_clear_debounce_frames: 3
+  transfer_timeout_ms: 5000
+  unknown_is_fault: false
+detection:
+  method: hough
+  use_row_grouping: true
+  row_grouping_gap_diameters: 0.6
+  fill_mask_holes: false
+  fill_mask_holes_kernel: 9
+  grid_columns: 4
+  detection_zone_width_px: 1000
+  grid_rows: 2
+  max_memory_frames: 5
+  row_x_tolerance_px: 0
+  contour_external:
+    min_circularity: 0.55
+  hough:
+    dp: 1.2
+    min_dist_px: 0
+    param1: 80.0
+    param2: 38.0
+    min_radius_px: 0
+    max_radius_px: 0
+    radius_tolerance: 0.2
+    gate_to_cloth: true
+    cloth_brightness_threshold: 112
+    downscale_factor: 2.0
+    hough_interval_ms: 100
+    cloth_reference_path: C:\Users\harshkumar.rai\PyCharmMiscProject\Vis_control_v2\config\cloth_reference_mask.png
+  bg_subtract:
+    threshold: 30
+    reference_path: C:\Users\harshkumar.rai\PyCharmMiscProject\Vis_control\config\bg_reference_cloth.png
+  shape_filter:
+    enabled: true
+    min_circularity: 0.6
+    size_tolerance: 0.4
+  band:
+    enabled: true
+    ahead_px: 600
+    behind_px: 150
+profiles:
+- name: Default
+  expected_area_px: 60000
+  expected_width_px: 290
+  expected_height_px: 290
+  fused_threshold: 1.4
+  noise_threshold: 0.617
+  single_min_ratio: 0.5
+  unknown_max_ratio: 2.5
+  belt_adaptive_block: 0
+  camera_exposure_us: 10000
+  camera_gain: 0.0
+  roi_split_x: 1859
+  transfer_line_x: 1977
+  dough_is_darker: true
+  belt_crop:
+    top: 372
+    bottom: 810
+    left: 883
+    right: 64
+  cloth_crop:
+    top: 286
+    bottom: 838
+    left: 70
+    right: 0
+  belt_dough_is_darker: false
+  belt_min_solidity: 0.8
+  belt_max_aspect_ratio: 3.0
+  ref_circularity_mean: 0.0
+  ref_circularity_min: 0.0
+  ref_solidity_mean: 0.0
+  ref_solidity_min: 0.0
+  circularity_tolerance: 0.7
+  solidity_tolerance: 0.85
+  fused_merge_distance_factor: 1.15
+  dilation_kernel_size: 5
+  transfer_bridge_width_px: 90
+  tripwire_half_width_px: 15
+  tripwire_occupancy_threshold: 0.12
+  tripwire_debounce_frames: 2
+opcua:
+  endpoint: opc.tcp://0.0.0.0:4840/viscontrol/
+  namespace: http://opelka.com/viscontrol
+web:
+  enabled: false
+  port: 8126
+  password_hash: ''
+ui:
+  service_pin_hash: $2b$10$d7wg1eJVhSFmkanVPG4QG.5QWHMdoTVSUgQ7eMS20WPehHSGHLvIG
+  recent_defects_max: 20
+  startup_banner_seconds: 30
+storage:
+  log_dir: logs
+  defect_image_dir: logs/defects
+  app_log_rotation_mb: 10
+  app_log_keep_files: 7
+  csv_log_keep_days: 90
+plc:
+  url: opc.tcp://192.168.224.100:4840
+  node_ext_tuchabzug_stop: ns=6;s=::TUA:fromext_stop_Tuchabzug
+  node_ext_tuchabzug_status: ns=6;s=::TUA:toext_Tuchabzug_running
+  node_ext_error: ns=6;s=::AsGlobalPV:fromext_Error_idx
+  node_ext_viscontrol_alive: ns=6;s=::Signal:fromext_viscontrol_alive
+  node_ext_error_quit: ns=6;s=::Signal:toext_Error_quit
+  node_ext_einlaufband_running: ns=6;s=::Einlauf:toext_Einlaufband_running
+  poll_interval_s: 0.1
+  stop_pulse_ms: 100
+  fault_error_code: 2
+  reconnect_delay_s: 2.0

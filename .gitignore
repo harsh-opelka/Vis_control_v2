@@ -41,7 +41,7 @@ logs/*.log
 logs/*.csv
 logs/defects/
 logs/shutdown.marker
-config/local.yaml
+#config/local.yaml
 
 # Tests
 .pytest_cache/
