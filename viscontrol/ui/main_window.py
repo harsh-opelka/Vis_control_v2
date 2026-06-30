@@ -45,9 +45,9 @@ from viscontrol.detection.classical import ClassicalDetector
 from viscontrol.detection.pipeline import InspectionPipeline
 from viscontrol.detection.row_grouping import (
     RowLineTracker,
-    group_rows,
     leading_edge_x,
     median_piece_diameter,
+    slice_rows_by_count,
 )
 from viscontrol.io.camera import OrientationTransform, PlaybackCamera, make_camera
 from viscontrol.io.recorder import FrameRecorder
@@ -224,7 +224,6 @@ class MainWindow(QMainWindow):
         self._active_row_index: int = 0
         self._row_status: list[str] = ["WAITING"] * max(0, config.detection.grid_rows)
         self._row_advance_pending_log: bool = False  # diagnostic only: set True when row advances
-        self._row_fresh_seen: bool = False  # True once active row's tangent seen above fresh-margin
         self._cycle_partial_warned: bool = False     # True once partial-detection warning logged
         self._cycle_front_row: list = []             # active-row detections (for display + stop)
         self._cycle_row2: list = []                  # next-row detections (for display)
@@ -563,7 +562,6 @@ class MainWindow(QMainWindow):
         self._detection_zone_outer_x = None
         self._active_row_index = 0
         self._row_status = ["WAITING"] * max(0, self._cfg.detection.grid_rows)
-        self._row_fresh_seen = False
         self._cycle_partial_warned = False
         self._cycle_front_row = []
         self._cycle_row2 = []
@@ -695,11 +693,9 @@ class MainWindow(QMainWindow):
                                 self._row_status,
                             )
                             self._row_advance_pending_log = True
-                            self._row_fresh_seen = False
                         if self._active_row_index >= _grid_rows:
                             self._active_row_index = 0
                             self._row_status = ["WAITING"] * max(0, _grid_rows)
-                            self._row_fresh_seen = False
                             logger.info(
                                 "Row-SM FULL RESET: all rows complete -> "
                                 "active_row_index=0, row_status reset to {}",
@@ -958,12 +954,9 @@ class MainWindow(QMainWindow):
             # cloth_detections for coloring in _draw_detection.
             _row_count_display: int | None = None
             if self._cfg.detection.use_row_grouping and cloth_detections:
-                # Tolerance-based grouping — same algorithm as the stop decision
-                # (single source of truth: both use group_rows with gap_diams).
-                _diam = median_piece_diameter(cloth_detections) or float(profile.expected_width_px)
-                _tol_px = self._cfg.detection.row_x_tolerance_px
-                _gap_diams = (_tol_px / _diam) if (_tol_px > 0 and _diam > 0) else 1.0
-                _grouped = group_rows(cloth_detections, gap_diameters=_gap_diams, piece_diameter=_diam)
+                # Count-based grouping (single source of truth with stop decision):
+                # sort by leading_edge_x, slice into groups of grid_columns.
+                _grouped = slice_rows_by_count(cloth_detections, self._cfg.detection.grid_columns)
                 _row_count_display = len(_grouped)
                 # Map detection object → index for O(1) lookup; assign row colours.
                 _det_to_idx = {id(det): i for i, det in enumerate(cloth_detections)}
@@ -1234,11 +1227,18 @@ class MainWindow(QMainWindow):
         effective_width = max(float(profile.transfer_bridge_width_px), raw_diameter)
         self._active_bridge_width_px = int(effective_width)
 
-        tol_px = self._cfg.detection.row_x_tolerance_px
-        gap_diams = (tol_px / raw_diameter) if (tol_px > 0 and raw_diameter > 0) else 1.0
-        grouped_rows = group_rows(all_detections, gap_diameters=gap_diams, piece_diameter=raw_diameter)
-
+        grid_cols = self._cfg.detection.grid_columns
         grid_rows = self._cfg.detection.grid_rows
+        grouped_rows = slice_rows_by_count(all_detections, grid_cols)
+
+        # Sort-slice grouping log (unthrottled — diagnostic).
+        _log_xs = [int(round(leading_edge_x(d))) for d in sorted(all_detections, key=leading_edge_x)]
+        _log_groups = [[int(round(leading_edge_x(d))) for d in grp] for grp in grouped_rows]
+        logger.info(
+            "Sort-slice grouping: {} pieces detected, sorted X={}, sliced into groups_of_{}={}",
+            len(all_detections), _log_xs, grid_cols, _log_groups,
+        )
+
         active_idx = self._active_row_index
 
         # --- Step 1: cycle complete — skip stop evaluation ---
@@ -1351,31 +1351,7 @@ class MainWindow(QMainWindow):
 
         # --- Step 3: stop trigger for the active row ---
         if self._row_status[active_idx] == "WAITING":
-            # Fresh-row guard: a newly-active row must first be seen with its
-            # tangent ABOVE (transfer_x + fresh_margin) at least once before the
-            # fire condition is armed. This rejects straggler/leftover pieces that
-            # are already sitting at or past the transfer line when the row becomes
-            # active. 0 margin disables the guard entirely.
-            _fresh_margin = self._cfg.detection.min_fresh_row_tangent_margin
-            if not self._row_fresh_seen:
-                if effective_tang_x is not None and effective_tang_x > transfer_x + _fresh_margin:
-                    self._row_fresh_seen = True
-                    logger.info(
-                        "Row-SM: fresh row confirmed — tangent {} > transfer_x+margin {:.0f} "
-                        "(active_row={})",
-                        int(effective_tang_x), transfer_x + _fresh_margin, active_idx,
-                    )
-                elif effective_tang_x is not None:
-                    _now_log = time.monotonic()
-                    if _now_log >= self._cycle_log_next_time:
-                        self._cycle_log_next_time = _now_log + 0.2
-                        logger.info(
-                            "Row-SM: rejecting instant-fire for newly active row — "
-                            "tangent {} too close to transfer_x {:.0f} (likely leftover, "
-                            "not fresh row). Waiting for fresh approach.",
-                            int(effective_tang_x), transfer_x,
-                        )
-            if self._row_fresh_seen and effective_tang_x is not None and effective_tang_x <= transfer_x:
+            if effective_tang_x is not None and effective_tang_x <= transfer_x:
                 self._row_status[active_idx] = "STOPPED"
                 logger.info(
                     "Row-SM FIRE: row {} tangent {} <= transfer_x {:.0f} "
@@ -2024,7 +2000,7 @@ class MainWindow(QMainWindow):
         self._save_cfg()
         self._active_row_index = 0
         self._row_status = ["WAITING"] * max(0, self._cfg.detection.grid_rows)
-        self._row_fresh_seen = False
+
         logger.info("grid rows set to {}", rows)
 
     def _on_row_grouping_changed(self, enabled: bool) -> None:
@@ -2042,7 +2018,7 @@ class MainWindow(QMainWindow):
         self._row_count = 0
         self._active_row_index = 0
         self._row_status = ["WAITING"] * max(0, self._cfg.detection.grid_rows)
-        self._row_fresh_seen = False
+
         self._cycle_partial_warned = False
         self._cycle_front_row = []
         self._cycle_row2 = []

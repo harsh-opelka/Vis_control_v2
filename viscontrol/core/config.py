@@ -362,19 +362,6 @@ class _DetectionSection(BaseModel):
             "decision and the display coloring (single source of truth)."
         ),
     )
-    min_fresh_row_tangent_margin: int = Field(
-        150, ge=0,
-        description=(
-            "USE_ROW_GROUPING only. Minimum distance (px) ABOVE transfer_x that "
-            "the active row's front tangent must be seen at least once before the "
-            "stop-fire condition is armed. Prevents instant-fire on leftover or "
-            "straggler pieces that are already at/past the transfer line when a "
-            "new row becomes active. A newly-active row's fire gate stays closed "
-            "until its tangent exceeds (transfer_x + this margin); after that the "
-            "normal tangent <= transfer_x condition applies. 0 = disabled (no "
-            "fresh-approach requirement)."
-        ),
-    )
     contour_external: _ContourExternalSection = Field(default_factory=_ContourExternalSection)
     hough: _HoughSection = Field(default_factory=_HoughSection)
     bg_subtract: _BgSubtractSection = Field(default_factory=_BgSubtractSection)

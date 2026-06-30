@@ -130,6 +130,31 @@ def group_rows(
     return rows
 
 
+def slice_rows_by_count(
+    detections: Sequence[Any],
+    columns: int,
+) -> list[list[Any]]:
+    """Sort detections by leading_edge_x then slice into equal-count row groups.
+
+    Row 0 = the first ``columns`` pieces (smallest leading_edge_x = closest to
+    the transfer line), Row 1 = the next ``columns``, etc.
+
+    Works correctly when rows are touching or overlapping in X, because grouping
+    uses COUNT not distance — no tolerance threshold involved. Only the sort order
+    and ``columns`` matter.
+
+    Partial last group (fewer than ``columns`` pieces) is returned as-is — the
+    caller's existing partial-detection logic handles that case.
+    Returns an empty list when there are no detections. ``columns`` <= 0 → 1.
+    """
+    items = list(detections)
+    if not items:
+        return []
+    items.sort(key=leading_edge_x)
+    n = max(1, columns)
+    return [items[i : i + n] for i in range(0, len(items), n)]
+
+
 def row_leading_edge(row: Sequence[Any]) -> float:
     """Representative leading-edge travel position of a row (median of members,
     robust to one outlier piece)."""
