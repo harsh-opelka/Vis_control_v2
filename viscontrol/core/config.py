@@ -375,6 +375,20 @@ class _DetectionSection(BaseModel):
             "tangent <= transfer_x fire condition. 0 = no safety cap."
         ),
     )
+    post_reset_fresh_margin_px: int = Field(
+        200, ge=0,
+        description=(
+            "USE_ROW_GROUPING only. After a FULL RESET (all rows complete, "
+            "active_row_index back to 0), the first fire of the new cycle is "
+            "gated: the active row's tangent must be seen ABOVE "
+            "(transfer_x + this margin) at least once before it can fire. "
+            "This prevents leftover/straggler pieces from the just-completed "
+            "cycle from instant-firing as the new Row 1. Does NOT apply after "
+            "a mid-cycle ADVANCE — Row 2+ can fire immediately. "
+            "~1–2 dough diameters (default 200px) is recommended. "
+            "0 = disabled (no post-reset gate)."
+        ),
+    )
     contour_external: _ContourExternalSection = Field(default_factory=_ContourExternalSection)
     hough: _HoughSection = Field(default_factory=_HoughSection)
     bg_subtract: _BgSubtractSection = Field(default_factory=_BgSubtractSection)

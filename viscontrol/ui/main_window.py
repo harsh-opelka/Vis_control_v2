@@ -225,6 +225,12 @@ class MainWindow(QMainWindow):
         self._row_status: list[str] = ["WAITING"] * max(0, config.detection.grid_rows)
         self._row_advance_pending_log: bool = False  # diagnostic only: set True when row advances
         self._committed_boundary_x: float | None = None  # leading_edge_x of last fired row; filters leftovers
+        self._post_reset_pending: bool = False  # True after FULL RESET; gates first fire until fresh approach seen
+        # Immediate-switch anchor: set the moment a row fires so the NEXT row is
+        # tracked by position (not by blind sort-order) starting the same frame.
+        # None = use normal front-most-group mode; not None = anchor-proximity mode.
+        self._tracked_anchor_x: float | None = None   # last known X of the row we're tracking
+        self._tracked_anchor_idx: int | None = None   # _row_status index for the anchor-tracked row
         self._cycle_partial_warned: bool = False     # True once partial-detection warning logged
         self._cycle_front_row: list = []             # active-row detections (for display + stop)
         self._cycle_row2: list = []                  # next-row detections (for display)
@@ -564,6 +570,9 @@ class MainWindow(QMainWindow):
         self._active_row_index = 0
         self._row_status = ["WAITING"] * max(0, self._cfg.detection.grid_rows)
         self._committed_boundary_x = None
+        self._post_reset_pending = False
+        self._tracked_anchor_x = None
+        self._tracked_anchor_idx = None
         self._cycle_partial_warned = False
         self._cycle_front_row = []
         self._cycle_row2 = []
@@ -698,9 +707,13 @@ class MainWindow(QMainWindow):
                         if self._active_row_index >= _grid_rows:
                             self._active_row_index = 0
                             self._row_status = ["WAITING"] * max(0, _grid_rows)
+                            self._post_reset_pending = True
+                            self._tracked_anchor_x = None
+                            self._tracked_anchor_idx = None
                             logger.info(
                                 "Row-SM FULL RESET: all rows complete -> "
-                                "active_row_index=0, row_status reset to {}",
+                                "active_row_index=0, row_status reset to {}; "
+                                "post_reset_pending=True (fresh approach required before next fire)",
                                 self._row_status,
                             )
                             _old_bnd = self._committed_boundary_x
@@ -1305,12 +1318,26 @@ class MainWindow(QMainWindow):
                 )
             return
 
-        # --- Step 2: look ONLY at the active row's group ---
-        # Always use grouped_rows[0]: once the previous row's pieces leave the
-        # cloth the list shrinks, so the current active row is always the
-        # front-most (smallest tangent) group regardless of active_row_index.
-        active_row = grouped_rows[0] if grouped_rows else []
-        row2 = grouped_rows[1] if len(grouped_rows) > 1 else []
+        # --- Step 2: select the active row group ---
+        # In anchor mode (set immediately when a row fires): find the eligible group
+        # whose front tangent is closest to where the tracked row was last seen.
+        # This keeps us following the SAME physical row as the cloth moves, instead
+        # of whatever happens to sort into "first N pieces" each fresh frame.
+        # In normal mode (fresh cycle or no active anchor): use the front-most group.
+        if self._tracked_anchor_x is not None and grouped_rows:
+            active_row = min(
+                grouped_rows,
+                key=lambda g: abs(min(leading_edge_x(d) for d in g) - self._tracked_anchor_x)
+                if g
+                else float("inf"),
+            )
+            _new_anchor = min(leading_edge_x(d) for d in active_row) if active_row else None
+            if _new_anchor is not None:
+                self._tracked_anchor_x = _new_anchor  # follow the group as it moves
+            row2 = []  # no "second group" in anchor mode; display shows tracked row only
+        else:
+            active_row = grouped_rows[0] if grouped_rows else []
+            row2 = grouped_rows[1] if len(grouped_rows) > 1 else []
 
         # Partial-detection warning: fires once when active row smaller than expected.
         grid_cols = self._cfg.detection.grid_columns
@@ -1331,12 +1358,21 @@ class MainWindow(QMainWindow):
             if grp else f"(idx={gi}, tangent=None)"
             for gi, grp in enumerate(grouped_rows)
         ) + "]"
-        _dbg_sel_idx: int | str = 0 if grouped_rows else "N/A"
-        _dbg_sel_method = (
-            "grouped_rows[0] (front-most group)"
-            if grouped_rows
-            else "grouped_rows[0] out of range (no groups detected), used []"
-        )
+        _dbg_sel_idx: int | str
+        _dbg_sel_method: str
+        if self._tracked_anchor_x is not None:
+            _dbg_sel_idx = "anchor"
+            _dbg_sel_method = (
+                f"anchor-proximity (anchor={int(round(self._tracked_anchor_x))}, tracking row_idx={self._tracked_anchor_idx})"
+                if grouped_rows
+                else "anchor mode but no groups detected, used []"
+            )
+        elif grouped_rows:
+            _dbg_sel_idx = 0
+            _dbg_sel_method = "grouped_rows[0] (front-most group)"
+        else:
+            _dbg_sel_idx = "N/A"
+            _dbg_sel_method = "grouped_rows[0] out of range (no groups detected), used []"
         if self._row_advance_pending_log:
             self._row_advance_pending_log = False
             logger.info(
@@ -1397,15 +1433,55 @@ class MainWindow(QMainWindow):
                 transfer_x,
                 grid_rows,
             )
+            if self._tracked_anchor_x is not None:
+                logger.info(
+                    "Row-SM TRACK: following Row {}, current tangent={}, transfer_x={:.0f}",
+                    (self._tracked_anchor_idx or 0) + 1,
+                    int(effective_tang_x) if effective_tang_x is not None else "none",
+                    transfer_x,
+                )
 
         # --- Step 3: stop trigger for the active row ---
-        if self._row_status[active_idx] == "WAITING":
-            if effective_tang_x is not None and effective_tang_x <= transfer_x:
-                self._row_status[active_idx] = "STOPPED"
+        # In anchor mode _fire_idx differs from active_row_index: we fire against
+        # the tracked row's status slot, not the SM's current slot, so Row 2 can
+        # fire even before the next TuchabzugRunning rising edge formally advances
+        # the SM. The SM still advances on rising edges as before (bookkeeping).
+        _fire_idx = (
+            self._tracked_anchor_idx
+            if self._tracked_anchor_idx is not None
+            else active_idx
+        )
+        if _fire_idx < len(self._row_status) and self._row_status[_fire_idx] == "WAITING":
+            # Post-reset guard: only in normal mode (anchor only activates mid-cycle,
+            # never right after a FULL RESET, so the guard is never needed there).
+            _allow_fire = True
+            if self._tracked_anchor_idx is None and self._post_reset_pending and effective_tang_x is not None:
+                _pr_threshold = transfer_x + self._cfg.detection.post_reset_fresh_margin_px
+                if effective_tang_x > _pr_threshold:
+                    self._post_reset_pending = False
+                    logger.info(
+                        "Post-reset: fresh row confirmed — tangent {} > {:.0f} "
+                        "(active_row={}), fire gate now open",
+                        int(effective_tang_x), _pr_threshold, active_idx,
+                    )
+                    # tangent > threshold > transfer_x — won't fire this frame but
+                    # _allow_fire stays True so subsequent frames fire normally
+                else:
+                    _allow_fire = False
+                    _now_log = time.monotonic()
+                    if _now_log >= self._cycle_log_next_time:
+                        self._cycle_log_next_time = _now_log + 0.2
+                        logger.info(
+                            "Post-reset: rejecting instant-fire, tangent {} not yet "
+                            "confirmed fresh (need > {:.0f})",
+                            int(effective_tang_x), _pr_threshold,
+                        )
+            if _allow_fire and effective_tang_x is not None and effective_tang_x <= transfer_x:
+                self._row_status[_fire_idx] = "STOPPED"
                 logger.info(
                     "Row-SM FIRE: row {} tangent {} <= transfer_x {:.0f} "
                     "-> StopTuchabzug | row_status={}",
-                    active_idx + 1,
+                    _fire_idx + 1,
                     int(effective_tang_x),
                     transfer_x,
                     self._row_status,
@@ -1416,9 +1492,44 @@ class MainWindow(QMainWindow):
                 logger.info(
                     "Committed boundary SET: X={} (row {} fired at tangent={}, "
                     "transfer_x={:.0f}, capped to transfer_x - {})",
-                    int(round(_capped_bnd)), active_idx + 1,
+                    int(round(_capped_bnd)), _fire_idx + 1,
                     int(effective_tang_x), transfer_x, _safety,
                 )
+
+                # Immediately switch tracking to the next row in the SAME frame.
+                if self._tracked_anchor_idx is None:
+                    # Normal (non-anchor) fire: Row N just fired — capture Row N+1's
+                    # position from this frame's grouping (row2 = grouped_rows[1]).
+                    _next_idx = _fire_idx + 1
+                    _next_anchor = (
+                        min(leading_edge_x(d) for d in row2) if row2 else None
+                    )
+                    if _next_anchor is not None and _next_idx < len(self._row_status):
+                        self._tracked_anchor_x = _next_anchor
+                        self._tracked_anchor_idx = _next_idx
+                        logger.info(
+                            "Row-SM SWITCH: Row {} fired -> immediately switching active "
+                            "reference to Row {} (captured tangent={})",
+                            _fire_idx + 1, _next_idx + 1, int(_next_anchor),
+                        )
+                        # Same-frame display switch: show Row 2's red line immediately.
+                        self._cycle_front_row = row2
+                        self._cycle_ref_tangent_x = _next_anchor
+                    else:
+                        logger.info(
+                            "Row-SM SWITCH: Row {} fired -> Row {} not detected this "
+                            "frame; will pick up by anchor on next frame",
+                            _fire_idx + 1, _fire_idx + 2,
+                        )
+                else:
+                    # Anchor-tracked row fired: clear anchor; SM advances on next rising edge.
+                    logger.info(
+                        "Row-SM TRACK DONE: Row {} (anchor-tracked) fired, anchor cleared",
+                        _fire_idx + 1,
+                    )
+                    self._tracked_anchor_x = None
+                    self._tracked_anchor_idx = None
+
                 self._sm.handle_stop_tuchabzug_trigger()
                 self._push_signals_to_opcua()
                 self._request_plc_stop_pulse()
@@ -2059,6 +2170,9 @@ class MainWindow(QMainWindow):
         self._active_row_index = 0
         self._row_status = ["WAITING"] * max(0, self._cfg.detection.grid_rows)
         self._committed_boundary_x = None
+        self._post_reset_pending = False
+        self._tracked_anchor_x = None
+        self._tracked_anchor_idx = None
         logger.info("grid rows set to {}", rows)
 
     def _on_row_grouping_changed(self, enabled: bool) -> None:
@@ -2077,6 +2191,9 @@ class MainWindow(QMainWindow):
         self._active_row_index = 0
         self._row_status = ["WAITING"] * max(0, self._cfg.detection.grid_rows)
         self._committed_boundary_x = None
+        self._post_reset_pending = False
+        self._tracked_anchor_x = None
+        self._tracked_anchor_idx = None
         self._cycle_partial_warned = False
         self._cycle_front_row = []
         self._cycle_row2 = []

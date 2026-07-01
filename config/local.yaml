@@ -41,9 +41,11 @@ detection:
   fill_mask_holes_kernel: 9
   grid_columns: 4
   detection_zone_width_px: 1000
-  grid_rows: 2
+  grid_rows: 3
   max_memory_frames: 5
   row_x_tolerance_px: 0
+  boundary_safety_margin_px: 80
+  post_reset_fresh_margin_px: 200
   contour_external:
     min_circularity: 0.55
   hough:
