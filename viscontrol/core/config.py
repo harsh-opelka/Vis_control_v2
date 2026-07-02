@@ -79,6 +79,16 @@ class _InspectionSection(BaseModel):
     display_detection_interval: int = Field(1, ge=1)
     line_clear_debounce_frames: int = Field(3, ge=1)
     transfer_timeout_ms: int = Field(5000, ge=100)
+    belt_detection_enabled: bool = Field(
+        True,
+        description=(
+            "Debug toggle: when False, the belt inspection window never opens, "
+            "no belt-side detection or fault debounce runs, and belt processing "
+            "is skipped entirely in the frame loop. Cloth ROI detection and row-"
+            "stop logic are unaffected. Runtime-only — see MainWindow's "
+            "'Belt detection' checkbox (Service > Diagnostics)."
+        ),
+    )
     unknown_is_fault: bool = Field(
         False,
         description=(
@@ -373,6 +383,14 @@ class _DetectionSection(BaseModel):
             "~half a dough diameter (default 80px) ensures the next row's pieces "
             "are never excluded at the instant they would otherwise satisfy the "
             "tangent <= transfer_x fire condition. 0 = no safety cap."
+        ),
+    )
+    boundary_offset_px: int = Field(
+        30, ge=0,
+        description=(
+            "USE_ROW_GROUPING only. Added to the fired tangent when setting "
+            "committed_boundary_x: boundary = fired_tangent_x + boundary_offset_px. "
+            "0 = boundary sits exactly at the fired tangent."
         ),
     )
     post_reset_fresh_margin_px: int = Field(

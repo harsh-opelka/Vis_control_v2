@@ -45,6 +45,7 @@ inspection:
   display_detection_interval: 1
   line_clear_debounce_frames: 3
   transfer_timeout_ms: 5000
+  belt_detection_enabled: true   # debug toggle: false disables all belt-side detection/inspection
   unknown_is_fault: false   # FIX 6: True = legacy behavior (every "unknown" blob is a hard fault)
 
 profiles:

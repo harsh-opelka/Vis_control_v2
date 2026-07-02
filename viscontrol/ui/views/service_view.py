@@ -87,6 +87,7 @@ class ServiceView(QWidget):
     belt_dough_is_darker_changed = Signal(bool)
     show_belt_mask_changed = Signal(bool)
     show_cloth_mask_changed = Signal(bool)
+    belt_detection_enabled_changed = Signal(bool)
     # Cloth-side alternative detection methods (A/B comparison). See
     # core/config.py _DetectionSection and detection/pipeline.py run_cloth_tracking.
     detection_method_changed = Signal(str)   # "blob" | "contour_external" | "hough" | "bg_subtract"
@@ -453,6 +454,20 @@ class ServiceView(QWidget):
 
     def _build_diagnostics_section(self) -> QWidget:
         card, form = self._section_card(self.tr("Diagnostics"))
+        self._belt_detection_check = QCheckBox(self.tr("Belt detection"))
+        self._belt_detection_check.setToolTip(
+            self.tr(
+                "Debug toggle. Unchecking disables belt inspection entirely: "
+                "the inspection window never opens, no belt-side detection or "
+                "fault debounce runs, and belt processing is skipped in the "
+                "frame loop. Cloth ROI detection and row-stop logic are "
+                "unaffected. Takes effect immediately; an open window closes "
+                "right away. Existing latched faults still require operator ack."
+            )
+        )
+        self._belt_detection_check.toggled.connect(self.belt_detection_enabled_changed.emit)
+        form.addRow("", self._belt_detection_check)
+
         self._belt_mask_check = QCheckBox(self.tr("Show belt detection mask"))
         self._belt_mask_check.setToolTip(
             self.tr(
@@ -664,6 +679,9 @@ class ServiceView(QWidget):
         self._fill_mask_holes_check.blockSignals(True)
         self._fill_mask_holes_check.setChecked(cfg.detection.fill_mask_holes)
         self._fill_mask_holes_check.blockSignals(False)
+        self._belt_detection_check.blockSignals(True)
+        self._belt_detection_check.setChecked(cfg.inspection.belt_detection_enabled)
+        self._belt_detection_check.blockSignals(False)
         self._bg_reference_status.setText(
             self.tr("Reference captured.") if cfg.detection.bg_subtract.reference_path
             else self.tr("No reference captured yet.")

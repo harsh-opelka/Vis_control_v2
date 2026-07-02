@@ -73,6 +73,9 @@ from viscontrol.ui.widgets.status_bar import StatusBar
 # always runs at camera rate (subject to belt_check_interval / tripwire_check_interval).
 _DISPLAY_INTERVAL_S: float = 1.0 / 15.0   # ~15 fps display cap
 _PERF_LOG_INTERVAL_S: float = 1.0         # SECTION 1: per-stage timing summary, once/sec
+# Post-fire boundary CLEARING -> ARMED transition (USE_ROW_GROUPING only).
+_BOUNDARY_CLEAR_STREAK: int = 3           # consecutive frames with 0 excluded leftovers
+_BOUNDARY_CLEAR_TIMEOUT_S: float = 1.5    # safety timeout since the post-fire rising edge
 
 
 class _FrameBridge(QObject):
@@ -225,7 +228,25 @@ class MainWindow(QMainWindow):
         self._row_status: list[str] = ["WAITING"] * max(0, config.detection.grid_rows)
         self._row_advance_pending_log: bool = False  # diagnostic only: set True when row advances
         self._committed_boundary_x: float | None = None  # leading_edge_x of last fired row; filters leftovers
+        # Post-fire boundary phase: CLEARING (boundary filter active, firing blocked —
+        # the just-fired row's leftovers are still being cleared) or ARMED (boundary
+        # filter disabled, all pieces eligible, firing allowed). Entered on every fire;
+        # evaluation of the CLEARING -> ARMED transition begins at the next rising edge
+        # (the row-advance event), not at the fire moment itself.
+        self._boundary_phase: str = "ARMED"
+        self._boundary_clearing_since: float | None = None  # time.monotonic() eval start
+        self._boundary_clear_streak: int = 0  # consecutive frames with 0 excluded pieces
         self._post_reset_pending: bool = False  # True after FULL RESET; gates first fire until fresh approach seen
+        # DEBUG LOGGING (determinism analysis) — see PLC-EDGE / CYCLE-SUMMARY /
+        # FRAME-GAP logs. Purely observational; never read by decision logic.
+        self._last_tuchabzug_edge_time: float | None = None  # time.monotonic() of last rising/falling edge
+        self._last_active_frame_time: float | None = None    # time.monotonic() of last processed frame while running
+        self._cycle_start_time: float | None = None          # time.monotonic() when the current cycle's row 1 began
+        self._cycle_rows_fired: list[int] = []          # row numbers (1-indexed) that fired this cycle
+        self._cycle_fire_tangents: list[float] = []     # tangent at which each row fired
+        self._cycle_boundaries: list[float] = []        # committed_boundary_x set after each fire
+        self._cycle_clearing_durations_ms: list[float] = []  # CLEARING phase duration per fire
+        self._cycle_armed_reasons: list[str] = []       # "leftovers_cleared"|"timeout" per fire
         # Immediate-switch anchor: set the moment a row fires so the NEXT row is
         # tracked by position (not by blind sort-order) starting the same frame.
         # None = use normal front-most-group mode; not None = anchor-proximity mode.
@@ -484,6 +505,7 @@ class MainWindow(QMainWindow):
 
         sv.detection_method_changed.connect(self._on_detection_method_changed)
         sv.fill_mask_holes_changed.connect(self._on_fill_mask_holes_changed)
+        sv.belt_detection_enabled_changed.connect(self._on_belt_detection_enabled_changed)
         sv.capture_bg_reference_requested.connect(self._on_capture_bg_reference)
         sv.open_cloth_reference_requested.connect(lambda: self._open_wizard(start_step=6))
 
@@ -570,6 +592,9 @@ class MainWindow(QMainWindow):
         self._active_row_index = 0
         self._row_status = ["WAITING"] * max(0, self._cfg.detection.grid_rows)
         self._committed_boundary_x = None
+        self._boundary_phase = "ARMED"
+        self._boundary_clearing_since = None
+        self._boundary_clear_streak = 0
         self._post_reset_pending = False
         self._tracked_anchor_x = None
         self._tracked_anchor_idx = None
@@ -661,10 +686,28 @@ class MainWindow(QMainWindow):
         if self._detection_enabled and self._sm.state != State.SERVICE:
             snap = self._sm.snapshot()
 
+            # DEBUG LOGGING: flag processed-frame gaps while cloth is actively
+            # moving — a long gap here can mean a crossing was never sampled.
+            if snap.tuchabzug_running:
+                if self._last_active_frame_time is not None:
+                    _frame_gap_ms = (_now_mono - self._last_active_frame_time) * 1000.0
+                    if _frame_gap_ms > 150.0:
+                        logger.info(
+                            "FRAME-GAP dt={}ms during active tracking — "
+                            "possible missed crossing",
+                            int(round(_frame_gap_ms)),
+                        )
+                self._last_active_frame_time = _now_mono
+            else:
+                self._last_active_frame_time = None
+
             # FIX 1: pre-compute whether belt inspection is due this frame so we
             # can stagger: avoid running cloth Hough (~25ms) AND belt (~15ms) on
-            # the same frame when possible.
-            _needs_belt_precheck = self._belt_inspect_window_open or snap.fault_active
+            # the same frame when possible. Debug toggle: belt_detection_enabled=
+            # False neutralizes this entirely (no belt-aware Hough staggering).
+            _needs_belt_precheck = self._cfg.inspection.belt_detection_enabled and (
+                self._belt_inspect_window_open or snap.fault_active
+            )
             _belt_due_this_frame = (
                 _needs_belt_precheck
                 and self._frame_count % self._cfg.inspection.belt_check_interval == 0
@@ -684,6 +727,16 @@ class MainWindow(QMainWindow):
                     self._reset_tracking_session()
                     if self._cfg.detection.use_row_grouping:
                         _grid_rows = self._cfg.detection.grid_rows
+                        if self._active_row_index == 0:
+                            # Start of a fresh cycle (either the very first one, or
+                            # right after the previous cycle's FULL RESET) — (re)arm
+                            # the per-cycle accumulators consumed by CYCLE-SUMMARY.
+                            self._cycle_start_time = time.monotonic()
+                            self._cycle_rows_fired = []
+                            self._cycle_fire_tangents = []
+                            self._cycle_boundaries = []
+                            self._cycle_clearing_durations_ms = []
+                            self._cycle_armed_reasons = []
                         logger.info(
                             "Row-SM rising edge: active_row={} status_before={}",
                             self._active_row_index,
@@ -695,7 +748,9 @@ class MainWindow(QMainWindow):
                         ):
                             _old_idx = self._active_row_index
                             self._row_status[self._active_row_index] = "DONE"
+                            self._log_state(f"row_status[{_old_idx}]", "STOPPED", "DONE", "rising_edge")
                             self._active_row_index += 1
+                            self._log_state("active_row_index", _old_idx, self._active_row_index, "rising_edge")
                             logger.info(
                                 "Row-SM ADVANCE: row {} marked DONE -> "
                                 "new active_row={} row_status={}",
@@ -704,12 +759,31 @@ class MainWindow(QMainWindow):
                                 self._row_status,
                             )
                             self._row_advance_pending_log = True
+                            # This is the "next rising edge" after the fire that put
+                            # us into CLEARING — begin evaluating the CLEARING ->
+                            # ARMED transition (leftover-clear streak / timeout) now.
+                            if self._boundary_phase == "CLEARING" and self._boundary_clearing_since is None:
+                                self._boundary_clearing_since = time.monotonic()
+                                self._boundary_clear_streak = 0
                         if self._active_row_index >= _grid_rows:
+                            _old_active_idx = self._active_row_index
+                            _old_row_status = list(self._row_status)
+                            _old_anchor = (self._tracked_anchor_x, self._tracked_anchor_idx)
+                            _old_phase = self._boundary_phase
                             self._active_row_index = 0
                             self._row_status = ["WAITING"] * max(0, _grid_rows)
                             self._post_reset_pending = True
                             self._tracked_anchor_x = None
                             self._tracked_anchor_idx = None
+                            self._boundary_phase = "ARMED"
+                            self._boundary_clearing_since = None
+                            self._boundary_clear_streak = 0
+                            self._log_state("active_row_index", _old_active_idx, 0, "full_reset")
+                            self._log_state("row_status", _old_row_status, self._row_status, "full_reset")
+                            if _old_anchor != (None, None):
+                                self._log_state("anchor", _old_anchor, (None, None), "full_reset")
+                            if _old_phase != "ARMED":
+                                self._log_state("boundary_phase", _old_phase, "ARMED", "full_reset")
                             logger.info(
                                 "Row-SM FULL RESET: all rows complete -> "
                                 "active_row_index=0, row_status reset to {}; "
@@ -719,10 +793,25 @@ class MainWindow(QMainWindow):
                             _old_bnd = self._committed_boundary_x
                             self._committed_boundary_x = None
                             if _old_bnd is not None:
+                                self._log_state("committed_boundary_x", _old_bnd, None, "full_reset")
                                 logger.info(
                                     "Committed boundary RESET: cleared (was {}) for new cycle",
                                     int(round(_old_bnd)),
                                 )
+                            _total_cycle_ms = (
+                                (time.monotonic() - self._cycle_start_time) * 1000.0
+                                if self._cycle_start_time is not None else 0.0
+                            )
+                            logger.info(
+                                "CYCLE-SUMMARY rows_fired={} fire_tangents={} boundaries={} "
+                                "clearing_durations_ms={} armed_reasons={} total_cycle_ms={}",
+                                self._cycle_rows_fired,
+                                [int(round(t)) for t in self._cycle_fire_tangents],
+                                [int(round(b)) for b in self._cycle_boundaries],
+                                [int(round(d)) for d in self._cycle_clearing_durations_ms],
+                                self._cycle_armed_reasons,
+                                int(round(_total_cycle_ms)),
+                            )
 
                 # FIX 1: rate-limit Hough to hough_interval_ms between runs.
                 # Stagger: if belt is also due this frame, defer Hough unless it
@@ -803,67 +892,75 @@ class MainWindow(QMainWindow):
             # Primary source is the PLC's toext_Einlaufband_running; the manual
             # toggle remains as a fallback/override when no PLC is attached
             # (demo mode, or production before the PLC connects).
-            belt_inspect_signal = self._read_belt_inspect_signal()
+            #
+            # Debug toggle: belt_detection_enabled=False skips this ENTIRE block
+            # (window never opens, no detection/debounce runs, _t_belt_ms stays
+            # 0.0). Cloth ROI detection / row-stop logic above is unaffected.
+            # Existing latched faults are untouched here — the operator-ack path
+            # (_on_plc_error_quit -> StateMachine.acknowledge_fault) is a separate
+            # PLC callback and still works while this block is skipped.
+            if self._cfg.inspection.belt_detection_enabled:
+                belt_inspect_signal = self._read_belt_inspect_signal()
 
-            if belt_inspect_signal and not self._belt_inspect_window_open:
-                self._open_belt_inspect_window()
-            elif not belt_inspect_signal and self._belt_inspect_window_open:
-                self._close_belt_inspect_window()
+                if belt_inspect_signal and not self._belt_inspect_window_open:
+                    self._open_belt_inspect_window()
+                elif not belt_inspect_signal and self._belt_inspect_window_open:
+                    self._close_belt_inspect_window()
 
-            # Run belt detection while the window is open OR while clearing a fault.
-            # Skipping in all other states saves 15-25 ms/frame (unchanged from before).
-            _needs_belt = self._belt_inspect_window_open or snap.fault_active
-            _t_belt = time.perf_counter()
-            if _needs_belt and self._frame_count % self._cfg.inspection.belt_check_interval == 0:
-                result = self._pipeline.run_belt_inspection(
-                    frame, profile, unknown_is_fault=self._cfg.inspection.unknown_is_fault,
-                )
-                belt_detections = result.detections
-                logger.debug(
-                    "Belt: {} blob(s), verdict={}",
-                    len(result.detections), result.verdict.value,
-                )
-                if result.inference_ms > 50.0:
-                    logger.debug("belt_inspection slow: {:.0f} ms", result.inference_ms)
+                # Run belt detection while the window is open OR while clearing a fault.
+                # Skipping in all other states saves 15-25 ms/frame (unchanged from before).
+                _needs_belt = self._belt_inspect_window_open or snap.fault_active
+                _t_belt = time.perf_counter()
+                if _needs_belt and self._frame_count % self._cfg.inspection.belt_check_interval == 0:
+                    result = self._pipeline.run_belt_inspection(
+                        frame, profile, unknown_is_fault=self._cfg.inspection.unknown_is_fault,
+                    )
+                    belt_detections = result.detections
+                    logger.debug(
+                        "Belt: {} blob(s), verdict={}",
+                        len(result.detections), result.verdict.value,
+                    )
+                    if result.inference_ms > 50.0:
+                        logger.debug("belt_inspection slow: {:.0f} ms", result.inference_ms)
 
-                # Fault RAISING: only inside the open window and only once per run.
-                # _belt_window_fault_latched prevents a second verdict even if the
-                # belt clears briefly and goes dirty again within the same run.
-                if self._belt_inspect_window_open and not self._belt_window_fault_latched:
-                    _was_armed = self._belt_fault_armed
-                    self._apply_belt_fault_debounce(result, belt_roi=belt)
-                    if _was_armed and not self._belt_fault_armed:
-                        # Fault just fired (armed→disarmed) — latch for this window run.
-                        self._belt_window_fault_latched = True
+                    # Fault RAISING: only inside the open window and only once per run.
+                    # _belt_window_fault_latched prevents a second verdict even if the
+                    # belt clears briefly and goes dirty again within the same run.
+                    if self._belt_inspect_window_open and not self._belt_window_fault_latched:
+                        _was_armed = self._belt_fault_armed
+                        self._apply_belt_fault_debounce(result, belt_roi=belt)
+                        if _was_armed and not self._belt_fault_armed:
+                            # Fault just fired (armed→disarmed) — latch for this window run.
+                            self._belt_window_fault_latched = True
 
-                # Fault CLEARING: always while fault_active, independent of window.
-                # FIX 4 (single shared latched fault state, UI <-> PLC): in
-                # production, the clean-frame self-clear below is DISABLED —
-                # otherwise FaultActive could clear here while the PLC's
-                # ext_error stays latched at 2 until the operator acks, which
-                # is exactly the drift this fix removes. Production's ONLY
-                # clear path is the operator ack (ext_error_quit rising edge,
-                # see _on_plc_error_quit -> StateMachine.acknowledge_fault).
-                # Demo has no PLC ack signal, so it keeps the original
-                # self-clear-after-N-clean-frames behavior.
-                snap = self._sm.snapshot()
-                _production_latched = self._cfg.app.mode == "production" and self._plc is not None
-                if snap.fault_active:
-                    if not result.verdict.is_fault:
-                        if not _production_latched and self._sm.handle_clean_frame_in_fault():
-                            self._on_fault_cleared()
-                    else:
-                        self._sm.handle_dirty_frame_in_fault()
+                    # Fault CLEARING: always while fault_active, independent of window.
+                    # FIX 4 (single shared latched fault state, UI <-> PLC): in
+                    # production, the clean-frame self-clear below is DISABLED —
+                    # otherwise FaultActive could clear here while the PLC's
+                    # ext_error stays latched at 2 until the operator acks, which
+                    # is exactly the drift this fix removes. Production's ONLY
+                    # clear path is the operator ack (ext_error_quit rising edge,
+                    # see _on_plc_error_quit -> StateMachine.acknowledge_fault).
+                    # Demo has no PLC ack signal, so it keeps the original
+                    # self-clear-after-N-clean-frames behavior.
+                    snap = self._sm.snapshot()
+                    _production_latched = self._cfg.app.mode == "production" and self._plc is not None
+                    if snap.fault_active:
+                        if not result.verdict.is_fault:
+                            if not _production_latched and self._sm.handle_clean_frame_in_fault():
+                                self._on_fault_cleared()
+                        else:
+                            self._sm.handle_dirty_frame_in_fault()
 
-                # Sticky overlay for display after the inspection window closes.
-                self._sticky_belt_detections = list(result.detections)
-                self._sticky_belt_crop_rect = belt_crop_rect
-                hold_ms = max(0, int(
-                    self._cfg.inspection.inspection_overlay_hold_seconds * 1000
-                ))
-                if hold_ms > 0:
-                    self._sticky_overlay_timer.start(hold_ms)
-            _t_belt_ms = (time.perf_counter() - _t_belt) * 1000.0
+                    # Sticky overlay for display after the inspection window closes.
+                    self._sticky_belt_detections = list(result.detections)
+                    self._sticky_belt_crop_rect = belt_crop_rect
+                    hold_ms = max(0, int(
+                        self._cfg.inspection.inspection_overlay_hold_seconds * 1000
+                    ))
+                    if hold_ms > 0:
+                        self._sticky_overlay_timer.start(hold_ms)
+                _t_belt_ms = (time.perf_counter() - _t_belt) * 1000.0
 
         _t_tripwire_ms = _t_detect_ms + _t_rowgroup_ms
         if _t_tripwire_ms > 0.0 or _t_belt_ms > 0.0:
@@ -1131,6 +1228,8 @@ class MainWindow(QMainWindow):
         self._frame_bridge._processing = False
 
     def _open_belt_inspect_window(self) -> None:
+        if not self._cfg.inspection.belt_detection_enabled:
+            return  # debug toggle: belt detection disabled — no-op
         self._belt_inspect_window_open = True
         self._belt_window_fault_latched = False
         self._belt_fault_armed = True
@@ -1147,6 +1246,24 @@ class MainWindow(QMainWindow):
 
     def _on_toggle_einlaufband(self, active: bool) -> None:
         self._manual_einlaufband_toggle = active
+
+    def _on_belt_detection_enabled_changed(self, enabled: bool) -> None:
+        """Debug toggle (Service > Diagnostics 'Belt detection' checkbox).
+
+        Takes effect immediately: turning it off closes an open inspection
+        window right away and clears pending fault-debounce state, but never
+        touches an already-latched fault — that only clears via the operator
+        ack path (_on_plc_error_quit -> StateMachine.acknowledge_fault), same
+        as always.
+        """
+        self._cfg.inspection.belt_detection_enabled = enabled
+        self._save_cfg()
+        if not enabled and self._belt_inspect_window_open:
+            self._belt_inspect_window_open = False
+            self._belt_fault_debounce_count = 0
+            self._belt_fault_armed = True
+            self._belt_clear_count = 0
+            logger.info("Belt inspection window CLOSED — disabled by toggle")
 
     def _read_belt_inspect_signal(self) -> bool:
         """Resolve the belt-inspection-window source.
@@ -1244,6 +1361,56 @@ class MainWindow(QMainWindow):
         self._detection_band = (int(x_left), int(x_right))
         return [d for d in detections if x_left <= leading_edge_x(d) <= x_right]
 
+    # ---------- DEBUG LOGGING (determinism analysis) ----------
+
+    def _log_state(self, field: str, old: object, new: object, trigger: str) -> None:
+        """Uniform "STATE:" transition line for row_status/active_row_index/
+        boundary_phase/committed_boundary_x/anchor mutations. Logging only —
+        never affects behavior."""
+        logger.info("STATE: {}: {} -> {} (trigger={})", field, old, new, trigger)
+
+    def _log_plc_edge(self, edge: str) -> None:
+        """Log time since the previous TuchabzugRunning edge (any source:
+        PLC ext_tuchabzug_status, OPC UA, demo simulate/force-toggle)."""
+        _now = time.monotonic()
+        _dt_ms = (
+            f"{(_now - self._last_tuchabzug_edge_time) * 1000.0:.0f}"
+            if self._last_tuchabzug_edge_time is not None
+            else "n/a"
+        )
+        logger.info("PLC-EDGE {} dt_since_last_edge={}ms", edge, _dt_ms)
+        self._last_tuchabzug_edge_time = _now
+
+    def _log_fire_trace(
+        self,
+        *,
+        state: str,
+        active_idx: int,
+        tangent: float | None,
+        transfer_x: float,
+        boundary: float | None,
+        pieces_total: int,
+        pieces_excluded: int,
+        fire_eligible: bool,
+        fired: bool,
+    ) -> None:
+        """One line per processed frame summarizing the fire decision."""
+        logger.info(
+            "FIRE-TRACE frame_id={} state={} active_row={} tangent={} "
+            "transfer_x={} boundary={} pieces_total={} pieces_excluded={} "
+            "fire_eligible={} fired={}",
+            self._frame_count,
+            state,
+            active_idx,
+            int(round(tangent)) if tangent is not None else "none",
+            int(round(transfer_x)),
+            int(round(boundary)) if boundary is not None else "none",
+            pieces_total,
+            pieces_excluded,
+            "true" if fire_eligible else "false",
+            "true" if fired else "false",
+        )
+
     def _apply_tangent_stop_edge(self, r: object, profile: "ProductProfile") -> None:
         """USE_ROW_GROUPING=ON firing path — explicit per-row state machine.
 
@@ -1266,10 +1433,46 @@ class MainWindow(QMainWindow):
         grid_cols = self._cfg.detection.grid_columns
         grid_rows = self._cfg.detection.grid_rows
 
+        # Post-fire CLEARING -> ARMED evaluation. Only runs once the next rising
+        # edge (row advance) has started the clock/streak — see the rising-edge
+        # handler. Firing stays blocked (Step 3 below) until we reach ARMED.
+        if (
+            self._boundary_phase == "CLEARING"
+            and self._boundary_clearing_since is not None
+            and self._committed_boundary_x is not None
+        ):
+            _clearing_excluded = [
+                d for d in all_detections if leading_edge_x(d) <= self._committed_boundary_x
+            ]
+            if not _clearing_excluded:
+                self._boundary_clear_streak += 1
+            else:
+                self._boundary_clear_streak = 0
+            _clearing_elapsed = time.monotonic() - self._boundary_clearing_since
+            if self._boundary_clear_streak >= _BOUNDARY_CLEAR_STREAK:
+                self._boundary_phase = "ARMED"
+                self._cycle_clearing_durations_ms.append(_clearing_elapsed * 1000.0)
+                self._cycle_armed_reasons.append("leftovers_cleared")
+                self._log_state("boundary_phase", "CLEARING", "ARMED", "leftovers_cleared")
+                logger.info(
+                    "Post-fire state: ARMED (reason=leftovers_cleared), "
+                    "boundary filter disabled",
+                )
+            elif _clearing_elapsed >= _BOUNDARY_CLEAR_TIMEOUT_S:
+                self._boundary_phase = "ARMED"
+                self._cycle_clearing_durations_ms.append(_clearing_elapsed * 1000.0)
+                self._cycle_armed_reasons.append("timeout")
+                self._log_state("boundary_phase", "CLEARING", "ARMED", "timeout")
+                logger.info(
+                    "Post-fire state: ARMED (reason=timeout), boundary filter disabled",
+                )
+
         # Boundary filter: exclude pieces already handled by a previously-fired row.
         # Pieces with leading_edge_x <= committed_boundary_x are leftovers from a
-        # row whose stop already fired and must not be regrouped as the new active row.
-        _bnd_x = self._committed_boundary_x
+        # row whose stop already fired and must not be regrouped as the new active
+        # row. Only applied while CLEARING — once ARMED the filter is fully
+        # disabled (all detected pieces eligible for grouping, anchor, and tangent).
+        _bnd_x = self._committed_boundary_x if self._boundary_phase == "CLEARING" else None
         _eligible = [d for d in all_detections if _bnd_x is None or leading_edge_x(d) > _bnd_x]
         _excluded = [d for d in all_detections if _bnd_x is not None and leading_edge_x(d) <= _bnd_x]
         logger.info(
@@ -1316,6 +1519,17 @@ class MainWindow(QMainWindow):
                     "(active_row_index={} >= grid_rows={})",
                     active_idx, grid_rows,
                 )
+            self._log_fire_trace(
+                state="IDLE",
+                active_idx=active_idx,
+                tangent=None,
+                transfer_x=transfer_x,
+                boundary=self._committed_boundary_x,
+                pieces_total=len(all_detections),
+                pieces_excluded=len(_excluded),
+                fire_eligible=False,
+                fired=False,
+            )
             return
 
         # --- Step 2: select the active row group ---
@@ -1442,6 +1656,11 @@ class MainWindow(QMainWindow):
                 )
 
         # --- Step 3: stop trigger for the active row ---
+        # Captured BEFORE the fire block (below) can mutate boundary_phase, so
+        # the FIRE-TRACE line at the end of this function reflects the state
+        # that actually gated THIS frame's decision, not the post-fire state.
+        _trace_state = self._boundary_phase
+        _fired_this_frame = False
         # In anchor mode _fire_idx differs from active_row_index: we fire against
         # the tracked row's status slot, not the SM's current slot, so Row 2 can
         # fire even before the next TuchabzugRunning rising edge formally advances
@@ -1451,7 +1670,11 @@ class MainWindow(QMainWindow):
             if self._tracked_anchor_idx is not None
             else active_idx
         )
-        if _fire_idx < len(self._row_status) and self._row_status[_fire_idx] == "WAITING":
+        if (
+            self._boundary_phase == "ARMED"
+            and _fire_idx < len(self._row_status)
+            and self._row_status[_fire_idx] == "WAITING"
+        ):
             # Post-reset guard: only in normal mode (anchor only activates mid-cycle,
             # never right after a FULL RESET, so the guard is never needed there).
             _allow_fire = True
@@ -1477,6 +1700,8 @@ class MainWindow(QMainWindow):
                             int(effective_tang_x), _pr_threshold,
                         )
             if _allow_fire and effective_tang_x is not None and effective_tang_x <= transfer_x:
+                _fired_this_frame = True
+                self._log_state(f"row_status[{_fire_idx}]", "WAITING", "STOPPED", "fire")
                 self._row_status[_fire_idx] = "STOPPED"
                 logger.info(
                     "Row-SM FIRE: row {} tangent {} <= transfer_x {:.0f} "
@@ -1486,14 +1711,27 @@ class MainWindow(QMainWindow):
                     transfer_x,
                     self._row_status,
                 )
-                _safety = self._cfg.detection.boundary_safety_margin_px
-                _capped_bnd = min(effective_tang_x, transfer_x - _safety)
-                self._committed_boundary_x = _capped_bnd
+                self._cycle_rows_fired.append(_fire_idx + 1)
+                self._cycle_fire_tangents.append(effective_tang_x)
+                _old_committed_bnd = self._committed_boundary_x
+                self._committed_boundary_x = effective_tang_x + self._cfg.detection.boundary_offset_px
+                self._cycle_boundaries.append(self._committed_boundary_x)
+                self._log_state(
+                    "committed_boundary_x", _old_committed_bnd, self._committed_boundary_x, "fire",
+                )
                 logger.info(
-                    "Committed boundary SET: X={} (row {} fired at tangent={}, "
-                    "transfer_x={:.0f}, capped to transfer_x - {})",
-                    int(round(_capped_bnd)), _fire_idx + 1,
-                    int(effective_tang_x), transfer_x, _safety,
+                    "Committed boundary SET: X={} (fired_tangent={} + offset={})",
+                    int(round(self._committed_boundary_x)),
+                    int(effective_tang_x),
+                    self._cfg.detection.boundary_offset_px,
+                )
+                self._log_state("boundary_phase", self._boundary_phase, "CLEARING", "fire")
+                self._boundary_phase = "CLEARING"
+                self._boundary_clearing_since = None  # evaluation starts at the next rising edge
+                self._boundary_clear_streak = 0
+                logger.info(
+                    "Post-fire state: CLEARING (boundary={})",
+                    int(round(self._committed_boundary_x)),
                 )
 
                 # Immediately switch tracking to the next row in the SAME frame.
@@ -1505,6 +1743,9 @@ class MainWindow(QMainWindow):
                         min(leading_edge_x(d) for d in row2) if row2 else None
                     )
                     if _next_anchor is not None and _next_idx < len(self._row_status):
+                        self._log_state(
+                            "anchor", (None, None), (_next_anchor, _next_idx), "fire",
+                        )
                         self._tracked_anchor_x = _next_anchor
                         self._tracked_anchor_idx = _next_idx
                         logger.info(
@@ -1527,12 +1768,30 @@ class MainWindow(QMainWindow):
                         "Row-SM TRACK DONE: Row {} (anchor-tracked) fired, anchor cleared",
                         _fire_idx + 1,
                     )
+                    self._log_state(
+                        "anchor",
+                        (self._tracked_anchor_x, self._tracked_anchor_idx),
+                        (None, None),
+                        "fire",
+                    )
                     self._tracked_anchor_x = None
                     self._tracked_anchor_idx = None
 
                 self._sm.handle_stop_tuchabzug_trigger()
                 self._push_signals_to_opcua()
                 self._request_plc_stop_pulse()
+
+        self._log_fire_trace(
+            state=_trace_state,
+            active_idx=active_idx,
+            tangent=effective_tang_x,
+            transfer_x=transfer_x,
+            boundary=self._committed_boundary_x,
+            pieces_total=len(all_detections),
+            pieces_excluded=len(_excluded),
+            fire_eligible=(_trace_state == "ARMED" and effective_tang_x is not None),
+            fired=_fired_this_frame,
+        )
 
     def _apply_belt_fault_debounce(
         self, result: "PipelineResult", *, belt_roi: "np.ndarray"
@@ -1649,6 +1908,7 @@ class MainWindow(QMainWindow):
         belt.  Tripwire is suppressed from this point until the line clears.
         Belt fault debounce is reset so each transfer window starts clean.
         """
+        self._log_plc_edge("rising")
         if self._row_phase == RowPhase.AT_LINE:
             self._row_phase = RowPhase.TRANSFERRING
             self._transfer_start_time = time.monotonic()
@@ -1665,6 +1925,7 @@ class MainWindow(QMainWindow):
         TRANSFERRING → AT_LINE if the line is still occupied (PLC stopped
         mid-transfer); TRANSFERRING → IDLE if the line already cleared.
         """
+        self._log_plc_edge("falling")
         if self._row_phase == RowPhase.TRANSFERRING:
             if self._tripwire_prev_stable:
                 self._row_phase = RowPhase.AT_LINE
@@ -1678,6 +1939,15 @@ class MainWindow(QMainWindow):
                 self._active_row_index,
                 self._row_status,
             )
+            if "WAITING" in self._row_status:
+                logger.info(
+                    "CYCLE-INCOMPLETE rows_status={} last_state={} last_tangent={} "
+                    "reason=falling_edge_before_fire",
+                    self._row_status,
+                    self._boundary_phase,
+                    int(round(self._cycle_ref_tangent_x))
+                    if self._cycle_ref_tangent_x is not None else "none",
+                )
 
     def _on_simulate_pulse(self) -> None:
         if self._cfg.app.mode != "demo":
@@ -2170,6 +2440,9 @@ class MainWindow(QMainWindow):
         self._active_row_index = 0
         self._row_status = ["WAITING"] * max(0, self._cfg.detection.grid_rows)
         self._committed_boundary_x = None
+        self._boundary_phase = "ARMED"
+        self._boundary_clearing_since = None
+        self._boundary_clear_streak = 0
         self._post_reset_pending = False
         self._tracked_anchor_x = None
         self._tracked_anchor_idx = None
@@ -2191,6 +2464,9 @@ class MainWindow(QMainWindow):
         self._active_row_index = 0
         self._row_status = ["WAITING"] * max(0, self._cfg.detection.grid_rows)
         self._committed_boundary_x = None
+        self._boundary_phase = "ARMED"
+        self._boundary_clearing_since = None
+        self._boundary_clear_streak = 0
         self._post_reset_pending = False
         self._tracked_anchor_x = None
         self._tracked_anchor_idx = None
