@@ -44,6 +44,8 @@ from viscontrol.detection.calibration import learn_reference
 from viscontrol.detection.classical import ClassicalDetector
 from viscontrol.detection.pipeline import InspectionPipeline
 from viscontrol.detection.row_grouping import (
+    ClusterTracker,
+    DEFAULT_CLOTH_SPEED_PX_S,
     RowLineTracker,
     group_by_gap,
     leading_edge_x,
@@ -200,6 +202,16 @@ class MainWindow(QMainWindow):
         # Row grouping (USE_ROW_GROUPING) — only active when detection.use_row_grouping
         # is True; otherwise the legacy tripwire above runs unchanged. Reset per cycle.
         self._row_line_tracker = RowLineTracker()
+        # Layer 2: sticky cluster identity on top of group_by_gap (see
+        # row_grouping.ClusterTracker). Gives each physical row a persistent
+        # id across frames so row identity/UI color/anchor selection don't
+        # depend on per-frame sort order.
+        self._cluster_tracker = ClusterTracker(
+            max_match_dist_px=config.detection.cluster_max_match_dist_px,
+            max_missed_frames=config.detection.cluster_max_missed_frames,
+        )
+        self._last_cluster_track_time: float | None = None  # time.monotonic() of last update()
+        self._cycle_id_grouped_rows: list[tuple[int, list]] = []  # last (cluster_id, members), front-first
         self._row_group_stop_active: bool = False  # mirrors StopTuchabzug pill for the pulse
         self._row_lines: list[float] = []          # current row-line x's (display)
         self._row_count: int = 0                   # current detected row count (display)
@@ -248,11 +260,21 @@ class MainWindow(QMainWindow):
         self._cycle_boundaries: list[float] = []        # committed_boundary_x set after each fire
         self._cycle_clearing_durations_ms: list[float] = []  # CLEARING phase duration per fire
         self._cycle_armed_reasons: list[str] = []       # "leftovers_cleared"|"timeout" per fire
+        # SESSION SUMMARY — cumulative across the whole app run (never reset
+        # per-cycle, unlike the _cycle_* accumulators above). Logged on every
+        # full-cycle reset and again at shutdown.
+        self._session_rows_fired: int = 0
+        self._session_stop_latches: int = 0
+        self._session_overshoot_records: list[tuple[int, float]] = []  # (row, overshoot_px) per fire
+        # INTER-ROW-STOP-GAP: time between consecutive StopTuchabzug latch releases.
+        self._last_stop_latch_time: float | None = None
+        self._last_stop_latch_row: int | None = None
         # Immediate-switch anchor: set the moment a row fires so the NEXT row is
         # tracked by position (not by blind sort-order) starting the same frame.
         # None = use normal front-most-group mode; not None = anchor-proximity mode.
         self._tracked_anchor_x: float | None = None   # last known X of the row we're tracking
         self._tracked_anchor_idx: int | None = None   # _row_status index for the anchor-tracked row
+        self._tracked_anchor_cluster_id: int | None = None  # ClusterTracker id of the anchor-tracked row
         self._cycle_partial_warned: bool = False     # True once partial-detection warning logged
         self._cycle_front_row: list = []             # active-row detections (for display + stop)
         self._cycle_row2: list = []                  # next-row detections (for display)
@@ -407,6 +429,7 @@ class MainWindow(QMainWindow):
 
     def shutdown(self) -> None:
         """Stop background threads. Called from main.py on close."""
+        self._log_session_summary()
         try:
             self._camera.stop()
         except Exception:  # noqa: BLE001
@@ -579,6 +602,9 @@ class MainWindow(QMainWindow):
         self._line_clear_debounce_count = 0
         self._transfer_timeout_warned = False
         self._row_line_tracker.reset()
+        self._cluster_tracker.reset()
+        self._last_cluster_track_time = None
+        self._cycle_id_grouped_rows = []
         self._row_group_stop_active = False
         self._row_lines = []
         self._row_count = 0
@@ -599,6 +625,7 @@ class MainWindow(QMainWindow):
         self._post_reset_pending = False
         self._tracked_anchor_x = None
         self._tracked_anchor_idx = None
+        self._tracked_anchor_cluster_id = None
         self._cycle_partial_warned = False
         self._cycle_front_row = []
         self._cycle_row2 = []
@@ -813,6 +840,9 @@ class MainWindow(QMainWindow):
                                 self._cycle_armed_reasons,
                                 int(round(_total_cycle_ms)),
                             )
+                            # Session-end verification: full-cycle reset = one natural
+                            # session-end point ("all rows DONE, cycle complete").
+                            self._log_session_summary()
 
                 # FIX 1: rate-limit Hough to hough_interval_ms between runs.
                 # Stagger: if belt is also due this frame, defer Hough unless it
@@ -1074,22 +1104,19 @@ class MainWindow(QMainWindow):
             # cloth_detections for coloring in _draw_detection.
             _row_count_display: int | None = None
             if self._cfg.detection.use_row_grouping and cloth_detections:
-                # Gap-cluster grouping with boundary filter (same filter as stop decision).
-                # Excluded pieces (X <= committed_boundary_x) are drawn gray (-1);
-                # only eligible pieces participate in the gap-cluster row coloring.
+                # Coloring reuses this frame's ClusterTracker output
+                # (self._cycle_id_grouped_rows, tagged in _apply_tangent_stop_edge
+                # from these same detections) rather than re-clustering here —
+                # ClusterTracker.update() must run at most once per frame, and
+                # id-tagged clusters are what makes color follow the tracked
+                # row instead of per-frame sort order.
                 _disp_bnd = self._committed_boundary_x
-                _disp_eligible = [
-                    d for d in cloth_detections
-                    if _disp_bnd is None or leading_edge_x(d) > _disp_bnd
-                ]
                 _disp_excluded = [
                     d for d in cloth_detections
                     if _disp_bnd is not None and leading_edge_x(d) <= _disp_bnd
                 ]
-                _grouped, _ = group_by_gap(
-                    _disp_eligible, self._cfg.detection.row_gap_threshold_px,
-                )
-                _row_count_display = len(_grouped)
+                _id_grouped = self._cycle_id_grouped_rows
+                _row_count_display = len(_id_grouped)
                 # Map detection object → index for O(1) lookup; assign row colours.
                 _det_to_idx = {id(det): i for i, det in enumerate(cloth_detections)}
                 _grid_row_asgn: dict[int, int] = {}
@@ -1097,11 +1124,22 @@ class MainWindow(QMainWindow):
                     _di = _det_to_idx.get(id(_det))
                     if _di is not None:
                         _grid_row_asgn[_di] = -1  # gray — boundary-excluded
-                for _gi, _grp in enumerate(_grouped[:2]):
-                    for _det in _grp:
+                # Color by tracked cluster id: the anchor-tracked row is always
+                # color 1 (front/magenta) regardless of its rank this frame;
+                # the next distinct cluster is color 2 (second/cyan).
+                _active_cid = self._tracked_anchor_cluster_id
+                if _active_cid is not None:
+                    _color_order = [_active_cid] + [
+                        cid for cid, _ in _id_grouped if cid != _active_cid
+                    ]
+                else:
+                    _color_order = [cid for cid, _ in _id_grouped]
+                _members_by_id = dict(_id_grouped)
+                for _color_i, _cid in enumerate(_color_order[:2]):
+                    for _det in _members_by_id.get(_cid, []):
                         _di = _det_to_idx.get(id(_det))
                         if _di is not None:
-                            _grid_row_asgn[_di] = _gi + 1  # 1 = front/magenta, 2 = second/cyan
+                            _grid_row_asgn[_di] = _color_i + 1  # 1 = front/magenta, 2 = second/cyan
                 _ref_x = self._cycle_ref_tangent_x
                 _ref_lbl = f"{int(_ref_x)}" if _ref_x is not None else "—"
                 _grs = self._cfg.detection.grid_rows
@@ -1414,6 +1452,33 @@ class MainWindow(QMainWindow):
             "true" if fired else "false",
         )
 
+    def _log_session_summary(self) -> None:
+        """SESSION SUMMARY: cumulative verification metrics across the whole
+        app session (not just the cycle that just completed) — logged at
+        every full-cycle reset (see the rising-edge handler's FULL RESET
+        branch) and again at shutdown, so a session ending mid-cycle still
+        gets a final line.
+        """
+        if not self._session_overshoot_records:
+            logger.info(
+                "SESSION SUMMARY: total_rows_fired=0 total_stop_latches={} "
+                "total_overshoot_avg=0px max_overshoot=0px (row=none)",
+                self._session_stop_latches,
+            )
+            return
+        _overshoots = [ov for _row, ov in self._session_overshoot_records]
+        _avg_overshoot = sum(_overshoots) / len(_overshoots)
+        _max_row, _max_overshoot = max(self._session_overshoot_records, key=lambda rec: rec[1])
+        logger.info(
+            "SESSION SUMMARY: total_rows_fired={} total_stop_latches={} "
+            "total_overshoot_avg={}px max_overshoot={}px (row={})",
+            self._session_rows_fired,
+            self._session_stop_latches,
+            int(round(_avg_overshoot)),
+            int(round(_max_overshoot)),
+            _max_row,
+        )
+
     def _apply_tangent_stop_edge(self, r: object, profile: "ProductProfile") -> None:
         """USE_ROW_GROUPING=ON firing path — explicit per-row state machine.
 
@@ -1507,9 +1572,21 @@ class MainWindow(QMainWindow):
         # the others so it can't contaminate a legitimate row's group. A
         # cluster with grid_cols or fewer members is left alone: it's a valid
         # (possibly partial) row, not a candidate for rejection.
+        #
+        # Interim staggered guard: a single oversized cluster (everything
+        # merged into one blob) is exactly what a staggered/offset row layout
+        # looks like — leave-one-out rejection against the whole-cluster
+        # median would reject genuine pieces on the layout's flanks. Skip
+        # rejection entirely in that one case; per-cluster rejection resumes
+        # as soon as gap-clustering actually produces more than one cluster.
+        _single_oversized = len(grouped_rows) == 1 and len(grouped_rows[0]) > grid_cols
+        if _single_oversized:
+            logger.info(
+                "Oversized single cluster (staggered layout?) — outlier rejection skipped",
+            )
         _cleaned_grouped_rows: list[list[Any]] = []
         for _grp in grouped_rows:
-            if len(_grp) > grid_cols:
+            if len(_grp) > grid_cols and not _single_oversized:
                 _grp_kept, _grp_rejected = reject_group_outliers(_grp)
                 for _out_d, _out_med, _out_dist in _grp_rejected:
                     logger.info(
@@ -1536,6 +1613,26 @@ class MainWindow(QMainWindow):
             "Gap-cluster groups: sorted X={}, clusters={}",
             _log_xs, _log_groups,
         )
+
+        # Layer 2: sticky cluster identity (ClusterTracker) — tag this frame's
+        # gap-clusters with persistent ids by predicted-position matching, so
+        # row identity/UI color/anchor selection below key off the id, not
+        # this list's per-frame order. Cached on self so the display block
+        # (drawn later this frame from the same detections) can reuse it
+        # without a second update() call, which would double-advance the
+        # tracker's internal frame counter and corrupt dt-based prediction.
+        _now_track = time.monotonic()
+        _dt_s = (
+            _now_track - self._last_cluster_track_time
+            if self._last_cluster_track_time is not None
+            else 0.0
+        )
+        self._last_cluster_track_time = _now_track
+        _cloth_speed = self._cfg.detection.cloth_speed_px_s or DEFAULT_CLOTH_SPEED_PX_S
+        id_grouped_rows = self._cluster_tracker.update(
+            grouped_rows, dt_s=_dt_s, cloth_speed_px_s=_cloth_speed,
+        )
+        self._cycle_id_grouped_rows = id_grouped_rows
 
         active_idx = self._active_row_index
 
@@ -1566,21 +1663,19 @@ class MainWindow(QMainWindow):
             return
 
         # --- Step 2: select the active row group ---
-        # In anchor mode (set immediately when a row fires): find the eligible group
-        # whose front tangent is closest to where the tracked row was last seen.
-        # This keeps us following the SAME physical row as the cloth moves, instead
-        # of whatever happens to sort into "first N pieces" each fresh frame.
-        # In normal mode (fresh cycle or no active anchor): use the front-most group.
-        if self._tracked_anchor_x is not None and grouped_rows:
-            active_row = min(
-                grouped_rows,
-                key=lambda g: abs(min(leading_edge_x(d) for d in g) - self._tracked_anchor_x)
-                if g
-                else float("inf"),
+        # In anchor mode (set immediately when a row fires): look up the
+        # cluster carrying the tracked ClusterTracker id — sticky identity,
+        # not per-frame sort order or raw position proximity — so we keep
+        # following the SAME physical row as the cloth moves even if its rank
+        # among this frame's clusters shifts. In normal mode (fresh cycle or
+        # no active anchor): use the front-most group.
+        if self._tracked_anchor_cluster_id is not None and id_grouped_rows:
+            active_row = next(
+                (members for cid, members in id_grouped_rows if cid == self._tracked_anchor_cluster_id),
+                [],
             )
-            _new_anchor = min(leading_edge_x(d) for d in active_row) if active_row else None
-            if _new_anchor is not None:
-                self._tracked_anchor_x = _new_anchor  # follow the group as it moves
+            if active_row:
+                self._tracked_anchor_x = min(leading_edge_x(d) for d in active_row)  # display/log only
             row2 = []  # no "second group" in anchor mode; display shows tracked row only
         else:
             active_row = grouped_rows[0] if grouped_rows else []
@@ -1763,6 +1858,31 @@ class MainWindow(QMainWindow):
                     int(round(_last_clearing_ms)),
                     _last_clearing_reason,
                 )
+                if _overshoot_px > 40:
+                    logger.warning(
+                        "HIGH OVERSHOOT WARNING: row={} overshoot={}px — may appear "
+                        "as merged transfer",
+                        _fire_idx + 1,
+                        int(round(_overshoot_px)),
+                    )
+
+                # STOP-LATCH release bookkeeping: gap since the previous release,
+                # plus the session-level totals consumed by SESSION SUMMARY.
+                _now_latch = time.monotonic()
+                if self._last_stop_latch_time is not None:
+                    _inter_row_gap_ms = (_now_latch - self._last_stop_latch_time) * 1000.0
+                    logger.info(
+                        "INTER-ROW-STOP-GAP: row_prev={} row_curr={} gap_ms={}",
+                        self._last_stop_latch_row,
+                        _fire_idx + 1,
+                        int(round(_inter_row_gap_ms)),
+                    )
+                self._last_stop_latch_time = _now_latch
+                self._last_stop_latch_row = _fire_idx + 1
+                self._session_rows_fired += 1
+                self._session_stop_latches += 1
+                self._session_overshoot_records.append((_fire_idx + 1, _overshoot_px))
+
                 self._cycle_rows_fired.append(_fire_idx + 1)
                 self._cycle_fire_tangents.append(effective_tang_x)
                 _old_committed_bnd = self._committed_boundary_x
@@ -1789,10 +1909,14 @@ class MainWindow(QMainWindow):
                 # Immediately switch tracking to the next row in the SAME frame.
                 if self._tracked_anchor_idx is None:
                     # Normal (non-anchor) fire: Row N just fired — capture Row N+1's
-                    # position from this frame's grouping (row2 = grouped_rows[1]).
+                    # position AND cluster id from this frame's grouping
+                    # (row2 = grouped_rows[1], same index into id_grouped_rows).
                     _next_idx = _fire_idx + 1
                     _next_anchor = (
                         min(leading_edge_x(d) for d in row2) if row2 else None
+                    )
+                    _next_cluster_id = (
+                        id_grouped_rows[1][0] if len(id_grouped_rows) > 1 else None
                     )
                     if _next_anchor is not None and _next_idx < len(self._row_status):
                         self._log_state(
@@ -1800,10 +1924,11 @@ class MainWindow(QMainWindow):
                         )
                         self._tracked_anchor_x = _next_anchor
                         self._tracked_anchor_idx = _next_idx
+                        self._tracked_anchor_cluster_id = _next_cluster_id
                         logger.info(
                             "Row-SM SWITCH: Row {} fired -> immediately switching active "
-                            "reference to Row {} (captured tangent={})",
-                            _fire_idx + 1, _next_idx + 1, int(_next_anchor),
+                            "reference to Row {} (captured tangent={}, cluster_id={})",
+                            _fire_idx + 1, _next_idx + 1, int(_next_anchor), _next_cluster_id,
                         )
                         # Same-frame display switch: show Row 2's red line immediately.
                         self._cycle_front_row = row2
@@ -1828,6 +1953,7 @@ class MainWindow(QMainWindow):
                     )
                     self._tracked_anchor_x = None
                     self._tracked_anchor_idx = None
+                    self._tracked_anchor_cluster_id = None
 
                 self._sm.handle_stop_tuchabzug_trigger()
                 self._push_signals_to_opcua()
@@ -2483,6 +2609,9 @@ class MainWindow(QMainWindow):
         self._cfg.detection.grid_columns = max(1, columns)
         self._save_cfg()
         self._row_line_tracker.reset()
+        self._cluster_tracker.reset()
+        self._last_cluster_track_time = None
+        self._cycle_id_grouped_rows = []
         logger.info("grid columns/row set to {}", columns)
 
     def _on_wizard_grid_rows_changed(self, rows: int) -> None:
@@ -2498,6 +2627,7 @@ class MainWindow(QMainWindow):
         self._post_reset_pending = False
         self._tracked_anchor_x = None
         self._tracked_anchor_idx = None
+        self._tracked_anchor_cluster_id = None
         logger.info("grid rows set to {}", rows)
 
     def _on_row_grouping_changed(self, enabled: bool) -> None:
@@ -2510,6 +2640,9 @@ class MainWindow(QMainWindow):
         self._cfg.detection.use_row_grouping = enabled
         self._save_cfg()
         self._row_line_tracker.reset()
+        self._cluster_tracker.reset()
+        self._last_cluster_track_time = None
+        self._cycle_id_grouped_rows = []
         self._row_group_stop_active = False
         self._row_lines = []
         self._row_count = 0
@@ -2522,6 +2655,7 @@ class MainWindow(QMainWindow):
         self._post_reset_pending = False
         self._tracked_anchor_x = None
         self._tracked_anchor_idx = None
+        self._tracked_anchor_cluster_id = None
         self._cycle_partial_warned = False
         self._cycle_front_row = []
         self._cycle_row2 = []
@@ -2788,6 +2922,9 @@ class MainWindow(QMainWindow):
         self._belt_fault_debounce_count = 0
         self._transfer_timeout_warned = False
         self._row_line_tracker.reset()
+        self._cluster_tracker.reset()
+        self._last_cluster_track_time = None
+        self._cycle_id_grouped_rows = []
         self._row_group_stop_active = False
         self._row_lines = []
         self._row_count = 0

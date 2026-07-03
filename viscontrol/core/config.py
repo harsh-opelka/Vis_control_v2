@@ -342,6 +342,34 @@ class _DetectionSection(BaseModel):
             "viscontrol/detection/row_grouping.py: group_by_gap."
         ),
     )
+    cloth_speed_px_s: float = Field(
+        350.0, ge=0,
+        description=(
+            "USE_ROW_GROUPING only. Expected cloth travel speed in cloth-ROI "
+            "pixels/second, used by ClusterTracker to predict a tracked "
+            "cluster's next front-X (last front-X - speed * dt) so it can be "
+            "matched frame-to-frame by predicted position instead of raw "
+            "distance. 0 = unconfigured, falls back to 350 px/s. See "
+            "viscontrol/detection/row_grouping.py: ClusterTracker."
+        ),
+    )
+    cluster_max_match_dist_px: float = Field(
+        120.0, ge=0,
+        description=(
+            "USE_ROW_GROUPING only. A gap-cluster matches a tracked cluster "
+            "when within this many pixels of its predicted (speed-extrapolated) "
+            "front position; farther than this it's treated as a new cluster "
+            "entering from the right. See ClusterTracker."
+        ),
+    )
+    cluster_max_missed_frames: int = Field(
+        3, ge=0,
+        description=(
+            "USE_ROW_GROUPING only. A tracked cluster unmatched for more than "
+            "this many consecutive frames is dropped (crossed the line or "
+            "lost). See ClusterTracker."
+        ),
+    )
     detection_zone_width_px: int = Field(
         600, ge=0,
         description=(

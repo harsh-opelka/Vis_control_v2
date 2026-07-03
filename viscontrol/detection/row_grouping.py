@@ -38,6 +38,8 @@ import statistics
 from dataclasses import dataclass
 from typing import Any, Sequence
 
+from viscontrol.core.logger import logger
+
 # Row split tolerance, as a multiple of the median DETECTED piece diameter:
 # pieces whose travel coordinates differ by less than
 # (gap_diameters × median diameter) are the same row; a clearly larger gap
@@ -161,6 +163,126 @@ def group_by_gap(
         else:
             clusters[-1].append(cur)
     return clusters, gaps
+
+
+# Sticky cluster tracking (Layer 2, on top of group_by_gap): group_by_gap
+# re-clusters from scratch every frame, so a cluster's position in the
+# returned list is not a stable identity — a piece entering or leaving a row
+# can shift every cluster behind it by one slot. ClusterTracker assigns each
+# cluster a persistent id by matching it, frame to frame, to the tracked
+# cluster whose PREDICTED front position (extrapolated by cloth speed) is
+# nearest — never by list index — so callers can key row identity, UI color,
+# and anchor selection off that id instead of per-frame sort order.
+CLUSTER_MAX_MATCH_DIST_PX: float = 120.0
+CLUSTER_MAX_MISSED_FRAMES: int = 3
+DEFAULT_CLOTH_SPEED_PX_S: float = 350.0
+
+
+@dataclass
+class _TrackedCluster:
+    id: int
+    front_x: float         # last known front (min leading_edge_x of members)
+    last_seen_frame: int
+    missed: int = 0
+
+
+class ClusterTracker:
+    """Sticky per-cycle identity tracking for ``group_by_gap`` output.
+
+    ``update`` is fed one frame's clusters and returns them tagged with a
+    STABLE id. A cluster keeps its id across frames by matching its front
+    position (min leading_edge_x of its members) to the nearest tracked
+    cluster's PREDICTED front position — last front-X minus expected cloth
+    travel since the last frame (``cloth_speed_px_s * dt_s``) — using a
+    global nearest-pair match so a cluster can't steal a better-matching
+    neighbour's id. A cluster farther than ``max_match_dist_px`` from every
+    prediction is new (entering from the right, gets a fresh id). A tracked
+    cluster unmatched for more than ``max_missed_frames`` frames is dropped
+    (crossed the transfer line or lost for good).
+    """
+
+    def __init__(
+        self,
+        *,
+        max_match_dist_px: float = CLUSTER_MAX_MATCH_DIST_PX,
+        max_missed_frames: int = CLUSTER_MAX_MISSED_FRAMES,
+    ) -> None:
+        self._tracked: list[_TrackedCluster] = []
+        self._next_id: int = 1
+        self._frame_no: int = 0
+        self._max_match_dist_px = max_match_dist_px
+        self._max_missed_frames = max_missed_frames
+
+    def reset(self) -> None:
+        self._tracked = []
+        self._next_id = 1
+        self._frame_no = 0
+
+    def update(
+        self,
+        clusters: Sequence[list[Any]],
+        *,
+        dt_s: float,
+        cloth_speed_px_s: float = DEFAULT_CLOTH_SPEED_PX_S,
+    ) -> list[tuple[int, list[Any]]]:
+        """Tag this frame's clusters with stable ids.
+
+        Returns ``(id, members)`` pairs in the SAME order as ``clusters``
+        (front-first, per ``group_by_gap``). Logs one
+        ``CLUSTER-TRACK: id=N front=X matched|new|lost`` line per tracked
+        cluster this call, for visibility into row identity across frames.
+        """
+        self._frame_no += 1
+        travel = max(cloth_speed_px_s, 0.0) * max(dt_s, 0.0)
+        fronts = [
+            min(leading_edge_x(d) for d in c) if c else float("inf")
+            for c in clusters
+        ]
+
+        # Global nearest-pair greedy match: closest (cluster, tracked) pairs
+        # win first, so a cluster can't be stolen by a farther-but-earlier one.
+        candidates: list[tuple[float, int, int]] = []
+        for ci, front in enumerate(fronts):
+            for ti, tr in enumerate(self._tracked):
+                predicted = tr.front_x - travel
+                dist = abs(front - predicted)
+                if dist <= self._max_match_dist_px:
+                    candidates.append((dist, ci, ti))
+        candidates.sort(key=lambda c: c[0])
+
+        assigned_ids: list[int | None] = [None] * len(clusters)
+        matched_tracked: set[int] = set()
+        matched_clusters: set[int] = set()
+        for _dist, ci, ti in candidates:
+            if ci in matched_clusters or ti in matched_tracked:
+                continue
+            matched_clusters.add(ci)
+            matched_tracked.add(ti)
+            tr = self._tracked[ti]
+            tr.front_x = fronts[ci]
+            tr.last_seen_frame = self._frame_no
+            tr.missed = 0
+            assigned_ids[ci] = tr.id
+            logger.info("CLUSTER-TRACK: id={} front={} matched", tr.id, int(round(fronts[ci])))
+
+        for ci, front in enumerate(fronts):
+            if assigned_ids[ci] is not None:
+                continue
+            tr = _TrackedCluster(id=self._next_id, front_x=front, last_seen_frame=self._frame_no)
+            self._next_id += 1
+            self._tracked.append(tr)
+            assigned_ids[ci] = tr.id
+            logger.info("CLUSTER-TRACK: id={} front={} new", tr.id, int(round(front)))
+
+        for ti, tr in enumerate(self._tracked):
+            if ti not in matched_tracked and tr.last_seen_frame != self._frame_no:
+                tr.missed += 1
+        lost = [tr for tr in self._tracked if tr.missed > self._max_missed_frames]
+        for tr in lost:
+            logger.info("CLUSTER-TRACK: id={} front={} lost", tr.id, int(round(tr.front_x)))
+        self._tracked = [tr for tr in self._tracked if tr.missed <= self._max_missed_frames]
+
+        return [(assigned_ids[i], clusters[i]) for i in range(len(clusters))]  # type: ignore[misc]
 
 
 # Grouping outlier rejection: within a sliced group, a member whose leading-edge
