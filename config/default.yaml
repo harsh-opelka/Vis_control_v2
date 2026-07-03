@@ -98,6 +98,8 @@ detection:
                                    # diameter. Lower = more rows; higher = fewer. Typical 0.5-1.0
   grid_columns: 8            # SECTION 6: pieces per row in the loaded grid. Row grouping
                              # uses this to identify the front/current row (N closest pieces)
+  row_gap_threshold_px: 150  # gap-cluster split: new row starts when the X gap between
+                             # consecutive sorted pieces exceeds this many pixels
   grid_rows: 0               # SECTION 6: expected rows on the cloth (0 = unknown). Informational.
   detection_zone_width_px: 600  # pixels of approach-side cloth beyond the bridge where Hough runs;
                                 # 0 = full ROI (no restriction). Outer edge drawn on cloth view.

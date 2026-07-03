@@ -18,7 +18,7 @@ import time
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import cv2
 import numpy as np
@@ -45,9 +45,10 @@ from viscontrol.detection.classical import ClassicalDetector
 from viscontrol.detection.pipeline import InspectionPipeline
 from viscontrol.detection.row_grouping import (
     RowLineTracker,
+    group_by_gap,
     leading_edge_x,
     median_piece_diameter,
-    slice_rows_by_count,
+    reject_group_outliers,
 )
 from viscontrol.io.camera import OrientationTransform, PlaybackCamera, make_camera
 from viscontrol.io.recorder import FrameRecorder
@@ -74,8 +75,8 @@ from viscontrol.ui.widgets.status_bar import StatusBar
 _DISPLAY_INTERVAL_S: float = 1.0 / 15.0   # ~15 fps display cap
 _PERF_LOG_INTERVAL_S: float = 1.0         # SECTION 1: per-stage timing summary, once/sec
 # Post-fire boundary CLEARING -> ARMED transition (USE_ROW_GROUPING only).
-_BOUNDARY_CLEAR_STREAK: int = 3           # consecutive frames with 0 excluded leftovers
-_BOUNDARY_CLEAR_TIMEOUT_S: float = 1.5    # safety timeout since the post-fire rising edge
+# Safety timeout is config-driven — see AppConfig.detection.clearing_timeout_ms.
+_BOUNDARY_CLEAR_STREAK: int = 1           # consecutive frames with 0 excluded leftovers
 
 
 class _FrameBridge(QObject):
@@ -1073,9 +1074,9 @@ class MainWindow(QMainWindow):
             # cloth_detections for coloring in _draw_detection.
             _row_count_display: int | None = None
             if self._cfg.detection.use_row_grouping and cloth_detections:
-                # Count-based grouping with boundary filter (same filter as stop decision).
+                # Gap-cluster grouping with boundary filter (same filter as stop decision).
                 # Excluded pieces (X <= committed_boundary_x) are drawn gray (-1);
-                # only eligible pieces participate in the sort+slice row coloring.
+                # only eligible pieces participate in the gap-cluster row coloring.
                 _disp_bnd = self._committed_boundary_x
                 _disp_eligible = [
                     d for d in cloth_detections
@@ -1085,7 +1086,9 @@ class MainWindow(QMainWindow):
                     d for d in cloth_detections
                     if _disp_bnd is not None and leading_edge_x(d) <= _disp_bnd
                 ]
-                _grouped = slice_rows_by_count(_disp_eligible, self._cfg.detection.grid_columns)
+                _grouped, _ = group_by_gap(
+                    _disp_eligible, self._cfg.detection.row_gap_threshold_px,
+                )
                 _row_count_display = len(_grouped)
                 # Map detection object → index for O(1) lookup; assign row colours.
                 _det_to_idx = {id(det): i for i, det in enumerate(cloth_detections)}
@@ -1458,7 +1461,7 @@ class MainWindow(QMainWindow):
                     "Post-fire state: ARMED (reason=leftovers_cleared), "
                     "boundary filter disabled",
                 )
-            elif _clearing_elapsed >= _BOUNDARY_CLEAR_TIMEOUT_S:
+            elif _clearing_elapsed >= self._cfg.detection.clearing_timeout_ms / 1000.0:
                 self._boundary_phase = "ARMED"
                 self._cycle_clearing_durations_ms.append(_clearing_elapsed * 1000.0)
                 self._cycle_armed_reasons.append("timeout")
@@ -1494,14 +1497,44 @@ class MainWindow(QMainWindow):
                         int(round(leading_edge_x(_excl_d))),
                     )
 
-        grouped_rows = slice_rows_by_count(_eligible, grid_cols)
+        grouped_rows, _row_gaps = group_by_gap(_eligible, self._cfg.detection.row_gap_threshold_px)
 
-        # Sort-slice grouping log (unthrottled — diagnostic).
+        # Outlier rejection: only meaningful for an over-full cluster (more
+        # pieces than a row should hold) — a straggler that slipped past the
+        # boundary filter or gap threshold could still land in a group and
+        # skew its front tangent. Leave-one-out check — drop any member
+        # farther than reject_group_outliers' max_dist_px from the median of
+        # the others so it can't contaminate a legitimate row's group. A
+        # cluster with grid_cols or fewer members is left alone: it's a valid
+        # (possibly partial) row, not a candidate for rejection.
+        _cleaned_grouped_rows: list[list[Any]] = []
+        for _grp in grouped_rows:
+            if len(_grp) > grid_cols:
+                _grp_kept, _grp_rejected = reject_group_outliers(_grp)
+                for _out_d, _out_med, _out_dist in _grp_rejected:
+                    logger.info(
+                        "Grouping outlier rejected: X={} median={} dist={}",
+                        int(round(leading_edge_x(_out_d))),
+                        int(round(_out_med)),
+                        int(round(_out_dist)),
+                    )
+            else:
+                _grp_kept = _grp
+                if 0 < len(_grp_kept) < grid_cols:
+                    logger.info("Partial cluster: {} pieces", len(_grp_kept))
+            _cleaned_grouped_rows.append(_grp_kept)
+        grouped_rows = _cleaned_grouped_rows
+
+        # Gap-cluster grouping log (unthrottled — diagnostic).
         _log_xs = [int(round(leading_edge_x(d))) for d in sorted(_eligible, key=leading_edge_x)]
         _log_groups = [[int(round(leading_edge_x(d))) for d in grp] for grp in grouped_rows]
         logger.info(
-            "Sort-slice grouping: {} pieces detected, sorted X={}, sliced into groups_of_{}={}",
-            len(_eligible), _log_xs, grid_cols, _log_groups,
+            "Gap-cluster grouping: {} pieces -> {} clusters, gaps={}",
+            len(_eligible), len(_log_groups), [int(round(g)) for g in _row_gaps],
+        )
+        logger.info(
+            "Gap-cluster groups: sorted X={}, clusters={}",
+            _log_xs, _log_groups,
         )
 
         active_idx = self._active_row_index
@@ -1710,6 +1743,25 @@ class MainWindow(QMainWindow):
                     int(effective_tang_x),
                     transfer_x,
                     self._row_status,
+                )
+                _overshoot_px = transfer_x - effective_tang_x
+                _last_clearing_ms = (
+                    self._cycle_clearing_durations_ms[-1]
+                    if self._cycle_clearing_durations_ms else 0.0
+                )
+                _last_clearing_reason = (
+                    self._cycle_armed_reasons[-1]
+                    if self._cycle_armed_reasons else "n/a"
+                )
+                logger.info(
+                    "FIRE OVERSHOOT: row={} fired_tangent={} transfer_x={:.0f} "
+                    "overshoot_px={} clearing_duration_ms={} clearing_exit_reason={}",
+                    _fire_idx + 1,
+                    int(effective_tang_x),
+                    transfer_x,
+                    int(round(_overshoot_px)),
+                    int(round(_last_clearing_ms)),
+                    _last_clearing_reason,
                 )
                 self._cycle_rows_fired.append(_fire_idx + 1)
                 self._cycle_fire_tangents.append(effective_tang_x)

@@ -130,29 +130,76 @@ def group_rows(
     return rows
 
 
-def slice_rows_by_count(
+def group_by_gap(
     detections: Sequence[Any],
-    columns: int,
-) -> list[list[Any]]:
-    """Sort detections by leading_edge_x then slice into equal-count row groups.
+    gap_threshold_px: float,
+) -> tuple[list[list[Any]], list[float]]:
+    """Sort detections by leading_edge_x and cluster on the gaps between them.
 
-    Row 0 = the first ``columns`` pieces (smallest leading_edge_x = closest to
-    the transfer line), Row 1 = the next ``columns``, etc.
+    A new cluster starts whenever the gap between consecutive sorted pieces'
+    leading-edge X exceeds ``gap_threshold_px``. Each cluster lines up with a
+    physical row regardless of how many pieces were actually detected in it —
+    unlike a fixed-size slice, a missing or extra detection in one row cannot
+    shift the grouping of every row behind it.
 
-    Works correctly when rows are touching or overlapping in X, because grouping
-    uses COUNT not distance — no tolerance threshold involved. Only the sort order
-    and ``columns`` matter.
-
-    Partial last group (fewer than ``columns`` pieces) is returned as-is — the
-    caller's existing partial-detection logic handles that case.
-    Returns an empty list when there are no detections. ``columns`` <= 0 → 1.
+    Returns ``(clusters, gaps)`` where ``clusters`` is front-first (smallest
+    leading_edge_x first) and ``gaps`` is the consecutive-gap list used to
+    split them, for the caller to log. Returns ``([], [])`` for no detections.
+    ``gap_threshold_px`` <= 0 puts every piece in its own cluster.
     """
     items = list(detections)
     if not items:
-        return []
+        return [], []
     items.sort(key=leading_edge_x)
-    n = max(1, columns)
-    return [items[i : i + n] for i in range(0, len(items), n)]
+    clusters: list[list[Any]] = [[items[0]]]
+    gaps: list[float] = []
+    for prev, cur in zip(items, items[1:]):
+        gap = leading_edge_x(cur) - leading_edge_x(prev)
+        gaps.append(gap)
+        if gap > gap_threshold_px:
+            clusters.append([cur])
+        else:
+            clusters[-1].append(cur)
+    return clusters, gaps
+
+
+# Grouping outlier rejection: within a sliced group, a member whose leading-edge
+# X differs from the median of the OTHER members by more than this many pixels
+# is treated as a straggler (e.g. a leftover piece that slipped past the
+# boundary filter) rather than a genuine member of that row.
+GROUP_OUTLIER_MAX_DIST_PX: float = 100.0
+
+
+def reject_group_outliers(
+    group: Sequence[Any],
+    *,
+    max_dist_px: float = GROUP_OUTLIER_MAX_DIST_PX,
+) -> tuple[list[Any], list[tuple[Any, float, float]]]:
+    """Leave-one-out outlier rejection within a single sliced row group.
+
+    For each member, compares its leading-edge X to the MEDIAN leading-edge X
+    of the OTHER members. A member farther than ``max_dist_px`` from that
+    median doesn't belong with the rest of the group and is dropped. Needs at
+    least 2 members to have any "others" to compare against.
+
+    Returns ``(kept, rejected)`` where ``rejected`` is
+    ``(detection, median_of_others, distance)`` per dropped piece, for the
+    caller to log.
+    """
+    items = list(group)
+    if len(items) < 2:
+        return items, []
+    kept: list[Any] = []
+    rejected: list[tuple[Any, float, float]] = []
+    for i, d in enumerate(items):
+        others = [leading_edge_x(o) for j, o in enumerate(items) if j != i]
+        med = statistics.median(others)
+        dist = abs(leading_edge_x(d) - med)
+        if dist > max_dist_px:
+            rejected.append((d, med, dist))
+        else:
+            kept.append(d)
+    return kept, rejected
 
 
 def row_leading_edge(row: Sequence[Any]) -> float:

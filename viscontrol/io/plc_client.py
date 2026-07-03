@@ -21,8 +21,11 @@ queue so there are never concurrent calls to the opcua client.  The main/GUI
 thread only enqueues commands (non-blocking); the worker thread drains them and
 then polls the readable node at ``poll_interval_s``.
 
-The stop-pulse command sends True, sleeps ``stop_pulse_ms``, then sends False —
-all on the worker thread so the GUI never blocks.
+The stop command LATCHES ext_tuchabzug_stop = True (a held level, not a timed
+pulse) so the PLC cannot miss it. The latch is released (written False) the
+moment ext_tuchabzug_status falls (the PLC acknowledged the stop by halting),
+or after ``stop_latch_timeout_s`` as a safety net if it never does — both
+checked from the worker thread's poll loop, so the GUI never blocks.
 
 The livebit (ext_viscontrol_alive) is toggled by the worker thread itself every
 1 second using a monotonic clock, with no separate thread required.  It resumes
@@ -51,6 +54,9 @@ _CMD_CLEAR_ERROR = "clear_error"
 _SENTINEL = None  # stop_event wakeup / shutdown sentinel
 
 _LIVEBIT_INTERVAL_S: float = 1.0
+# Safety net: if the PLC never acknowledges the stop latch (ext_tuchabzug_status
+# never falls) within this many seconds of setting it, release it anyway.
+_STOP_LATCH_TIMEOUT_S: float = 10.0
 
 
 class PlcInterface:
@@ -116,7 +122,9 @@ class PlcClient(PlcInterface):
         self._url = url
         self._node_ids = node_ids
         self._poll_interval = poll_interval_s
-        self._stop_pulse_s = stop_pulse_ms / 1000.0
+        # stop_pulse_ms is no longer used for timing — the stop signal is now
+        # a latched level (see module docstring), not a timed pulse. Kept as
+        # a constructor/config parameter only so callers don't need updating.
         self._reconnect_delay = reconnect_delay_s
 
         # OPC UA state (only touched by the worker thread)
@@ -132,6 +140,11 @@ class PlcClient(PlcInterface):
         # Cached readable values (updated by worker thread; safe to read from GUI thread)
         self._cached_tuchabzug: bool = False
         self._cached_einlaufband_running: bool = False
+
+        # Stop latch state (worker thread only). _stop_latch_set_time doubles as
+        # the STOP-LATENCY fire-to-falling-edge measurement start.
+        self._stop_latch_active: bool = False
+        self._stop_latch_set_time: float | None = None
 
         # Callbacks injected by MainWindow
         self.on_tuchabzug_change: Optional[Callable[[bool], None]] = None
@@ -266,10 +279,13 @@ class PlcClient(PlcInterface):
             self._connected = False
 
     def _do_stop_pulse(self) -> None:
-        """Write ext_tuchabzug_stop True → sleep → False.
+        """Latch ext_tuchabzug_stop = True (held level — no timed reset).
 
-        Mirrors the reference ``pulse_stop_if_status_true``.
-        Only fires if ext_tuchabzug_status is True.
+        Only fires if ext_tuchabzug_status is True. Release is NOT handled
+        here: the worker loop's poll phase writes False the moment
+        ext_tuchabzug_status falls (PLC acknowledged by halting), or after
+        _STOP_LATCH_TIMEOUT_S as a safety net — see _release_stop_latch and
+        its call sites in _thread_main.
         """
         try:
             from opcua import ua  # type: ignore[import]
@@ -277,19 +293,39 @@ class PlcClient(PlcInterface):
             return
         status = bool(self._nodes["ext_tuchabzug_status"].get_value())
         if not status:
-            logger.debug("PlcClient: stop pulse skipped (ext_tuchabzug_status=False)")
+            logger.debug("PlcClient: stop latch skipped (ext_tuchabzug_status=False)")
             return
         dv_true = ua.DataValue(ua.Variant(True, ua.VariantType.Boolean))
-        dv_false = ua.DataValue(ua.Variant(False, ua.VariantType.Boolean))
         self._nodes["ext_tuchabzug_stop"].set_value(dv_true)
-        logger.info("PlcClient: ext_tuchabzug_stop = True")
-        time.sleep(self._stop_pulse_s)
-        # Re-check connection after sleep before writing False
-        if not self._connected:
-            logger.warning("PlcClient: connection lost during stop pulse — skipping False write")
+        self._stop_latch_active = True
+        self._stop_latch_set_time = time.monotonic()
+        logger.info("STOP-LATCH set")
+
+    def _release_stop_latch(self, reason: str) -> None:
+        """Write ext_tuchabzug_stop = False and log the release.
+
+        ``reason`` is "plc_ack" (ext_tuchabzug_status fell) or "timeout"
+        (_STOP_LATCH_TIMEOUT_S elapsed with no acknowledgement). No-op if the
+        latch isn't currently active.
+        """
+        if not self._stop_latch_active:
             return
+        try:
+            from opcua import ua  # type: ignore[import]
+        except ImportError:
+            return
+        if not self._connected:
+            logger.warning("PlcClient: connection lost — skipping stop latch release write")
+            return
+        dv_false = ua.DataValue(ua.Variant(False, ua.VariantType.Boolean))
         self._nodes["ext_tuchabzug_stop"].set_value(dv_false)
-        logger.info("PlcClient: ext_tuchabzug_stop = False")
+        _dur_ms = (
+            (time.monotonic() - self._stop_latch_set_time) * 1000.0
+            if self._stop_latch_set_time is not None else 0.0
+        )
+        self._stop_latch_active = False
+        self._stop_latch_set_time = None
+        logger.info("STOP-LATCH released after {:.0f}ms (reason={})", _dur_ms, reason)
 
     def _do_set_error(self, code: int) -> None:
         try:
@@ -355,12 +391,35 @@ class PlcClient(PlcInterface):
                         "PlcClient: ext_tuchabzug_status {} → {}",
                         last_tuch, tuch,
                     )
+                    _was_true = last_tuch
                     last_tuch = tuch
+                    if _was_true and not tuch:
+                        # Falling edge = the PLC acknowledged the stop by
+                        # halting. This both releases the stop latch and is
+                        # the STOP-LATENCY measurement point.
+                        if self._stop_latch_set_time is not None:
+                            logger.info(
+                                "STOP-LATENCY fire_to_falling_edge={:.0f}ms",
+                                (time.monotonic() - self._stop_latch_set_time) * 1000.0,
+                            )
+                        self._release_stop_latch("plc_ack")
                     if self.on_tuchabzug_change is not None:
                         try:
                             self.on_tuchabzug_change(tuch)
                         except Exception:
                             logger.exception("on_tuchabzug_change callback error")
+
+                # Safety net: release the stop latch even without PLC ack.
+                if (
+                    self._stop_latch_active
+                    and self._stop_latch_set_time is not None
+                    and time.monotonic() - self._stop_latch_set_time >= _STOP_LATCH_TIMEOUT_S
+                ):
+                    logger.warning(
+                        "STOP-LATCH TIMEOUT: PLC did not acknowledge stop within {:.0f}s",
+                        _STOP_LATCH_TIMEOUT_S,
+                    )
+                    self._release_stop_latch("timeout")
 
                 # Einlaufband running — cached for read_einlaufband_running().
                 self._cached_einlaufband_running = bool(

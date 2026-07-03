@@ -331,6 +331,17 @@ class _DetectionSection(BaseModel):
             "to fire one StopTuchabzug per row. Settable in the wizard."
         ),
     )
+    row_gap_threshold_px: int = Field(
+        150, ge=1,
+        description=(
+            "USE_ROW_GROUPING only. Pieces are sorted by leading-edge X and "
+            "split into clusters wherever the gap to the next piece exceeds "
+            "this many pixels — each cluster is one physical row, regardless "
+            "of missing/extra detections. Replaces the old fixed-size "
+            "sort-slice-by-grid_columns grouping. See "
+            "viscontrol/detection/row_grouping.py: group_by_gap."
+        ),
+    )
     detection_zone_width_px: int = Field(
         600, ge=0,
         description=(
@@ -386,11 +397,23 @@ class _DetectionSection(BaseModel):
         ),
     )
     boundary_offset_px: int = Field(
-        30, ge=0,
+        25, ge=0,
         description=(
             "USE_ROW_GROUPING only. Added to the fired tangent when setting "
             "committed_boundary_x: boundary = fired_tangent_x + boundary_offset_px. "
-            "0 = boundary sits exactly at the fired tangent."
+            "0 = boundary sits exactly at the fired tangent. Default 25px (was "
+            "12px, originally 30px) balances a narrow dead zone above transfer_x "
+            "against grouping/outlier logic that now also guards against stragglers."
+        ),
+    )
+    clearing_timeout_ms: int = Field(
+        400, ge=0,
+        description=(
+            "USE_ROW_GROUPING only. Safety timeout for the post-fire CLEARING -> "
+            "ARMED transition: if the leftovers-cleared streak hasn't been "
+            "satisfied within this many milliseconds of the next rising edge, "
+            "ARMED is forced anyway so the boundary filter can't block a "
+            "legitimate fire indefinitely. Default 400ms (was a hardcoded 1.5s)."
         ),
     )
     post_reset_fresh_margin_px: int = Field(
