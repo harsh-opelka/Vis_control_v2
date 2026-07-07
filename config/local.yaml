@@ -45,9 +45,14 @@ detection:
   cloth_speed_px_s: 350
   cluster_max_match_dist_px: 120
   cluster_max_missed_frames: 3
+  staggered_layout: false
+  column_y_bands: []
   detection_zone_width_px: 1000
   grid_rows: 3
   max_memory_frames: 5
+  fallback_hard_cap_frames: 15
+  max_reasonable_overshoot_px: 60
+  far_past_block_timeout_ms: 3000
   row_x_tolerance_px: 0
   boundary_safety_margin_px: 80
   boundary_offset_px: 15

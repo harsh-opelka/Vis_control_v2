@@ -477,3 +477,105 @@ class RowLineTracker:
                 tr.fired = True
                 fired += 1
         return fired
+
+
+# ---------------------------------------------------------------------------
+# Layer 3: column-based grouping (staggered layouts), behind
+# config.detection.staggered_layout. Entirely independent of Layer 1
+# (group_by_gap) and Layer 2 (ClusterTracker) above — when a staggered layout
+# means pieces in the same physical row don't line up along X within a single
+# gap-cluster, grouping instead assigns each piece to a fixed COLUMN by its Y
+# position, and a "row" becomes the next not-yet-fired piece in every column
+# (tracked by a per-column front_pointer). See MainWindow._apply_column_based_stop
+# for the fire-decision integration; this module only provides the pure
+# column-assignment/row-building logic.
+# ---------------------------------------------------------------------------
+
+
+def default_column_y_bands(roi_height: float, grid_columns: int) -> list[list[float]]:
+    """Evenly-spaced column Y-bands spanning ``[0, roi_height)``.
+
+    Fallback used whenever ``config.detection.column_y_bands`` is empty or
+    doesn't match ``grid_columns`` — i.e. uncalibrated. Callers are expected
+    to log a warning whenever this is used (accuracy depends on physical
+    column spacing actually being uniform, which the real 'Set Column Bands'
+    calibration does not assume).
+    """
+    n = max(1, grid_columns)
+    band_h = max(float(roi_height), 1.0) / n
+    return [[i * band_h, (i + 1) * band_h] for i in range(n)]
+
+
+def assign_column(y: float, column_y_bands: Sequence[Sequence[float]]) -> int:
+    """Column index for a piece at travel-perpendicular coordinate ``y``.
+
+    Returns the index of the band containing ``y`` (``y_min <= y < y_max``).
+    A ``y`` outside every band (piece drifted past a calibrated edge, or the
+    bands don't fully cover the ROI) falls back to the NEAREST band by
+    center distance, rather than being dropped — a column assignment is
+    always made when at least one band exists. Returns -1 only when
+    ``column_y_bands`` itself is empty.
+    """
+    for i, band in enumerate(column_y_bands):
+        y_min, y_max = band[0], band[1]
+        if y_min <= y < y_max:
+            return i
+    if not column_y_bands:
+        return -1
+    centers = [(band[0] + band[1]) / 2.0 for band in column_y_bands]
+    return min(range(len(centers)), key=lambda i: abs(centers[i] - y))
+
+
+def assign_columns(
+    detections: Sequence[Any],
+    column_y_bands: Sequence[Sequence[float]],
+) -> dict[int, list[Any]]:
+    """Bucket ``detections`` into columns by Y, each column sorted front-to-back.
+
+    Returns ``{column_index: [pieces...]}``, members sorted by
+    ``leading_edge_x`` ascending (index 0 = most advanced / smallest X).
+    Logs ``COLUMN-ASSIGN: piece_X=X piece_Y=Y -> column=N`` per piece — the
+    caller only invokes this function when ``staggered_layout`` is True, so
+    non-staggered runs never see this log.
+    """
+    columns: dict[int, list[Any]] = {}
+    for d in detections:
+        y = float(d.centroid[1])
+        col = assign_column(y, column_y_bands)
+        logger.info(
+            "COLUMN-ASSIGN: piece_X={} piece_Y={} -> column={}",
+            int(round(leading_edge_x(d))), int(round(y)), col,
+        )
+        if col < 0:
+            continue
+        columns.setdefault(col, []).append(d)
+    for members in columns.values():
+        members.sort(key=leading_edge_x)
+    return columns
+
+
+def build_front_row(
+    columns: dict[int, list[Any]],
+    front_pointers: Sequence[int],
+) -> tuple[list[Any], list[int], bool]:
+    """The next row: the piece at rank ``front_pointers[c]`` in every column ``c``.
+
+    Returns ``(row_pieces, columns_used, any_column_empty)``:
+    ``columns_used`` is the list of column indices that actually contributed
+    a piece (i.e. had one available at their front pointer); the row is
+    "complete" — eligible to fire — only when ``any_column_empty`` is False,
+    meaning every column in ``front_pointers`` had a piece ready. A column
+    with no unfired piece at its front pointer contributes nothing (not an
+    error here — the caller logs COLUMN STARVATION and withholds firing).
+    """
+    row: list[Any] = []
+    columns_used: list[int] = []
+    any_column_empty = False
+    for c, fp in enumerate(front_pointers):
+        members = columns.get(c, [])
+        if fp < len(members):
+            row.append(members[fp])
+            columns_used.append(c)
+        else:
+            any_column_empty = True
+    return row, columns_used, any_column_empty

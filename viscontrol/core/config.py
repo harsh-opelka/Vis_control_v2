@@ -370,6 +370,31 @@ class _DetectionSection(BaseModel):
             "lost). See ClusterTracker."
         ),
     )
+    staggered_layout: bool = Field(
+        False,
+        description=(
+            "USE_ROW_GROUPING only. Master switch for Layer 3 column-based "
+            "grouping. False (default) = gap-cluster grouping (Layer 1) + "
+            "sticky cluster tracking (Layer 2) drive the fire decision, "
+            "unchanged — this is the non-staggered path. True = column-based "
+            "grouping (assign each piece to a column via column_y_bands, fire "
+            "per-column front-pointer rows) replaces gap-cluster grouping "
+            "entirely and drives the fire decision instead. See "
+            "MainWindow._apply_column_based_stop."
+        ),
+    )
+    column_y_bands: list[list[float]] = Field(
+        default_factory=list,
+        description=(
+            "staggered_layout only. Per-column [y_min, y_max] bands (cloth-ROI "
+            "pixels) used to assign a detected piece to a column by its "
+            "centroid Y. Length should equal grid_columns. Empty (default) = "
+            "uncalibrated — evenly-spaced bands across the cloth ROI height "
+            "are derived on the fly (logs a WARNING each time). Set via the "
+            "'Set Column Bands' calibration action (click each column's "
+            "vertical center in the paused cloth view) or edit directly here."
+        ),
+    )
     detection_zone_width_px: int = Field(
         600, ge=0,
         description=(
@@ -397,6 +422,42 @@ class _DetectionSection(BaseModel):
             "front-row leading-edge position when detection drops or returns "
             "fewer pieces than expected (frame drop fallback). 0 = disabled. "
             "See MainWindow._apply_tangent_stop_edge."
+        ),
+    )
+    fallback_hard_cap_frames: int = Field(
+        15, ge=0,
+        description=(
+            "USE_ROW_GROUPING only. Consecutive frames without a FRESH "
+            "detection for the active/tracked row (independent of, and "
+            "typically larger than, max_memory_frames) after which a "
+            "'FALLBACK EXCEEDED' warning is logged — the row is still held "
+            "waiting for real detection, never auto-fired on stale data. "
+            "Default 15 frames ~= 1.5s. 0 = never warn."
+        ),
+    )
+    max_reasonable_overshoot_px: int = Field(
+        60, ge=0,
+        description=(
+            "USE_ROW_GROUPING only. Fire-sanity threshold (cloth-ROI pixels "
+            "past transfer_x). A fire candidate with overshoot beyond this: "
+            "(a) requires >= 2 eligible pieces (a lone piece this far past is "
+            "treated as a stray, not a real row); (b) is not fired immediately "
+            "even with >= 2 pieces — the same tangent (within 20px) must "
+            "persist for 2 consecutive FRESH frames first ('SUSPICIOUS "
+            "FAR-PAST FIRE BLOCKED'), or the existing fallback-hold path is "
+            "left to catch up normally. Within this threshold, firing is "
+            "unaffected. See MainWindow._apply_tangent_stop_edge."
+        ),
+    )
+    far_past_block_timeout_ms: int = Field(
+        3000, ge=0,
+        description=(
+            "USE_ROW_GROUPING only. Maximum time a row may sit blocked by "
+            "'SUSPICIOUS FAR-PAST FIRE BLOCKED' (see max_reasonable_overshoot_px) "
+            "without the confirming second FRESH frame arriving. Once exceeded, "
+            "the row is force-fired on its last known tangent ('FAR-PAST BLOCK "
+            "TIMEOUT') so a row can never get stuck waiting forever. 0 = disabled "
+            "(block can last indefinitely)."
         ),
     )
     row_x_tolerance_px: int = Field(

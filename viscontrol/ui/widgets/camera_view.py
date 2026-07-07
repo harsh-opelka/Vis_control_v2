@@ -13,8 +13,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
-from PySide6.QtCore import QPointF, QRectF, Qt
-from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPaintEvent, QPen, QPixmap
+from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtGui import QColor, QFont, QImage, QMouseEvent, QPainter, QPaintEvent, QPen, QPixmap
 from PySide6.QtWidgets import QFrame, QSizePolicy, QVBoxLayout, QWidget, QLabel
 
 from viscontrol.detection.base import Detection
@@ -76,17 +76,43 @@ class CameraViewState:
     grid_row_assignments: dict[int, int] | None = None
     grid_ref_tangent_x: float | None = None
     grid_label: str | None = None
+    # Layer 3 "Set Column Bands" calibration: recorded click Y positions
+    # (image-local coords), drawn as dashed markers. None/[] = nothing to draw.
+    column_band_clicks: list[int] | None = None
 
 
 class _Canvas(QWidget):
     """Inner widget that actually paints the image + overlays."""
 
+    # Layer 3 "Set Column Bands" calibration: emits the clicked point's
+    # image-local Y (cloth-ROI pixel row) — only while calibration_mode is on.
+    calibration_click = Signal(int)
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._state = CameraViewState()
+        self._calibration_mode = False
+        # Transform of the most recently painted frame, cached so a click can
+        # be converted to image-space without repeating paintEvent's scaling
+        # math. None until the first frame is painted.
+        self._paint_dx = 0
+        self._paint_dy = 0
+        self._paint_sy = 1.0
+        self._paint_img_h = 0
         self.setMinimumSize(320, 240)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setStyleSheet(f"background-color: #1A1A1A; border-radius: {CARD_RADIUS}px;")
+
+    def set_calibration_mode(self, active: bool) -> None:
+        self._calibration_mode = active
+        self.setCursor(Qt.CursorShape.CrossCursor if active else Qt.CursorShape.ArrowCursor)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if not self._calibration_mode or self._paint_img_h <= 0:
+            return
+        click_y = (event.position().y() - self._paint_dy) / max(self._paint_sy, 1e-6)
+        click_y = max(0.0, min(float(self._paint_img_h - 1), click_y))
+        self.calibration_click.emit(int(round(click_y)))
 
     def set_state(self, state: CameraViewState) -> None:
         self._state = state
@@ -127,6 +153,30 @@ class _Canvas(QWidget):
         # Scale factor from image coords to drawn pixmap.
         sx = pixmap.width() / max(w, 1)
         sy = pixmap.height() / max(h, 1)
+
+        # Cached for mousePressEvent's widget-space -> image-space conversion
+        # (Set Column Bands calibration) — must match this frame's transform
+        # exactly, so it's captured here rather than recomputed on click.
+        self._paint_dx = dx
+        self._paint_dy = dy
+        self._paint_sy = sy
+        self._paint_img_h = h
+
+        # Set Column Bands calibration: horizontal marker + column index label
+        # at each recorded click Y (image-space). Drawn regardless of
+        # calibration_mode so a just-confirmed set of bands stays visible.
+        if state.column_band_clicks:
+            pen = QPen(QColor("#00E5A0"))
+            pen.setWidth(2)
+            pen.setStyle(Qt.PenStyle.DashLine)
+            p.setPen(pen)
+            font = QFont()
+            font.setPointSize(FONT_SMALL)
+            p.setFont(font)
+            for i, click_y in enumerate(state.column_band_clicks):
+                y_px = dy + click_y * sy
+                p.drawLine(QPointF(dx, y_px), QPointF(dx + pixmap.width(), y_px))
+                p.drawText(dx + 4, int(y_px) - 4, f"col {i}")
 
         # Tripwire band: semi-transparent fill over the transfer-line strip.
         # Drawn before the transfer line so the dashed line appears on top.
@@ -522,6 +572,9 @@ class _Canvas(QWidget):
 class CameraView(QFrame):
     """Captioned camera view (title + canvas + caption)."""
 
+    # Layer 3 "Set Column Bands" calibration — forwarded from the inner canvas.
+    calibration_click = Signal(int)
+
     def __init__(self, title: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("card")
@@ -545,6 +598,7 @@ class CameraView(QFrame):
         )
 
         self._canvas = _Canvas()
+        self._canvas.calibration_click.connect(self.calibration_click.emit)
         self._caption = QLabel("")
         self._caption.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: {FONT_SMALL}pt;")
 
@@ -552,6 +606,10 @@ class CameraView(QFrame):
         layout.addWidget(self._state_label)
         layout.addWidget(self._canvas, 1)
         layout.addWidget(self._caption)
+
+    def set_calibration_mode(self, active: bool) -> None:
+        """Layer 3: enter/exit Set Column Bands click-capture mode."""
+        self._canvas.set_calibration_mode(active)
 
     def set_title(self, title: str) -> None:
         self._title.setText(title)

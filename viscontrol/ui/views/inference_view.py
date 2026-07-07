@@ -87,6 +87,12 @@ class InferenceView(QWidget):
     simulate_pulse_clicked = Signal()
     force_toggle_tuchabzug_clicked = Signal()
     einlaufband_toggled = Signal(bool)  # True = sim belt running, False = stopped
+    # Layer 3 "Set Column Bands" calibration (staggered_layout): click near
+    # each column's vertical center in the paused cloth view to record its Y.
+    column_bands_mode_toggled = Signal(bool)  # True = entering calibration mode
+    column_band_clicked = Signal(int)         # image-space Y, forwarded from the cloth view
+    column_bands_confirm_clicked = Signal()
+    column_bands_reset_clicked = Signal()
 
     # Processed-view recording target frame rate (independent of the detection
     # rate — the grab is throttled to this so files stay a reasonable size).
@@ -250,9 +256,38 @@ class InferenceView(QWidget):
         cam_row.setSpacing(12)
         self._belt_view = CameraView(self.tr("Belt"))
         self._cloth_view = CameraView(self.tr("Cloth"))
+        self._cloth_view.calibration_click.connect(self.column_band_clicked.emit)
         cam_row.addWidget(self._belt_view, 1)
         cam_row.addWidget(self._cloth_view, 1)
         layout.addLayout(cam_row, 1)
+
+        # Layer 3 "Set Column Bands" calibration row: while paused, toggle
+        # into click-capture mode, click each column's vertical center in the
+        # cloth view above, then Confirm (derives bands as midpoints between
+        # adjacent clicks) or Reset to start over. Hidden unless staggered
+        # layout support is relevant — kept always-visible here since it's a
+        # one-time setup action, not a runtime toggle.
+        col_row = QHBoxLayout()
+        col_row.setSpacing(8)
+        self._column_bands_btn = QPushButton(self.tr("Set Column Bands"))
+        self._column_bands_btn.setObjectName("secondary")
+        self._column_bands_btn.setCheckable(True)
+        self._column_bands_btn.toggled.connect(self.column_bands_mode_toggled.emit)
+        col_row.addWidget(self._column_bands_btn, 0)
+        self._column_bands_confirm_btn = QPushButton(self.tr("Confirm"))
+        self._column_bands_confirm_btn.setObjectName("secondary")
+        self._column_bands_confirm_btn.clicked.connect(self.column_bands_confirm_clicked.emit)
+        col_row.addWidget(self._column_bands_confirm_btn, 0)
+        self._column_bands_reset_btn = QPushButton(self.tr("Reset Clicks"))
+        self._column_bands_reset_btn.setObjectName("secondary")
+        self._column_bands_reset_btn.clicked.connect(self.column_bands_reset_clicked.emit)
+        col_row.addWidget(self._column_bands_reset_btn, 0)
+        self._column_bands_status = QLabel("")
+        self._column_bands_status.setStyleSheet(
+            f"color: {TEXT_SECONDARY}; font-size: {FONT_SMALL}pt;"
+        )
+        col_row.addWidget(self._column_bands_status, 1)
+        layout.addLayout(col_row, 0)
 
         self._inference_label = QLabel(self.tr("Inference: —"))
         self._inference_label.setStyleSheet(
@@ -439,6 +474,7 @@ class InferenceView(QWidget):
         grid_ref_tangent_x: float | None = None,
         grid_label: str | None = None,
         debug_mask: np.ndarray | None = None,
+        column_band_clicks: list[int] | None = None,
     ) -> None:
         self._cloth_view.set_state(
             CameraViewState(
@@ -464,8 +500,23 @@ class InferenceView(QWidget):
                 grid_ref_tangent_x=grid_ref_tangent_x,
                 grid_label=grid_label,
                 debug_mask=debug_mask,
+                column_band_clicks=column_band_clicks,
             )
         )
+
+    def set_column_bands_calibration_mode(self, active: bool) -> None:
+        """Layer 3: enter/exit Set Column Bands click-capture mode.
+
+        Syncs the toggle button's checked state (without re-emitting
+        column_bands_mode_toggled) and enables click capture on the cloth view.
+        """
+        self._cloth_view.set_calibration_mode(active)
+        self._column_bands_btn.blockSignals(True)
+        self._column_bands_btn.setChecked(active)
+        self._column_bands_btn.blockSignals(False)
+
+    def set_column_bands_status(self, text: str) -> None:
+        self._column_bands_status.setText(text)
 
     def set_inference_ms(self, ms: float) -> None:
         self._inference_label.setText(self.tr("Inference: {ms:.1f} ms").format(ms=ms))

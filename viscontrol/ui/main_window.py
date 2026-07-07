@@ -14,7 +14,9 @@ the UI thread only ever sees clean data.
 from __future__ import annotations
 
 import copy
+import statistics
 import time
+from collections import deque
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -47,6 +49,9 @@ from viscontrol.detection.row_grouping import (
     ClusterTracker,
     DEFAULT_CLOTH_SPEED_PX_S,
     RowLineTracker,
+    assign_columns,
+    build_front_row,
+    default_column_y_bands,
     group_by_gap,
     leading_edge_x,
     median_piece_diameter,
@@ -179,6 +184,11 @@ class MainWindow(QMainWindow):
         self._perf_frames: int = 0
         self._perf_detect_count: int = 0   # detection passes in the current window
         self._perf_last_log: float = 0.0
+        # Rolling window of the last 50 detect-pass durations (only frames
+        # where detection actually ran), for the periodic perf summary's
+        # median/max — reveals whether Hough itself is the bottleneck versus
+        # just an average dragged down by frames that skipped detection.
+        self._detect_time_samples: deque[float] = deque(maxlen=50)
         # Cached active profile so _on_frame avoids rebuilding ProfileStore every frame.
         self._active_profile_cache: "ProductProfile" = config.active_profile()
         # Last known frame dimensions — used to update coord captions on shape change.
@@ -269,6 +279,17 @@ class MainWindow(QMainWindow):
         # INTER-ROW-STOP-GAP: time between consecutive StopTuchabzug latch releases.
         self._last_stop_latch_time: float | None = None
         self._last_stop_latch_row: int | None = None
+        # Layer 3 (staggered_layout=true): per-column front pointers — count of
+        # pieces already fired/consumed in each column, index-aligned with
+        # config.detection.column_y_bands. [] = uninitialized, lazily sized to
+        # grid_columns on first use. Reset to all-zero on every full reset.
+        self._column_front_pointers: list[int] = []
+        self._cloth_roi_height_px: int = 0  # cached cloth-ROI height, for default_column_y_bands
+        self._column_starvation_events: int = 0  # session-cumulative, for LAYER3 SESSION SUMMARY
+        # Column Bands calibration (Set Column Bands UI action): recorded Y
+        # clicks (image-space, cloth-ROI-local) while calibration mode is on.
+        self._column_bands_calib_active: bool = False
+        self._column_bands_calib_clicks: list[int] = []
         # Immediate-switch anchor: set the moment a row fires so the NEXT row is
         # tracked by position (not by blind sort-order) starting the same frame.
         # None = use normal front-most-group mode; not None = anchor-proximity mode.
@@ -285,6 +306,29 @@ class MainWindow(QMainWindow):
         # frames when detection drops. Cleared on every TuchabzugRunning rising edge.
         self._last_known_row_leading_x: float | None = None
         self._memory_frame_count: int = 0
+        # Consecutive frames without a FRESH detection for the active/tracked
+        # row — unlike _memory_frame_count this is never capped by
+        # max_memory_frames, so it keeps counting past the point where the
+        # position-hold fallback itself expires. Used only for the
+        # FALLBACK EXCEEDED warning; never gates or extends firing.
+        self._row_frames_stale: int = 0
+        # Per-row detection-quality accounting, keyed by row index (_fire_idx).
+        # Accumulated every frame that row is active/tracked; logged (as
+        # ROW DETECTION QUALITY) and cleared the moment that row fires.
+        self._row_quality_stats: dict[int, dict[str, int]] = {}
+        # SUSPICIOUS FAR-PAST FIRE confirmation: a fire candidate whose tangent
+        # overshoots transfer_x by more than max_reasonable_overshoot_px isn't
+        # fired on sight — the SAME tangent (within 20px) must repeat on 2
+        # consecutive FRESH frames first. Frozen (neither advanced nor reset)
+        # during fallback frames, so a brief detection drop mid-confirmation
+        # doesn't restart the count.
+        self._far_past_confirm_tangent: float | None = None
+        self._far_past_confirm_count: int = 0
+        # Wall-clock time (time.monotonic()) the current SUSPICIOUS FAR-PAST
+        # FIRE block started, for far_past_block_timeout_ms. None = not
+        # currently blocked. Reset whenever the block clears (row fires or
+        # stops being far-past) so a fresh block gets a fresh timeout.
+        self._far_past_block_since: float | None = None
         # DIAGNOSTIC (temporary — two-rows-at-once investigation, see
         # InspectionPipeline.DIAGNOSTIC_ROW_PROFILE). Throttle gate for the
         # ~3 Hz bump/valley log; does not affect detection or tripwire state.
@@ -430,6 +474,7 @@ class MainWindow(QMainWindow):
     def shutdown(self) -> None:
         """Stop background threads. Called from main.py on close."""
         self._log_session_summary()
+        self._log_layer3_session_summary()
         try:
             self._camera.stop()
         except Exception:  # noqa: BLE001
@@ -473,6 +518,10 @@ class MainWindow(QMainWindow):
         iv.simulate_pulse_clicked.connect(self._on_simulate_pulse)
         iv.force_toggle_tuchabzug_clicked.connect(self._on_force_toggle_tuchabzug)
         iv.einlaufband_toggled.connect(self._on_toggle_einlaufband)
+        iv.column_bands_mode_toggled.connect(self._on_column_bands_mode_toggled)
+        iv.column_band_clicked.connect(self._on_column_band_clicked)
+        iv.column_bands_confirm_clicked.connect(self._on_column_bands_confirm_clicked)
+        iv.column_bands_reset_clicked.connect(self._on_column_bands_reset_clicked)
 
         cv = self._capture_view
         cv.snapshot_requested.connect(self._on_save_snapshot)
@@ -633,6 +682,12 @@ class MainWindow(QMainWindow):
         self._cycle_log_next_time = 0.0
         self._last_known_row_leading_x = None
         self._memory_frame_count = 0
+        self._row_frames_stale = 0
+        self._row_quality_stats = {}
+        self._far_past_confirm_tangent = None
+        self._far_past_confirm_count = 0
+        self._far_past_block_since = None
+        self._column_front_pointers = []
         self._belt_inspect_window_open = False
         self._belt_window_fault_latched = False
         self._clear_sticky_overlay()
@@ -692,6 +747,7 @@ class MainWindow(QMainWindow):
         except ValueError:
             self._frame_bridge._processing = False
             return
+        self._cloth_roi_height_px = int(cloth.shape[0])  # Layer 3: default column Y-band derivation
         _split_ms = (time.perf_counter() - _t_split) * 1000.0
 
         transfer_local: int = profile.transfer_line_x - profile.roi_split_x
@@ -843,6 +899,13 @@ class MainWindow(QMainWindow):
                             # Session-end verification: full-cycle reset = one natural
                             # session-end point ("all rows DONE, cycle complete").
                             self._log_session_summary()
+                            # Layer 3 (staggered_layout): front pointers restart from
+                            # 0 for the new cycle — every column's already-fired
+                            # pieces belonged to the cycle that just completed.
+                            if self._cfg.detection.staggered_layout:
+                                self._column_front_pointers = []
+                                logger.info("COLUMN-RESET: all front_pointers -> 0")
+                            self._log_layer3_session_summary()
 
                 # FIX 1: rate-limit Hough to hough_interval_ms between runs.
                 # Stagger: if belt is also due this frame, defer Hough unless it
@@ -866,6 +929,15 @@ class MainWindow(QMainWindow):
                         bg_reference_cloth=self._bg_reference_cloth,
                     )
                     _t_detect_ms = (time.perf_counter() - _t_d0) * 1000.0
+                    self._detect_time_samples.append(_t_detect_ms)
+                    # Per-call pairing of piece count with detect timing (not
+                    # throttled, unlike pipeline.py's 2s-throttled "pieces_in_roi"
+                    # summary) — lets a scaling-with-piece-count vs constant-cost
+                    # question be answered directly from the logs.
+                    logger.info(
+                        "DETECT PROFILE: pieces_in_roi={} detect_ms={:.1f}",
+                        len(r.detections), _t_detect_ms,
+                    )
                     # Cache for reuse between Hough runs.
                     self._cached_cloth_detections = r.detections
                     self._cached_cloth_highlight = list(r.front_row_centroids)
@@ -1186,6 +1258,9 @@ class MainWindow(QMainWindow):
                 grid_ref_tangent_x=_ref_x,
                 grid_label=_grid_label,
                 debug_mask=_cloth_debug_mask,
+                column_band_clicks=(
+                    self._column_bands_calib_clicks if self._column_bands_calib_active else None
+                ),
             )
             self._inference_view.set_inference_ms(self._latest_pipeline_ms)
             self._inference_view.set_plc_signals(
@@ -1216,6 +1291,16 @@ class MainWindow(QMainWindow):
 
         _frame_ms = (time.perf_counter() - _t0) * 1000.0
 
+        # Per-frame slow-frame guard (unthrottled — every overrun matters):
+        # a frame this slow can let the cloth travel far enough between
+        # samples to produce a large tangent jump right near the fire zone.
+        if _frame_ms > 40.0:
+            logger.warning(
+                "SLOW FRAME: total={:.0f}ms detect={:.0f}ms rowgroup={:.0f}ms "
+                "display={:.0f}ms — cloth may outrun sampling",
+                _frame_ms, _t_detect_ms, _t_rowgroup_ms, _display_ms,
+            )
+
         # SECTION 1: per-stage timing, averaged over a 1-second window and
         # emitted ONCE PER SECOND at INFO (throttled — a per-frame INFO would
         # cause stderr backpressure; this is one line/sec). Makes the bottleneck
@@ -1235,10 +1320,19 @@ class MainWindow(QMainWindow):
             window_s = max(1e-3, _now_mono - self._perf_last_log)
             detect_hz = self._perf_detect_count / window_s
             if self._detection_enabled:
+                # Median/max over the last <=50 detect passes (not just this
+                # 1s window's average) — separates "Hough is consistently
+                # slow" from "one outlier frame dragged the average up".
+                _detect_median = (
+                    statistics.median(self._detect_time_samples)
+                    if self._detect_time_samples else 0.0
+                )
+                _detect_max = max(self._detect_time_samples, default=0.0)
                 logger.info(
                     "perf 1s ({} frames, {:.1f} fps): total={:.1f}ms "
                     "detect={:.1f}ms rowgroup={:.1f}ms belt={:.1f}ms "
-                    "display={:.1f}ms split={:.1f}ms | detection {:.1f}/s",
+                    "display={:.1f}ms split={:.1f}ms | detection {:.1f}/s "
+                    "| detect(last {}) median={:.1f}ms max={:.1f}ms",
                     n, n / window_s,
                     self._perf_totals["total"] / n,
                     self._perf_totals["detect"] / n,
@@ -1247,6 +1341,9 @@ class MainWindow(QMainWindow):
                     self._perf_totals["display"] / n,
                     self._perf_totals["split"] / n,
                     detect_hz,
+                    len(self._detect_time_samples),
+                    _detect_median,
+                    _detect_max,
                 )
             for k in self._perf_totals:
                 self._perf_totals[k] = 0.0
@@ -1287,6 +1384,99 @@ class MainWindow(QMainWindow):
 
     def _on_toggle_einlaufband(self, active: bool) -> None:
         self._manual_einlaufband_toggle = active
+
+    # ---------- Layer 3: "Set Column Bands" calibration ----------
+
+    def _on_column_bands_mode_toggled(self, active: bool) -> None:
+        """Enter/exit column-band click-capture mode on the cloth view.
+
+        Only allowed while paused (detection stopped) — clicking on a live,
+        moving feed would record meaningless Y positions.
+        """
+        if active and self._detection_enabled:
+            logger.warning("Set Column Bands: refused — stop detection first")
+            self._inference_view.set_column_bands_calibration_mode(False)
+            self._inference_view.set_column_bands_status(
+                self.tr("Stop detection first to calibrate column bands")
+            )
+            return
+        self._column_bands_calib_active = active
+        n = self._cfg.detection.grid_columns
+        if active:
+            self._column_bands_calib_clicks = []
+            self._inference_view.set_column_bands_status(
+                self.tr("Click column 1 of {n} centers in the cloth view").format(n=n)
+            )
+        else:
+            self._inference_view.set_column_bands_status("")
+        self._inference_view.set_column_bands_calibration_mode(active)
+        logger.info("Set Column Bands: calibration mode {}", "ON" if active else "OFF")
+
+    def _on_column_band_clicked(self, image_y: int) -> None:
+        if not self._column_bands_calib_active:
+            return
+        self._column_bands_calib_clicks.append(image_y)
+        n = self._cfg.detection.grid_columns
+        logger.info(
+            "Set Column Bands: recorded click {}/{} at Y={}",
+            len(self._column_bands_calib_clicks), n, image_y,
+        )
+        if len(self._column_bands_calib_clicks) >= n:
+            self._inference_view.set_column_bands_status(
+                self.tr("{n}/{n} columns clicked — press Confirm to save").format(n=n)
+            )
+        else:
+            self._inference_view.set_column_bands_status(
+                self.tr("Click column {k} of {n} centers in the cloth view").format(
+                    k=len(self._column_bands_calib_clicks) + 1, n=n,
+                )
+            )
+
+    def _on_column_bands_confirm_clicked(self) -> None:
+        """Derive column_y_bands from the recorded clicks and save to config.
+
+        Band boundaries are the midpoints between adjacent (sorted) clicks;
+        the first band starts at 0 and the last extends to the cloth ROI
+        height, so every Y is covered even if a piece drifts past the
+        outermost click.
+        """
+        clicks = sorted(self._column_bands_calib_clicks)
+        n = self._cfg.detection.grid_columns
+        if len(clicks) != n:
+            logger.warning(
+                "Set Column Bands: confirm refused — need exactly {} clicks, got {}",
+                n, len(clicks),
+            )
+            self._inference_view.set_column_bands_status(
+                self.tr("Need exactly {n} clicks (have {k}) — click more or Reset").format(
+                    n=n, k=len(clicks),
+                )
+            )
+            return
+        roi_h = float(self._cloth_roi_height_px or clicks[-1] + 1)
+        bands: list[list[float]] = []
+        for i, y in enumerate(clicks):
+            lo = 0.0 if i == 0 else (clicks[i - 1] + y) / 2.0
+            hi = roi_h if i == n - 1 else (y + clicks[i + 1]) / 2.0
+            bands.append([lo, hi])
+        self._cfg.detection.column_y_bands = bands
+        self._save_cfg()
+        logger.info("Set Column Bands: saved {} bands from clicks {}", bands, clicks)
+        self._column_bands_calib_active = False
+        self._column_bands_calib_clicks = []
+        self._inference_view.set_column_bands_calibration_mode(False)
+        self._inference_view.set_column_bands_status(
+            self.tr("Saved {n} column bands").format(n=n)
+        )
+
+    def _on_column_bands_reset_clicked(self) -> None:
+        self._column_bands_calib_clicks = []
+        n = self._cfg.detection.grid_columns
+        self._inference_view.set_column_bands_status(
+            self.tr("Clicks cleared — click column 1 of {n} centers in the cloth view").format(n=n)
+            if self._column_bands_calib_active else self.tr("Clicks cleared")
+        )
+        logger.info("Set Column Bands: clicks reset")
 
     def _on_belt_detection_enabled_changed(self, enabled: bool) -> None:
         """Debug toggle (Service > Diagnostics 'Belt detection' checkbox).
@@ -1479,6 +1669,20 @@ class MainWindow(QMainWindow):
             _max_row,
         )
 
+    def _log_layer3_session_summary(self) -> None:
+        """LAYER3 SESSION SUMMARY (STEP 5): column-based-grouping-specific
+        cumulative metrics, logged alongside _log_session_summary at every
+        full-cycle reset and at shutdown. total_rows_fired reuses the same
+        session-wide counter as SESSION SUMMARY — every fire goes through the
+        column path while staggered_layout=true, so it's accurate regardless
+        of whether the flag was flipped mid-session.
+        """
+        logger.info(
+            "LAYER3 SESSION SUMMARY: total_column_starvation_events={} total_rows_fired={}",
+            self._column_starvation_events,
+            self._session_rows_fired,
+        )
+
     def _apply_tangent_stop_edge(self, r: object, profile: "ProductProfile") -> None:
         """USE_ROW_GROUPING=ON firing path — explicit per-row state machine.
 
@@ -1561,6 +1765,24 @@ class MainWindow(QMainWindow):
                         "(would have been row candidate)",
                         int(round(leading_edge_x(_excl_d))),
                     )
+
+        # Layer 3: column-based grouping (staggered_layout=true) replaces
+        # gap-cluster grouping (Layer 1) + sticky tracking (Layer 2) entirely
+        # from here on and drives the fire decision itself — everything above
+        # this point (CLEARING/ARMED eval, boundary filter) is shared and
+        # untouched. staggered_layout=false (default) falls through to the
+        # unchanged Layer 1/2 path below.
+        if self._cfg.detection.staggered_layout:
+            self._apply_column_based_stop(
+                eligible=_eligible,
+                transfer_x=transfer_x,
+                active_idx=self._active_row_index,
+                grid_cols=grid_cols,
+                grid_rows=grid_rows,
+                all_detections=all_detections,
+                excluded=_excluded,
+            )
+            return
 
         grouped_rows, _row_gaps = group_by_gap(_eligible, self._cfg.detection.row_gap_threshold_px)
 
@@ -1733,29 +1955,81 @@ class MainWindow(QMainWindow):
         )
         # ---- END DIAGNOSTIC ----
 
+        # Row identity for this frame's stop decision — moved up from Step 3 so
+        # the fallback/quality accounting below can key off it too. In anchor
+        # mode we fire against the tracked row's status slot, not the SM's
+        # current slot, so Row 2 can fire even before the next TuchabzugRunning
+        # rising edge formally advances the SM.
+        _fire_idx = (
+            self._tracked_anchor_idx
+            if self._tracked_anchor_idx is not None
+            else active_idx
+        )
+
         # Position memory fallback — applied to the active row's tracked position.
         max_mem = self._cfg.detection.max_memory_frames
         if min_tang_x is not None:
             self._last_known_row_leading_x = min_tang_x
             self._memory_frame_count = 0
+            self._row_frames_stale = 0
             effective_tang_x = min_tang_x
             _using_fallback = False
-        elif (
-            self._last_known_row_leading_x is not None
-            and self._memory_frame_count < max_mem
-        ):
-            self._memory_frame_count += 1
-            effective_tang_x = self._last_known_row_leading_x
-            _using_fallback = True
-            logger.info(
-                "Fallback row position: {}px (frame {}/{})",
-                int(self._last_known_row_leading_x),
-                self._memory_frame_count,
-                max_mem,
-            )
         else:
-            effective_tang_x = None
-            _using_fallback = False
+            self._row_frames_stale += 1
+            if (
+                self._last_known_row_leading_x is not None
+                and self._memory_frame_count < max_mem
+            ):
+                self._memory_frame_count += 1
+                effective_tang_x = self._last_known_row_leading_x
+                _using_fallback = True
+                logger.info(
+                    "Fallback row position: {}px (frame {}/{})",
+                    int(self._last_known_row_leading_x),
+                    self._memory_frame_count,
+                    max_mem,
+                )
+            else:
+                effective_tang_x = None
+                _using_fallback = False
+            # Independent of max_memory_frames — this keeps counting even after
+            # the position hold itself has expired, purely to flag a row that
+            # may be undetectable. Never gates or extends firing (see item 1:
+            # fallback frames never fire, regardless of streak length).
+            _fallback_cap = self._cfg.detection.fallback_hard_cap_frames
+            if _fallback_cap > 0 and self._row_frames_stale == _fallback_cap + 1:
+                logger.warning(
+                    "FALLBACK EXCEEDED: row={} frames_stale={} — row may be "
+                    "undetectable, held position={}px",
+                    _fire_idx + 1,
+                    self._row_frames_stale,
+                    int(round(self._last_known_row_leading_x))
+                    if self._last_known_row_leading_x is not None else -1,
+                )
+
+        # Per-row detection-quality accounting (see ROW DETECTION QUALITY,
+        # logged and cleared at that row's fire, below).
+        _rq = self._row_quality_stats.setdefault(
+            _fire_idx, {"total": 0, "full_group": 0, "fallback": 0, "consec_no_full_group": 0},
+        )
+        _rq["total"] += 1
+        if min_tang_x is not None and len(active_row) >= grid_cols:
+            _rq["full_group"] += 1
+            _rq["consec_no_full_group"] = 0
+        else:
+            _rq["consec_no_full_group"] += 1
+            # Continuous (not just at-fire) visibility: a row stuck at zero
+            # full-group frames for a long stretch may mean a piece already
+            # slipped past detection undetected — surface it immediately
+            # rather than waiting for that row to eventually fire (or never).
+            if _rq["consec_no_full_group"] == 11:
+                logger.warning(
+                    "ROW DETECTION STRUGGLING: row={} frames_since_full_group={} "
+                    "— piece may have crossed undetected",
+                    _fire_idx + 1, _rq["consec_no_full_group"],
+                )
+        if _using_fallback:
+            _rq["fallback"] += 1
 
         # Update display state (consumed by display block every frame).
         self._cycle_front_row = active_row
@@ -1789,15 +2063,8 @@ class MainWindow(QMainWindow):
         # that actually gated THIS frame's decision, not the post-fire state.
         _trace_state = self._boundary_phase
         _fired_this_frame = False
-        # In anchor mode _fire_idx differs from active_row_index: we fire against
-        # the tracked row's status slot, not the SM's current slot, so Row 2 can
-        # fire even before the next TuchabzugRunning rising edge formally advances
-        # the SM. The SM still advances on rising edges as before (bookkeeping).
-        _fire_idx = (
-            self._tracked_anchor_idx
-            if self._tracked_anchor_idx is not None
-            else active_idx
-        )
+        # _fire_idx computed above (before the fallback/quality accounting).
+        # The SM still advances on rising edges as before (bookkeeping).
         if (
             self._boundary_phase == "ARMED"
             and _fire_idx < len(self._row_status)
@@ -1827,7 +2094,89 @@ class MainWindow(QMainWindow):
                             "confirmed fresh (need > {:.0f})",
                             int(effective_tang_x), _pr_threshold,
                         )
-            if _allow_fire and effective_tang_x is not None and effective_tang_x <= transfer_x:
+            _would_geometrically_fire = (
+                _allow_fire and effective_tang_x is not None and effective_tang_x <= transfer_x
+            )
+            _max_reasonable = self._cfg.detection.max_reasonable_overshoot_px
+            _overshoot_now = (
+                transfer_x - effective_tang_x if effective_tang_x is not None else None
+            )
+            _far_past = (
+                _would_geometrically_fire
+                and _overshoot_now is not None
+                and _overshoot_now > _max_reasonable
+            )
+            # A lone piece already far past the line is a stray, not a row —
+            # never fireable regardless of how long it persists. >=2 pieces
+            # (or being within the reasonable range to begin with) is exempt.
+            _piece_count_ok = (
+                not _would_geometrically_fire
+                or len(active_row) >= 2
+                or (_overshoot_now is not None and _overshoot_now <= _max_reasonable)
+            )
+            # Far-past confirmation: only fresh frames advance/reset the streak
+            # so a fallback-held stale position can't fake persistence — the
+            # existing fallback-hold path (and its own hard cap) keeps running
+            # independently of this counter in the meantime.
+            if _far_past and not _using_fallback:
+                if (
+                    self._far_past_confirm_tangent is not None
+                    and abs(effective_tang_x - self._far_past_confirm_tangent) <= 20
+                ):
+                    self._far_past_confirm_count += 1
+                else:
+                    self._far_past_confirm_count = 1
+                self._far_past_confirm_tangent = effective_tang_x
+            elif not _far_past:
+                self._far_past_confirm_count = 0
+                self._far_past_confirm_tangent = None
+            _far_past_confirmed = not _far_past or self._far_past_confirm_count >= 2
+            # Timeout escape: a block that never gets its confirming second
+            # FRESH frame (e.g. the row's tangent keeps drifting by >20px, or
+            # detection is flaky right at the overshoot boundary) must not be
+            # able to hold the row forever — force a fire on the last known
+            # tangent past far_past_block_timeout_ms, same last-resort spirit
+            # as the fallback-position mechanism above.
+            _far_past_timed_out = False
+            if _far_past and not _far_past_confirmed:
+                _now_block = time.monotonic()
+                if self._far_past_block_since is None:
+                    self._far_past_block_since = _now_block
+                _blocked_ms = (_now_block - self._far_past_block_since) * 1000.0
+                _block_timeout_ms = self._cfg.detection.far_past_block_timeout_ms
+                if _block_timeout_ms > 0 and _blocked_ms >= _block_timeout_ms:
+                    _far_past_timed_out = True
+                    logger.warning(
+                        "FAR-PAST BLOCK TIMEOUT: row={} held {}ms with no "
+                        "confirmation — forcing fire on last known position",
+                        _fire_idx + 1, int(round(_blocked_ms)),
+                    )
+                else:
+                    logger.info(
+                        "SUSPICIOUS FAR-PAST FIRE BLOCKED: row={} tangent={} pieces={} "
+                        "— waiting for confirmation",
+                        _fire_idx + 1, int(effective_tang_x), len(active_row),
+                    )
+            else:
+                self._far_past_block_since = None
+
+            _would_fire = (
+                _would_geometrically_fire
+                and _piece_count_ok
+                and (_far_past_confirmed or _far_past_timed_out)
+            )
+            if _would_fire:
+                # Item 1: a fallback (stale) tangent must NEVER trigger the
+                # actual fire, no matter how many consecutive fallback frames
+                # preceded it — only a frame with a genuine fresh detection
+                # for this row/cluster can. Logged either way so a suppressed
+                # fallback "near-fire" stays visible.
+                logger.info(
+                    "FIRE DATA SOURCE: {} frames_stale={}",
+                    "fallback" if _using_fallback else "fresh",
+                    self._row_frames_stale,
+                )
+            if _would_fire and not _using_fallback:
                 _fired_this_frame = True
                 self._log_state(f"row_status[{_fire_idx}]", "WAITING", "STOPPED", "fire")
                 self._row_status[_fire_idx] = "STOPPED"
@@ -1865,6 +2214,18 @@ class MainWindow(QMainWindow):
                         _fire_idx + 1,
                         int(round(_overshoot_px)),
                     )
+
+                _rq_fired = self._row_quality_stats.pop(
+                    _fire_idx, {"total": 0, "full_group": 0, "fallback": 0},
+                )
+                logger.info(
+                    "ROW DETECTION QUALITY: row={} total_frames={} "
+                    "frames_with_full_group={} frames_fallback={}",
+                    _fire_idx + 1,
+                    _rq_fired["total"],
+                    _rq_fired["full_group"],
+                    _rq_fired["fallback"],
+                )
 
                 # STOP-LATCH release bookkeeping: gap since the previous release,
                 # plus the session-level totals consumed by SESSION SUMMARY.
@@ -1967,6 +2328,366 @@ class MainWindow(QMainWindow):
             boundary=self._committed_boundary_x,
             pieces_total=len(all_detections),
             pieces_excluded=len(_excluded),
+            fire_eligible=(_trace_state == "ARMED" and effective_tang_x is not None),
+            fired=_fired_this_frame,
+        )
+
+    def _apply_column_based_stop(
+        self,
+        *,
+        eligible: list[Any],
+        transfer_x: float,
+        active_idx: int,
+        grid_cols: int,
+        grid_rows: int,
+        all_detections: list[Any],
+        excluded: list[Any],
+    ) -> None:
+        """Layer 3 (staggered_layout=true) firing path — column-based grouping.
+
+        Replaces Layer 1 (group_by_gap) + Layer 2 (ClusterTracker) grouping/
+        selection entirely: a "row" is the next not-yet-fired piece in every
+        column (tracked via self._column_front_pointers), not an X-gap
+        cluster. Everything downstream — the row_status WAITING/STOPPED/DONE
+        state machine, CLEARING/ARMED (evaluated by the caller before this is
+        reached), the immediate same-frame row-advance latch (reusing
+        self._tracked_anchor_idx exactly as the Layer 1 path does, since
+        TuchabzugRunning stays continuously True while several rows cross in
+        one cycle), position-memory fallback, and session/overshoot/quality
+        bookkeeping is the SAME mechanism the Layer 1/2 path uses — just fed
+        column-derived data instead of gap-cluster data. self._tracked_anchor_x
+        / _tracked_anchor_cluster_id are gap-cluster-specific and stay unused
+        (None) on this path.
+        """
+        bands = self._cfg.detection.column_y_bands
+        if len(bands) != grid_cols:
+            bands = default_column_y_bands(self._cloth_roi_height_px or 1000, grid_cols)
+            logger.warning(
+                "Using default column Y-bands — run Set Column Bands calibration for accuracy",
+            )
+
+        columns = assign_columns(eligible, bands)
+
+        if len(self._column_front_pointers) != grid_cols:
+            self._column_front_pointers = [0] * grid_cols
+
+        active_row, columns_used, any_column_empty = build_front_row(
+            columns, self._column_front_pointers,
+        )
+        pieces_per_column = [len(columns.get(c, [])) for c in range(grid_cols)]
+        logger.info(
+            "ROW-GROUP (column-based): row_pieces={} from columns={} front_pointers={}",
+            [int(round(leading_edge_x(d))) for d in active_row],
+            columns_used,
+            list(self._column_front_pointers),
+        )
+
+        # --- Step 1 equivalent: cycle complete — skip stop evaluation ---
+        if active_idx >= grid_rows:
+            self._cycle_front_row = []
+            self._cycle_row2 = []
+            self._cycle_ref_tangent_x = None
+            _now_log = time.monotonic()
+            if _now_log >= self._cycle_log_next_time:
+                self._cycle_log_next_time = _now_log + 0.2
+                logger.info(
+                    "Row-SM (column-based): cycle already complete, waiting for full "
+                    "reset (active_row_index={} >= grid_rows={})",
+                    active_idx, grid_rows,
+                )
+            self._log_fire_trace(
+                state="IDLE",
+                active_idx=active_idx,
+                tangent=None,
+                transfer_x=transfer_x,
+                boundary=self._committed_boundary_x,
+                pieces_total=len(all_detections),
+                pieces_excluded=len(excluded),
+                fire_eligible=False,
+                fired=False,
+            )
+            return
+
+        # Partial-detection warning (mirrors Layer 1's, driven by column
+        # completeness instead of group size).
+        if not self._cycle_partial_warned and active_row and any_column_empty:
+            self._cycle_partial_warned = True
+            logger.warning(
+                "Partial detection: expected {} columns to contribute to row {}, "
+                "got {} (columns_used={}) — proceeding",
+                grid_cols, active_idx, len(columns_used), columns_used,
+            )
+
+        min_tang_x = min(leading_edge_x(d) for d in active_row) if active_row else None
+
+        _fire_idx = (
+            self._tracked_anchor_idx
+            if self._tracked_anchor_idx is not None
+            else active_idx
+        )
+
+        # Position memory fallback — identical mechanism to the Layer 1/2 path.
+        max_mem = self._cfg.detection.max_memory_frames
+        if min_tang_x is not None:
+            self._last_known_row_leading_x = min_tang_x
+            self._memory_frame_count = 0
+            self._row_frames_stale = 0
+            effective_tang_x = min_tang_x
+            _using_fallback = False
+        else:
+            self._row_frames_stale += 1
+            if (
+                self._last_known_row_leading_x is not None
+                and self._memory_frame_count < max_mem
+            ):
+                self._memory_frame_count += 1
+                effective_tang_x = self._last_known_row_leading_x
+                _using_fallback = True
+                logger.info(
+                    "Fallback row position: {}px (frame {}/{})",
+                    int(self._last_known_row_leading_x),
+                    self._memory_frame_count,
+                    max_mem,
+                )
+            else:
+                effective_tang_x = None
+                _using_fallback = False
+            _fallback_cap = self._cfg.detection.fallback_hard_cap_frames
+            if _fallback_cap > 0 and self._row_frames_stale == _fallback_cap + 1:
+                logger.warning(
+                    "FALLBACK EXCEEDED: row={} frames_stale={} — row may be "
+                    "undetectable, held position={}px",
+                    _fire_idx + 1,
+                    self._row_frames_stale,
+                    int(round(self._last_known_row_leading_x))
+                    if self._last_known_row_leading_x is not None else -1,
+                )
+
+        _rq = self._row_quality_stats.setdefault(
+            _fire_idx, {"total": 0, "full_group": 0, "fallback": 0},
+        )
+        _rq["total"] += 1
+        if min_tang_x is not None and not any_column_empty:
+            _rq["full_group"] += 1
+        if _using_fallback:
+            _rq["fallback"] += 1
+
+        self._cycle_front_row = active_row
+        self._cycle_row2 = []
+        self._cycle_ref_tangent_x = effective_tang_x
+
+        _now_log = time.monotonic()
+        if _now_log >= self._cycle_log_next_time:
+            self._cycle_log_next_time = _now_log + 0.2
+            logger.info(
+                "Row-SM state (column-based): active_row={} status={} "
+                "this_row_tangent={} transfer_x={:.0f} grid_rows={}",
+                active_idx,
+                self._row_status,
+                f"{int(effective_tang_x)}" if effective_tang_x is not None else "none",
+                transfer_x,
+                grid_rows,
+            )
+
+        _trace_state = self._boundary_phase
+        _fired_this_frame = False
+        if (
+            self._boundary_phase == "ARMED"
+            and _fire_idx < len(self._row_status)
+            and self._row_status[_fire_idx] == "WAITING"
+        ):
+            _allow_fire = True
+            if (
+                self._tracked_anchor_idx is None
+                and self._post_reset_pending
+                and effective_tang_x is not None
+            ):
+                _pr_threshold = transfer_x + self._cfg.detection.post_reset_fresh_margin_px
+                if effective_tang_x > _pr_threshold:
+                    self._post_reset_pending = False
+                    logger.info(
+                        "Post-reset: fresh row confirmed — tangent {} > {:.0f} "
+                        "(active_row={}), fire gate now open",
+                        int(effective_tang_x), _pr_threshold, active_idx,
+                    )
+                else:
+                    _allow_fire = False
+                    _now_log = time.monotonic()
+                    if _now_log >= self._cycle_log_next_time:
+                        self._cycle_log_next_time = _now_log + 0.2
+                        logger.info(
+                            "Post-reset: rejecting instant-fire, tangent {} not yet "
+                            "confirmed fresh (need > {:.0f})",
+                            int(effective_tang_x), _pr_threshold,
+                        )
+
+            _would_fire = (
+                _allow_fire and effective_tang_x is not None and effective_tang_x <= transfer_x
+            )
+            if _would_fire:
+                logger.info(
+                    "LAYER3-FIRE-VALIDATION: row={} fired_tangent={} columns_used={} "
+                    "pieces_per_column={} any_column_empty={}",
+                    _fire_idx + 1,
+                    int(effective_tang_x),
+                    columns_used,
+                    pieces_per_column,
+                    "true" if any_column_empty else "false",
+                )
+                logger.info(
+                    "FIRE DATA SOURCE: {} frames_stale={}",
+                    "fallback" if _using_fallback else "fresh",
+                    self._row_frames_stale,
+                )
+            if _would_fire and any_column_empty:
+                for c in range(grid_cols):
+                    _avail = len(columns.get(c, []))
+                    _fp = self._column_front_pointers[c]
+                    if _fp >= _avail:
+                        self._column_starvation_events += 1
+                        logger.warning(
+                            "COLUMN STARVATION: column={} front_pointer={} but only "
+                            "{} pieces available — grouping may be incomplete",
+                            c, _fp, _avail,
+                        )
+
+            if _would_fire and not _using_fallback and not any_column_empty:
+                _fired_this_frame = True
+                self._log_state(f"row_status[{_fire_idx}]", "WAITING", "STOPPED", "fire")
+                self._row_status[_fire_idx] = "STOPPED"
+                logger.info(
+                    "Row-SM FIRE (column-based): row {} tangent {} <= transfer_x {:.0f} "
+                    "-> StopTuchabzug | row_status={}",
+                    _fire_idx + 1,
+                    int(effective_tang_x),
+                    transfer_x,
+                    self._row_status,
+                )
+                _overshoot_px = transfer_x - effective_tang_x
+                _last_clearing_ms = (
+                    self._cycle_clearing_durations_ms[-1]
+                    if self._cycle_clearing_durations_ms else 0.0
+                )
+                _last_clearing_reason = (
+                    self._cycle_armed_reasons[-1]
+                    if self._cycle_armed_reasons else "n/a"
+                )
+                logger.info(
+                    "FIRE OVERSHOOT: row={} fired_tangent={} transfer_x={:.0f} "
+                    "overshoot_px={} clearing_duration_ms={} clearing_exit_reason={}",
+                    _fire_idx + 1,
+                    int(effective_tang_x),
+                    transfer_x,
+                    int(round(_overshoot_px)),
+                    int(round(_last_clearing_ms)),
+                    _last_clearing_reason,
+                )
+                if _overshoot_px > 40:
+                    logger.warning(
+                        "HIGH OVERSHOOT WARNING: row={} overshoot={}px — may appear "
+                        "as merged transfer",
+                        _fire_idx + 1,
+                        int(round(_overshoot_px)),
+                    )
+
+                _rq_fired = self._row_quality_stats.pop(
+                    _fire_idx, {"total": 0, "full_group": 0, "fallback": 0},
+                )
+                logger.info(
+                    "ROW DETECTION QUALITY: row={} total_frames={} "
+                    "frames_with_full_group={} frames_fallback={}",
+                    _fire_idx + 1,
+                    _rq_fired["total"],
+                    _rq_fired["full_group"],
+                    _rq_fired["fallback"],
+                )
+
+                _now_latch = time.monotonic()
+                if self._last_stop_latch_time is not None:
+                    _inter_row_gap_ms = (_now_latch - self._last_stop_latch_time) * 1000.0
+                    logger.info(
+                        "INTER-ROW-STOP-GAP: row_prev={} row_curr={} gap_ms={}",
+                        self._last_stop_latch_row,
+                        _fire_idx + 1,
+                        int(round(_inter_row_gap_ms)),
+                    )
+                self._last_stop_latch_time = _now_latch
+                self._last_stop_latch_row = _fire_idx + 1
+                self._session_rows_fired += 1
+                self._session_stop_latches += 1
+                self._session_overshoot_records.append((_fire_idx + 1, _overshoot_px))
+
+                self._cycle_rows_fired.append(_fire_idx + 1)
+                self._cycle_fire_tangents.append(effective_tang_x)
+                _old_committed_bnd = self._committed_boundary_x
+                self._committed_boundary_x = effective_tang_x + self._cfg.detection.boundary_offset_px
+                self._cycle_boundaries.append(self._committed_boundary_x)
+                self._log_state(
+                    "committed_boundary_x", _old_committed_bnd, self._committed_boundary_x, "fire",
+                )
+                logger.info(
+                    "Committed boundary SET: X={} (fired_tangent={} + offset={})",
+                    int(round(self._committed_boundary_x)),
+                    int(effective_tang_x),
+                    self._cfg.detection.boundary_offset_px,
+                )
+                self._log_state("boundary_phase", self._boundary_phase, "CLEARING", "fire")
+                self._boundary_phase = "CLEARING"
+                self._boundary_clearing_since = None
+                self._boundary_clear_streak = 0
+                logger.info(
+                    "Post-fire state: CLEARING (boundary={})",
+                    int(round(self._committed_boundary_x)),
+                )
+
+                # Column front pointers: advance every column that contributed
+                # a piece to the fired row.
+                _new_front_pointers = list(self._column_front_pointers)
+                for c in columns_used:
+                    _new_front_pointers[c] += 1
+                self._column_front_pointers = _new_front_pointers
+                logger.info(
+                    "COLUMN-FIRE: row={} columns_advanced={} new_front_pointers={}",
+                    _fire_idx + 1, columns_used, self._column_front_pointers,
+                )
+
+                # Immediate switch to the next row_status slot in the SAME
+                # frame — identical mechanism to the Layer 1/2 latch, just not
+                # position/id-based (column front pointers already encode
+                # "next row" for the following frame's build_front_row call).
+                if self._tracked_anchor_idx is None:
+                    _next_idx = _fire_idx + 1
+                    if _next_idx < len(self._row_status):
+                        self._log_state("anchor", (None, None), (None, _next_idx), "fire")
+                        self._tracked_anchor_idx = _next_idx
+                        logger.info(
+                            "Row-SM SWITCH (column-based): Row {} fired -> immediately "
+                            "switching active reference to Row {}",
+                            _fire_idx + 1, _next_idx + 1,
+                        )
+                else:
+                    logger.info(
+                        "Row-SM TRACK DONE (column-based): Row {} (anchor-tracked) "
+                        "fired, anchor cleared",
+                        _fire_idx + 1,
+                    )
+                    self._log_state(
+                        "anchor", (None, self._tracked_anchor_idx), (None, None), "fire",
+                    )
+                    self._tracked_anchor_idx = None
+
+                self._sm.handle_stop_tuchabzug_trigger()
+                self._push_signals_to_opcua()
+                self._request_plc_stop_pulse()
+
+        self._log_fire_trace(
+            state=_trace_state,
+            active_idx=active_idx,
+            tangent=effective_tang_x,
+            transfer_x=transfer_x,
+            boundary=self._committed_boundary_x,
+            pieces_total=len(all_detections),
+            pieces_excluded=len(excluded),
             fire_eligible=(_trace_state == "ARMED" and effective_tang_x is not None),
             fired=_fired_this_frame,
         )
@@ -2628,6 +3349,7 @@ class MainWindow(QMainWindow):
         self._tracked_anchor_x = None
         self._tracked_anchor_idx = None
         self._tracked_anchor_cluster_id = None
+        self._column_front_pointers = []
         logger.info("grid rows set to {}", rows)
 
     def _on_row_grouping_changed(self, enabled: bool) -> None:
@@ -2662,6 +3384,12 @@ class MainWindow(QMainWindow):
         self._cycle_ref_tangent_x = None
         self._last_known_row_leading_x = None
         self._memory_frame_count = 0
+        self._row_frames_stale = 0
+        self._row_quality_stats = {}
+        self._far_past_confirm_tangent = None
+        self._far_past_confirm_count = 0
+        self._far_past_block_since = None
+        self._column_front_pointers = []
         self._wizard_view.set_detection_settings(self._cfg.detection)
         logger.info("cloth row grouping (per-row stop): {}", "ON" if enabled else "OFF")
 
@@ -2947,6 +3675,10 @@ class MainWindow(QMainWindow):
         self._cycle_log_next_time = 0.0  # log immediately on first Hough run
         self._last_known_row_leading_x = None  # clear per-cycle position memory
         self._memory_frame_count = 0
+        self._row_frames_stale = 0
+        self._far_past_confirm_tangent = None
+        self._far_past_confirm_count = 0
+        self._far_past_block_since = None
         self._clear_sticky_overlay()
         logger.debug("Tracking session reset — new cycle")
 
