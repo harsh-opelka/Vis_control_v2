@@ -42,6 +42,7 @@ from viscontrol.core.profiles import ProductProfile
 from viscontrol.core.state_machine import StateMachine
 from viscontrol.detection.calibration import learn_reference
 from viscontrol.detection.classical import ClassicalDetector
+from viscontrol.detection.column_learning import ColumnLearner
 from viscontrol.detection.pipeline import InspectionPipeline
 from viscontrol.detection.row_grouping import (
     RowLineTracker,
@@ -267,6 +268,14 @@ class MainWindow(QMainWindow):
         # InspectionPipeline.DIAGNOSTIC_ROW_PROFILE). Throttle gate for the
         # ~3 Hz bump/valley log; does not affect detection or tripwire state.
         self._diag_row_profile_last_log: float = 0.0
+        # DIAGNOSTIC (logging-only, see viscontrol/detection/column_learning.py):
+        # learns column Y-bands from observed piece Y-centroids purely for
+        # comparison against Layer 1/2 grouping. Never read by fire/stop logic.
+        self._column_learner = ColumnLearner(
+            config.detection.grid_columns,
+            window_size=config.column_learning.window_size,
+            recompute_every_n_frames=config.column_learning.recompute_every_n_frames,
+        )
         self._transfer_timeout_warned: bool = False  # True once timeout warning was logged
         # Wizard draft: suppress file writes during wizard; revert on cancel.
         self._wizard_active: bool = False
@@ -407,6 +416,14 @@ class MainWindow(QMainWindow):
 
     def shutdown(self) -> None:
         """Stop background threads. Called from main.py on close."""
+        if self._cfg.column_learning.enabled:
+            logger.info(
+                "COLUMN-LEARN SESSION SUMMARY: final_bands={} "
+                "total_pieces_observed={} recompute_count={}",
+                self._column_learner.bands,
+                self._column_learner.total_pieces_observed,
+                self._column_learner.recompute_count,
+            )
         try:
             self._camera.stop()
         except Exception:  # noqa: BLE001
@@ -845,6 +862,39 @@ class MainWindow(QMainWindow):
                     _tripwire_occupied = r.tripwire_occupied
                     if r.inference_ms > 50.0:
                         logger.debug("cloth_tracking slow: {:.0f} ms", r.inference_ms)
+
+                    # --- DIAGNOSTIC (logging-only): column learning ---
+                    # Runs alongside Layer 1 (group_by_gap) / Layer 2 (sticky
+                    # anchor tracking) logging below, never replacing or
+                    # feeding into it. See viscontrol/detection/column_learning.py.
+                    # Output is observation-only: not read by fire_eligible,
+                    # active_row, tangent selection, or any StopTuchabzug
+                    # decision.
+                    if self._cfg.column_learning.enabled:
+                        _cl_y_centroids = [float(d.centroid[1]) for d in r.detections]
+                        self._column_learner.update(_cl_y_centroids)
+                        _cl_bands = self._column_learner.bands
+                        _cl_piece_columns: list[tuple[int, int, int]] = []
+                        for _cl_d in r.detections:
+                            _cl_tangent_x = leading_edge_x(_cl_d)  # center_x - radius
+                            _cl_y = float(_cl_d.centroid[1])
+                            _cl_col, _cl_in_band = self._column_learner.assign_column(_cl_y)
+                            if _cl_bands and not _cl_in_band:
+                                logger.warning(
+                                    "ColumnLearner: piece Y={} out of all bands {} "
+                                    "(piece X={}) — assigned nearest column={}",
+                                    int(round(_cl_y)), _cl_bands,
+                                    int(round(_cl_tangent_x)), _cl_col,
+                                )
+                            _cl_piece_columns.append(
+                                (int(round(_cl_tangent_x)), int(round(_cl_y)), _cl_col)
+                            )
+                        logger.info(
+                            "COLUMN-LEARN: frame_id={} bands={} piece_columns={}",
+                            self._frame_count, _cl_bands, _cl_piece_columns,
+                        )
+                    # --- END DIAGNOSTIC ---
+
                     # Firing path: row grouping (per-row stop) when enabled,
                     # otherwise the unchanged single-line tripwire.
                     _t_r0 = time.perf_counter()

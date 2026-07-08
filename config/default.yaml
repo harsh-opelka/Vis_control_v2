@@ -138,6 +138,16 @@ detection:
     threshold: 30             # pixel intensity diff (0-255) above which a pixel counts as "changed"
     reference_path: ""        # set automatically when capturing an empty-cloth reference (Service > Detection)
 
+# DIAGNOSTIC (logging-only): automatic column detection via Y-centroid
+# learning. See viscontrol/detection/column_learning.py. Purely observational
+# groundwork for a possible future column-based tracking mode — never feeds
+# fire_eligible, active_row, tangent selection, or any StopTuchabzug decision.
+# Layer 1 (group_by_gap) and Layer 2 (sticky anchor tracking) are unaffected.
+column_learning:
+  enabled: true
+  window_size: 100             # rolling window: recent piece Y-centroids retained
+  recompute_every_n_frames: 30 # how often column_y_bands are re-derived from the window
+
 opcua:
   endpoint: "opc.tcp://0.0.0.0:4840/viscontrol/"
   namespace: "http://opelka.com/viscontrol"

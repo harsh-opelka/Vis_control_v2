@@ -437,6 +437,39 @@ class _DetectionSection(BaseModel):
     band: _BandSection = Field(default_factory=_BandSection)
 
 
+class _ColumnLearningSection(BaseModel):
+    """DIAGNOSTIC (logging-only): automatic column detection via Y-centroid
+    learning. See viscontrol/detection/column_learning.py (ColumnLearner).
+
+    Purely observational groundwork for a possible future column-based
+    tracking mode — never read by fire_eligible, active_row, tangent
+    selection, or any StopTuchabzug decision. Layer 1 (group_by_gap) and
+    Layer 2 (sticky anchor tracking) are unaffected regardless of this
+    section's values.
+    """
+
+    enabled: bool = Field(
+        True,
+        description=(
+            "Master on/off for COLUMN-LEARN logging and column assignment. "
+            "When False, no rolling window is fed and no COLUMN-LEARN lines "
+            "are logged."
+        ),
+    )
+    window_size: int = Field(
+        100, ge=1,
+        description="Rolling window size: number of recent piece Y-centroids retained.",
+    )
+    recompute_every_n_frames: int = Field(
+        30, ge=1,
+        description=(
+            "How often (in frames fed to ColumnLearner.update) column_y_bands "
+            "are recomputed from the current window, rather than every frame, "
+            "so bands stay stable rather than jittery."
+        ),
+    )
+
+
 class _OpcuaSection(BaseModel):
     endpoint: str = "opc.tcp://0.0.0.0:4840/viscontrol/"
     namespace: str = "http://opelka.com/viscontrol"
@@ -489,6 +522,7 @@ class AppConfig(BaseModel):
     orientation: _OrientationSection = Field(default_factory=_OrientationSection)
     inspection: _InspectionSection = Field(default_factory=_InspectionSection)
     detection: _DetectionSection = Field(default_factory=_DetectionSection)
+    column_learning: _ColumnLearningSection = Field(default_factory=_ColumnLearningSection)
     profiles: list[ProductProfile] = Field(default_factory=list)
     opcua: _OpcuaSection = Field(default_factory=_OpcuaSection)
     web: _WebSection = Field(default_factory=_WebSection)
