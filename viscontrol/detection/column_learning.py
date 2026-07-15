@@ -2,9 +2,9 @@
 
 Groundwork for a possible future column-based tracking mode. ``ColumnLearner``
 watches the spread of detected pieces' Y-centroids over time and derives
-``grid_columns`` Y-bands from it, purely for comparison against what Layer 1
-(``group_by_gap``) and Layer 2 (sticky anchor tracking, see MainWindow.
-_apply_tangent_stop_edge) already produce.
+``grid_columns`` Y-bands from it, purely for comparison against what the
+cluster-based fire decision (see MainWindow._apply_cluster_stop_edge,
+ClusterTracker) already produces.
 
 Entirely observational: nothing here is read by any fire/stop decision. See
 MainWindow's COLUMN-LEARN logging (config.column_learning) for the call site.

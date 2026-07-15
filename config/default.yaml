@@ -91,16 +91,8 @@ profiles:
 # the default "blob" behavior without removing it.
 detection:
   method: "blob"            # blob | contour_external | hough | bg_subtract
-  use_row_grouping: false   # cloth side: false = legacy single-line tripwire (unchanged);
-                            # true = group pieces into rows and fire StopTuchabzug once per
-                            # row as each row-line crosses the transfer line (row_grouping.py)
-  row_grouping_gap_diameters: 0.6  # row split tolerance = this × median detected piece
-                                   # diameter. Lower = more rows; higher = fewer. Typical 0.5-1.0
-  grid_columns: 8            # SECTION 6: pieces per row in the loaded grid. Row grouping
-                             # uses this to identify the front/current row (N closest pieces)
-  row_gap_threshold_px: 150  # gap-cluster split: new row starts when the X gap between
-                             # consecutive sorted pieces exceeds this many pixels
-  grid_rows: 0               # SECTION 6: expected rows on the cloth (0 = unknown). Informational.
+  cycle_idle_reset_ms: 3000  # logging-only: no pieces detected for this long + no tracked
+                             # clusters -> log a CYCLE-SUMMARY and reset batch counters
   detection_zone_width_px: 600  # pixels of approach-side cloth beyond the bridge where Hough runs;
                                 # 0 = full ROI (no restriction). Outer edge drawn on cloth view.
   fill_mask_holes: false     # blob-only: pre-fill enclosed mask holes before extraction
@@ -140,13 +132,23 @@ detection:
 
 # DIAGNOSTIC (logging-only): automatic column detection via Y-centroid
 # learning. See viscontrol/detection/column_learning.py. Purely observational
-# groundwork for a possible future column-based tracking mode — never feeds
-# fire_eligible, active_row, tangent selection, or any StopTuchabzug decision.
-# Layer 1 (group_by_gap) and Layer 2 (sticky anchor tracking) are unaffected.
+# groundwork for a possible future column-based tracking mode — never read by
+# the cluster-based fire decision (proximity_clustering.py: ClusterTracker).
 column_learning:
   enabled: true
   window_size: 100             # rolling window: recent piece Y-centroids retained
   recompute_every_n_frames: 30 # how often column_y_bands are re-derived from the window
+  expected_columns: 8          # Y-bands to split into; own knob, decoupled from the
+                                # retired detection.grid_columns
+
+# Tangent-based proximity clustering — the grid-free replacement for the old
+# fixed-grid/row firing model. See viscontrol/detection/proximity_clustering.py
+# (cluster_by_tangent, ClusterTracker). tolerance_px drives both the live fire
+# decision (MainWindow._apply_cluster_stop_edge) and the diagnostic overlay;
+# enabled only gates the diagnostic PROXIMITY-CLUSTER log/overlay, not firing.
+proximity_clustering:
+  enabled: true
+  tolerance_px: 150   # gap threshold (px) along tangent_x; live-adjustable in Service > Diagnostics
 
 opcua:
   endpoint: "opc.tcp://0.0.0.0:4840/viscontrol/"

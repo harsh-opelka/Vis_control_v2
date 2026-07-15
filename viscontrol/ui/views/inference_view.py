@@ -430,15 +430,11 @@ class InferenceView(QWidget):
         row_profile: np.ndarray | None = None,
         row_profile_x_offset: int = 0,
         row_profile_scale: float = 1.0,
-        row_lines: list[float] | None = None,
-        row_count: int | None = None,
         detection_band: tuple[int, int] | None = None,
-        current_row_centroids: list[tuple[float, float]] | None = None,
         detection_zone_outer_x: int | None = None,
-        grid_row_assignments: dict[int, int] | None = None,
-        grid_ref_tangent_x: float | None = None,
-        grid_label: str | None = None,
+        cluster_state_label: str | None = None,
         debug_mask: np.ndarray | None = None,
+        proximity_clusters: list[tuple[float, list[tuple[float, float, float]]]] | None = None,
     ) -> None:
         self._cloth_view.set_state(
             CameraViewState(
@@ -455,15 +451,11 @@ class InferenceView(QWidget):
                 row_profile=row_profile,
                 row_profile_x_offset=row_profile_x_offset,
                 row_profile_scale=row_profile_scale,
-                row_lines=row_lines,
-                row_count=row_count,
                 detection_band=detection_band,
-                current_row_centroids=current_row_centroids or [],
                 detection_zone_outer_x=detection_zone_outer_x,
-                grid_row_assignments=grid_row_assignments,
-                grid_ref_tangent_x=grid_ref_tangent_x,
-                grid_label=grid_label,
+                cluster_state_label=cluster_state_label,
                 debug_mask=debug_mask,
+                proximity_clusters=proximity_clusters,
             )
         )
 

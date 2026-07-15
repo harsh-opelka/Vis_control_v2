@@ -1,35 +1,17 @@
-"""Row grouping for the cloth side (behind the USE_ROW_GROUPING toggle).
+"""Row/grid grouping helpers — retired from the fire decision.
 
-Background
-----------
-The legacy cloth tripwire (see MainWindow._apply_tripwire_edge) watches a single
-vertical strip at the transfer line and fires StopTuchabzug on an occupied→clear
-edge. That fires ONCE per "occupied" episode, so two rows of dough that arrive
-back-to-back with no clear gap between them look like a single long occupancy and
-trigger only one stop.
+StopTuchabzug firing has moved to a grid-free tangent-based proximity
+cluster model (see viscontrol/detection/proximity_clustering.py:
+cluster_by_tangent, ClusterTracker, and MainWindow._apply_cluster_stop_edge).
+The functions in this module (``group_by_gap``, ``group_rows``,
+``group_into_rows``, ``reject_group_outliers``, ``RowLineTracker``) are no
+longer wired into any fire decision — they're kept as unused-but-harmless
+utilities rather than deleted outright, since no callers were confirmed
+gone for certain across the whole codebase.
 
-Row grouping fixes that without touching detection or the tripwire. It works on
-the centroids the active detection method already produces inside the cloth ROI:
-
-1. ``group_into_rows`` clusters those centroids by their travel-direction
-   coordinate (x — the transfer line is vertical, so the cloth travels along x).
-   Pieces within a tolerance along travel — gap_diameters × the median DETECTED
-   piece diameter — belong to the same row; a clearly larger jump starts the
-   next row. The tolerance scales with dough SIZE (no fixed pixel sizes, no fixed
-   row count), so slightly staggered/irregular pieces merge into one row instead
-   of over-segmenting.
-2. Each row collapses to a single "row-line": the MEDIAN travel coordinate of
-   its members (robust to an outlier piece).
-3. ``RowLineTracker`` follows those row-lines frame to frame and fires exactly
-   once per row, the moment a tracked row-line crosses the transfer line.
-
-Two rows that touch (no gap) still sit at two distinct travel positions, so they
-form two clusters → two row-lines → two independent stops. That is the whole
-point of the feature.
-
-Nothing here sends the PLC pulse or changes any signal — it only decides *how
-many* rows just crossed. MainWindow turns that count into the existing
-StopTuchabzug pulse(s).
+``leading_edge_x`` and ``median_piece_diameter`` are still live: they're
+used by both the legacy tripwire RowPhase tracking
+(MainWindow._track_row_phase) and the cluster-based fire decision.
 """
 
 from __future__ import annotations
@@ -41,8 +23,8 @@ from typing import Any, Sequence
 # Row split tolerance, as a multiple of the median DETECTED piece diameter:
 # pieces whose travel coordinates differ by less than
 # (gap_diameters × median diameter) are the same row; a clearly larger gap
-# starts the next row. Tolerance scales with dough size (no fixed pixels) and is
-# overridable per call from config.detection.row_grouping_gap_diameters.
+# starts the next row. Tolerance scales with dough size (no fixed pixels) and
+# is overridable per call via the gap_diameters parameter below.
 DEFAULT_GAP_DIAMETERS: float = 0.6
 
 # Float-noise floor so the split threshold stays strictly positive even if the
@@ -208,18 +190,6 @@ def row_leading_edge(row: Sequence[Any]) -> float:
     if not row:
         return 0.0
     return statistics.median(leading_edge_x(d) for d in row)
-
-
-def front_row_by_grid(detections: Sequence[Any], columns: int) -> list[Any]:
-    """SECTION 6: the FRONT/CURRENT row as the ``columns`` pieces closest to
-    the transfer line — i.e. with the smallest leading-edge travel coordinate
-    (the line is on the left). Returns all detections when there are fewer than
-    ``columns`` of them, or ``columns <= 0``. Uses relative leading-edge
-    positions only (no fixed pixel sizes)."""
-    items = sorted(detections, key=leading_edge_x)
-    if columns <= 0 or len(items) <= columns:
-        return items
-    return items[:columns]
 
 
 def group_into_rows(

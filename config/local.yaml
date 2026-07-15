@@ -1,5 +1,5 @@
 app:
-  mode: production
+  mode: demo
   language: en
   active_profile: Default
 camera:
@@ -36,19 +36,13 @@ inspection:
   unknown_is_fault: false
 detection:
   method: hough
-  use_row_grouping: true
-  row_grouping_gap_diameters: 0.6
   fill_mask_holes: false
   fill_mask_holes_kernel: 9
-  grid_columns: 4
-  row_gap_threshold_px: 150
   detection_zone_width_px: 1000
-  grid_rows: 3
   max_memory_frames: 5
-  row_x_tolerance_px: 0
-  boundary_safety_margin_px: 80
   boundary_offset_px: 25
-  post_reset_fresh_margin_px: 200
+  clearing_timeout_ms: 400
+  cycle_idle_reset_ms: 3000
   contour_external:
     min_circularity: 0.55
   hough:
@@ -75,6 +69,14 @@ detection:
     enabled: true
     ahead_px: 600
     behind_px: 150
+column_learning:
+  enabled: true
+  window_size: 100
+  recompute_every_n_frames: 30
+  expected_columns: 8
+proximity_clustering:
+  enabled: true
+  tolerance_px: 149
 profiles:
 - name: Default
   expected_area_px: 60000
@@ -85,20 +87,20 @@ profiles:
   single_min_ratio: 0.5
   unknown_max_ratio: 2.5
   belt_adaptive_block: 0
-  camera_exposure_us: 10000
+  camera_exposure_us: 2754
   camera_gain: 0.0
   roi_split_x: 1859
-  transfer_line_x: 1977
+  transfer_line_x: 2017
   dough_is_darker: true
   belt_crop:
-    top: 372
+    top: 264
     bottom: 810
     left: 883
     right: 64
   cloth_crop:
     top: 286
-    bottom: 838
-    left: 70
+    bottom: 752
+    left: 0
     right: 0
   belt_dough_is_darker: false
   belt_min_solidity: 0.8
@@ -111,7 +113,7 @@ profiles:
   solidity_tolerance: 0.85
   fused_merge_distance_factor: 1.15
   dilation_kernel_size: 5
-  transfer_bridge_width_px: 90
+  transfer_bridge_width_px: 60
   tripwire_half_width_px: 15
   tripwire_occupancy_threshold: 0.12
   tripwire_debounce_frames: 2

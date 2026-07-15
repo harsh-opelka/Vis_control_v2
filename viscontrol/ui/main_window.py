@@ -18,7 +18,7 @@ import time
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -44,13 +44,12 @@ from viscontrol.detection.calibration import learn_reference
 from viscontrol.detection.classical import ClassicalDetector
 from viscontrol.detection.column_learning import ColumnLearner
 from viscontrol.detection.pipeline import InspectionPipeline
-from viscontrol.detection.row_grouping import (
-    RowLineTracker,
-    group_by_gap,
-    leading_edge_x,
-    median_piece_diameter,
-    reject_group_outliers,
+from viscontrol.detection.proximity_clustering import (
+    ClusterTracker,
+    cluster_by_tangent,
+    pieces_from_detections,
 )
+from viscontrol.detection.row_grouping import leading_edge_x, median_piece_diameter
 from viscontrol.io.camera import OrientationTransform, PlaybackCamera, make_camera
 from viscontrol.io.recorder import FrameRecorder
 from viscontrol.ui.i18n import install_translator
@@ -75,9 +74,6 @@ from viscontrol.ui.widgets.status_bar import StatusBar
 # always runs at camera rate (subject to belt_check_interval / tripwire_check_interval).
 _DISPLAY_INTERVAL_S: float = 1.0 / 15.0   # ~15 fps display cap
 _PERF_LOG_INTERVAL_S: float = 1.0         # SECTION 1: per-stage timing summary, once/sec
-# Post-fire boundary CLEARING -> ARMED transition (USE_ROW_GROUPING only).
-# Safety timeout is config-driven — see AppConfig.detection.clearing_timeout_ms.
-_BOUNDARY_CLEAR_STREAK: int = 1           # consecutive frames with 0 excluded leftovers
 
 
 class _FrameBridge(QObject):
@@ -198,16 +194,6 @@ class MainWindow(QMainWindow):
         self._row_phase: RowPhase = RowPhase.IDLE
         self._line_clear_debounce_count: int = 0   # clear frames counted in TRANSFERRING
         self._transfer_start_time: float = 0.0     # time.monotonic() when TRANSFERRING began
-        # Row grouping (USE_ROW_GROUPING) — only active when detection.use_row_grouping
-        # is True; otherwise the legacy tripwire above runs unchanged. Reset per cycle.
-        self._row_line_tracker = RowLineTracker()
-        self._row_group_stop_active: bool = False  # mirrors StopTuchabzug pill for the pulse
-        self._row_lines: list[float] = []          # current row-line x's (display)
-        self._row_count: int = 0                   # current detected row count (display)
-        # SECTION 5/6: leading-edge centroids of the CURRENT/front row (the
-        # grid_columns pieces nearest the transfer bridge), drawn in a distinct
-        # colour so the operator sees which pieces are grouped as one row.
-        self._current_row_centroids: list[tuple[float, float]] = []
         # SECTION 3: active detection band (x_left, x_right) in cloth-local
         # coords, for display; None = whole ROI / band disabled.
         self._detection_band: tuple[int, int] | None = None
@@ -223,59 +209,41 @@ class MainWindow(QMainWindow):
         # Detection zone outer boundary (approach-side, cloth-local x), for
         # display; None when zone disabled or detection hasn't run yet.
         self._detection_zone_outer_x: int | None = None
-        # Grid-aware tangent stop (USE_ROW_GROUPING=ON): explicit per-row state machine.
-        # _active_row_index advances on TuchabzugRunning rising edge once the active row
-        # is STOPPED. All rows DONE triggers a full-cycle reset.
-        self._active_row_index: int = 0
-        self._row_status: list[str] = ["WAITING"] * max(0, config.detection.grid_rows)
-        self._row_advance_pending_log: bool = False  # diagnostic only: set True when row advances
-        self._committed_boundary_x: float | None = None  # leading_edge_x of last fired row; filters leftovers
-        # Post-fire boundary phase: CLEARING (boundary filter active, firing blocked —
-        # the just-fired row's leftovers are still being cleared) or ARMED (boundary
-        # filter disabled, all pieces eligible, firing allowed). Entered on every fire;
-        # evaluation of the CLEARING -> ARMED transition begins at the next rising edge
-        # (the row-advance event), not at the fire moment itself.
-        self._boundary_phase: str = "ARMED"
-        self._boundary_clearing_since: float | None = None  # time.monotonic() eval start
-        self._boundary_clear_streak: int = 0  # consecutive frames with 0 excluded pieces
-        self._post_reset_pending: bool = False  # True after FULL RESET; gates first fire until fresh approach seen
-        # DEBUG LOGGING (determinism analysis) — see PLC-EDGE / CYCLE-SUMMARY /
-        # FRAME-GAP logs. Purely observational; never read by decision logic.
+        # Cluster-based firing (replaces the old grid/row state machine
+        # entirely). ClusterTracker owns per-cluster ACTIVE/FIRED lifecycle —
+        # see viscontrol/detection/proximity_clustering.py. Continuous by
+        # design: never reset on TuchabzugRunning edges (only on genuinely
+        # discontinuous events — see _disable_detection).
+        self._cluster_tracker = ClusterTracker()
+        # Idle/batch bookkeeping for the logging-only CYCLE-SUMMARY boundary
+        # (detection.cycle_idle_reset_ms) — does not gate firing.
+        self._last_piece_seen_time: float | None = None
+        self._batch_active: bool = False
+        self._batch_start_time: float | None = None
+        self._batch_cluster_ids_fired: list[int] = []
+        self._batch_fire_tangents: list[float] = []
+        self._batch_overshoots_px: list[float] = []
+        # DEBUG LOGGING (determinism analysis) — see PLC-EDGE / FRAME-GAP
+        # logs. Purely observational; never read by decision logic.
         self._last_tuchabzug_edge_time: float | None = None  # time.monotonic() of last rising/falling edge
         self._last_active_frame_time: float | None = None    # time.monotonic() of last processed frame while running
-        self._cycle_start_time: float | None = None          # time.monotonic() when the current cycle's row 1 began
-        self._cycle_rows_fired: list[int] = []          # row numbers (1-indexed) that fired this cycle
-        self._cycle_fire_tangents: list[float] = []     # tangent at which each row fired
-        self._cycle_boundaries: list[float] = []        # committed_boundary_x set after each fire
-        self._cycle_clearing_durations_ms: list[float] = []  # CLEARING phase duration per fire
-        self._cycle_armed_reasons: list[str] = []       # "leftovers_cleared"|"timeout" per fire
-        # Immediate-switch anchor: set the moment a row fires so the NEXT row is
-        # tracked by position (not by blind sort-order) starting the same frame.
-        # None = use normal front-most-group mode; not None = anchor-proximity mode.
-        self._tracked_anchor_x: float | None = None   # last known X of the row we're tracking
-        self._tracked_anchor_idx: int | None = None   # _row_status index for the anchor-tracked row
-        self._cycle_partial_warned: bool = False     # True once partial-detection warning logged
-        self._cycle_front_row: list = []             # active-row detections (for display + stop)
-        self._cycle_row2: list = []                  # next-row detections (for display)
-        self._cycle_ref_tangent_x: float | None = None  # effective active-row leading tangent x
-        self._cycle_log_next_time: float = 0.0      # throttle gate for per-cycle state log
-        # FIX 2: position memory fallback (USE_ROW_GROUPING only).
-        # Stores last known active-row leftmost tangent for up to max_memory_frames
-        # frames when detection drops. Cleared on every TuchabzugRunning rising edge.
-        self._last_known_row_leading_x: float | None = None
-        self._memory_frame_count: int = 0
         # DIAGNOSTIC (temporary — two-rows-at-once investigation, see
         # InspectionPipeline.DIAGNOSTIC_ROW_PROFILE). Throttle gate for the
         # ~3 Hz bump/valley log; does not affect detection or tripwire state.
         self._diag_row_profile_last_log: float = 0.0
         # DIAGNOSTIC (logging-only, see viscontrol/detection/column_learning.py):
         # learns column Y-bands from observed piece Y-centroids purely for
-        # comparison against Layer 1/2 grouping. Never read by fire/stop logic.
+        # comparison against the cluster tracker. Never read by fire/stop logic.
         self._column_learner = ColumnLearner(
-            config.detection.grid_columns,
+            config.column_learning.expected_columns,
             window_size=config.column_learning.window_size,
             recompute_every_n_frames=config.column_learning.recompute_every_n_frames,
         )
+        # DIAGNOSTIC/VISUALIZATION ONLY (see
+        # viscontrol/detection/proximity_clustering.py): count of frames the
+        # tangent-based proximity clustering actually ran on, for the
+        # session-end summary log. Never read by fire/stop logic.
+        self._proximity_cluster_frames_processed: int = 0
         self._transfer_timeout_warned: bool = False  # True once timeout warning was logged
         # Wizard draft: suppress file writes during wizard; revert on cancel.
         self._wizard_active: bool = False
@@ -424,6 +392,12 @@ class MainWindow(QMainWindow):
                 self._column_learner.total_pieces_observed,
                 self._column_learner.recompute_count,
             )
+        logger.info(
+            "PROXIMITY-CLUSTER SESSION SUMMARY: final_tolerance={} "
+            "total_frames_processed={}",
+            self._cfg.proximity_clustering.tolerance_px,
+            self._proximity_cluster_frames_processed,
+        )
         try:
             self._camera.stop()
         except Exception:  # noqa: BLE001
@@ -509,11 +483,8 @@ class MainWindow(QMainWindow):
         # FIX 2: same handler as the Service page combo — single source of
         # truth, both controls stay in sync (see _on_detection_method_changed).
         wz.detection_method_changed.connect(self._on_detection_method_changed)
-        wz.row_grouping_changed.connect(self._on_row_grouping_changed)
         wz.save_cloth_reference_requested.connect(self._on_save_cloth_reference)
         wz.transfer_bridge_width_changed.connect(self._on_wizard_bridge_width_changed)
-        wz.grid_columns_changed.connect(self._on_wizard_grid_columns_changed)
-        wz.grid_rows_changed.connect(self._on_wizard_grid_rows_changed)
 
         sv.dough_is_darker_changed.connect(self._on_dough_is_darker_changed)
         sv.belt_dough_is_darker_changed.connect(self._on_belt_dough_is_darker_changed)
@@ -524,6 +495,8 @@ class MainWindow(QMainWindow):
         sv.detection_method_changed.connect(self._on_detection_method_changed)
         sv.fill_mask_holes_changed.connect(self._on_fill_mask_holes_changed)
         sv.belt_detection_enabled_changed.connect(self._on_belt_detection_enabled_changed)
+        sv.proximity_clustering_enabled_changed.connect(self._on_proximity_clustering_enabled_changed)
+        sv.proximity_clustering_tolerance_changed.connect(self._on_proximity_clustering_tolerance_changed)
         sv.capture_bg_reference_requested.connect(self._on_capture_bg_reference)
         sv.open_cloth_reference_requested.connect(lambda: self._open_wizard(start_step=6))
 
@@ -595,11 +568,6 @@ class MainWindow(QMainWindow):
         self._row_phase = RowPhase.IDLE
         self._line_clear_debounce_count = 0
         self._transfer_timeout_warned = False
-        self._row_line_tracker.reset()
-        self._row_group_stop_active = False
-        self._row_lines = []
-        self._row_count = 0
-        self._current_row_centroids = []
         self._detection_band = None
         self._last_hough_time = 0.0
         self._cached_cloth_detections = []
@@ -607,22 +575,13 @@ class MainWindow(QMainWindow):
         self._cached_tripwire_occupied = False
         self._active_bridge_width_px = 0
         self._detection_zone_outer_x = None
-        self._active_row_index = 0
-        self._row_status = ["WAITING"] * max(0, self._cfg.detection.grid_rows)
-        self._committed_boundary_x = None
-        self._boundary_phase = "ARMED"
-        self._boundary_clearing_since = None
-        self._boundary_clear_streak = 0
-        self._post_reset_pending = False
-        self._tracked_anchor_x = None
-        self._tracked_anchor_idx = None
-        self._cycle_partial_warned = False
-        self._cycle_front_row = []
-        self._cycle_row2 = []
-        self._cycle_ref_tangent_x = None
-        self._cycle_log_next_time = 0.0
-        self._last_known_row_leading_x = None
-        self._memory_frame_count = 0
+        self._cluster_tracker.reset()
+        self._last_piece_seen_time = None
+        self._batch_active = False
+        self._batch_start_time = None
+        self._batch_cluster_ids_fired = []
+        self._batch_fire_tangents = []
+        self._batch_overshoots_px = []
         self._belt_inspect_window_open = False
         self._belt_window_fault_latched = False
         self._clear_sticky_overlay()
@@ -743,93 +702,6 @@ class MainWindow(QMainWindow):
                 # Reset per-cycle state on the very first frame of a new cloth pull.
                 if _is_rising_edge:
                     self._reset_tracking_session()
-                    if self._cfg.detection.use_row_grouping:
-                        _grid_rows = self._cfg.detection.grid_rows
-                        if self._active_row_index == 0:
-                            # Start of a fresh cycle (either the very first one, or
-                            # right after the previous cycle's FULL RESET) — (re)arm
-                            # the per-cycle accumulators consumed by CYCLE-SUMMARY.
-                            self._cycle_start_time = time.monotonic()
-                            self._cycle_rows_fired = []
-                            self._cycle_fire_tangents = []
-                            self._cycle_boundaries = []
-                            self._cycle_clearing_durations_ms = []
-                            self._cycle_armed_reasons = []
-                        logger.info(
-                            "Row-SM rising edge: active_row={} status_before={}",
-                            self._active_row_index,
-                            self._row_status,
-                        )
-                        if (
-                            self._active_row_index < _grid_rows
-                            and self._row_status[self._active_row_index] == "STOPPED"
-                        ):
-                            _old_idx = self._active_row_index
-                            self._row_status[self._active_row_index] = "DONE"
-                            self._log_state(f"row_status[{_old_idx}]", "STOPPED", "DONE", "rising_edge")
-                            self._active_row_index += 1
-                            self._log_state("active_row_index", _old_idx, self._active_row_index, "rising_edge")
-                            logger.info(
-                                "Row-SM ADVANCE: row {} marked DONE -> "
-                                "new active_row={} row_status={}",
-                                _old_idx + 1,
-                                self._active_row_index,
-                                self._row_status,
-                            )
-                            self._row_advance_pending_log = True
-                            # This is the "next rising edge" after the fire that put
-                            # us into CLEARING — begin evaluating the CLEARING ->
-                            # ARMED transition (leftover-clear streak / timeout) now.
-                            if self._boundary_phase == "CLEARING" and self._boundary_clearing_since is None:
-                                self._boundary_clearing_since = time.monotonic()
-                                self._boundary_clear_streak = 0
-                        if self._active_row_index >= _grid_rows:
-                            _old_active_idx = self._active_row_index
-                            _old_row_status = list(self._row_status)
-                            _old_anchor = (self._tracked_anchor_x, self._tracked_anchor_idx)
-                            _old_phase = self._boundary_phase
-                            self._active_row_index = 0
-                            self._row_status = ["WAITING"] * max(0, _grid_rows)
-                            self._post_reset_pending = True
-                            self._tracked_anchor_x = None
-                            self._tracked_anchor_idx = None
-                            self._boundary_phase = "ARMED"
-                            self._boundary_clearing_since = None
-                            self._boundary_clear_streak = 0
-                            self._log_state("active_row_index", _old_active_idx, 0, "full_reset")
-                            self._log_state("row_status", _old_row_status, self._row_status, "full_reset")
-                            if _old_anchor != (None, None):
-                                self._log_state("anchor", _old_anchor, (None, None), "full_reset")
-                            if _old_phase != "ARMED":
-                                self._log_state("boundary_phase", _old_phase, "ARMED", "full_reset")
-                            logger.info(
-                                "Row-SM FULL RESET: all rows complete -> "
-                                "active_row_index=0, row_status reset to {}; "
-                                "post_reset_pending=True (fresh approach required before next fire)",
-                                self._row_status,
-                            )
-                            _old_bnd = self._committed_boundary_x
-                            self._committed_boundary_x = None
-                            if _old_bnd is not None:
-                                self._log_state("committed_boundary_x", _old_bnd, None, "full_reset")
-                                logger.info(
-                                    "Committed boundary RESET: cleared (was {}) for new cycle",
-                                    int(round(_old_bnd)),
-                                )
-                            _total_cycle_ms = (
-                                (time.monotonic() - self._cycle_start_time) * 1000.0
-                                if self._cycle_start_time is not None else 0.0
-                            )
-                            logger.info(
-                                "CYCLE-SUMMARY rows_fired={} fire_tangents={} boundaries={} "
-                                "clearing_durations_ms={} armed_reasons={} total_cycle_ms={}",
-                                self._cycle_rows_fired,
-                                [int(round(t)) for t in self._cycle_fire_tangents],
-                                [int(round(b)) for b in self._cycle_boundaries],
-                                [int(round(d)) for d in self._cycle_clearing_durations_ms],
-                                self._cycle_armed_reasons,
-                                int(round(_total_cycle_ms)),
-                            )
 
                 # FIX 1: rate-limit Hough to hough_interval_ms between runs.
                 # Stagger: if belt is also due this frame, defer Hough unless it
@@ -864,12 +736,11 @@ class MainWindow(QMainWindow):
                         logger.debug("cloth_tracking slow: {:.0f} ms", r.inference_ms)
 
                     # --- DIAGNOSTIC (logging-only): column learning ---
-                    # Runs alongside Layer 1 (group_by_gap) / Layer 2 (sticky
-                    # anchor tracking) logging below, never replacing or
-                    # feeding into it. See viscontrol/detection/column_learning.py.
-                    # Output is observation-only: not read by fire_eligible,
-                    # active_row, tangent selection, or any StopTuchabzug
-                    # decision.
+                    # Runs alongside the cluster-based fire decision below,
+                    # never replacing or feeding into it. See
+                    # viscontrol/detection/column_learning.py. Output is
+                    # observation-only: not read by the cluster tracker or
+                    # any StopTuchabzug decision.
                     if self._cfg.column_learning.enabled:
                         _cl_y_centroids = [float(d.centroid[1]) for d in r.detections]
                         self._column_learner.update(_cl_y_centroids)
@@ -895,13 +766,14 @@ class MainWindow(QMainWindow):
                         )
                     # --- END DIAGNOSTIC ---
 
-                    # Firing path: row grouping (per-row stop) when enabled,
-                    # otherwise the unchanged single-line tripwire.
+                    # Firing path: cluster-based (grid-free), the sole owner
+                    # of StopTuchabzug firing. _track_row_phase still runs
+                    # for its RowPhase bookkeeping (belt-fault-debounce
+                    # reset, transfer-timeout warning, UI label) but no
+                    # longer fires anything itself.
                     _t_r0 = time.perf_counter()
-                    if self._cfg.detection.use_row_grouping:
-                        self._apply_tangent_stop_edge(r, profile)
-                    else:
-                        self._apply_tripwire_edge(r, profile)
+                    self._track_row_phase(r, profile)
+                    self._apply_cluster_stop_edge(r, profile)
                     _t_rowgroup_ms = (time.perf_counter() - _t_r0) * 1000.0
 
                     # --- DIAGNOSTIC: row-profile bump/valley log (two-rows-at-once
@@ -1116,54 +988,52 @@ class MainWindow(QMainWindow):
                 if not highlight:
                     highlight = self._cached_cloth_highlight
 
+            # --- DIAGNOSTIC/VISUALIZATION ONLY: tangent-based proximity
+            # clustering (see viscontrol/detection/proximity_clustering.py).
+            # Groups the pieces already detected above by proximity along
+            # tangent_x only (X axis) — no fixed row count, no outlier
+            # rejection. Runs alongside existing detection every processed
+            # frame; its output is never read by fire_eligible, active_row,
+            # StopTuchabzug, or any state-machine decision (observation +
+            # overlay only — everything above this block keeps firing
+            # exactly as it does today).
+            _proximity_clusters_overlay: list[tuple[float, list[tuple[float, float, float]]]] | None = None
+            if self._cfg.proximity_clustering.enabled:
+                self._proximity_cluster_frames_processed += 1
+                _prox_tolerance = self._cfg.proximity_clustering.tolerance_px
+                _prox_clusters = cluster_by_tangent(
+                    pieces_from_detections(cloth_detections), _prox_tolerance,
+                )
+                _prox_cluster_strs = [
+                    "(front_tangent={:.1f}, piece_count={}, tangents={})".format(
+                        c.front_tangent_x,
+                        len(c.pieces),
+                        [round(pc.tangent_x, 1) for pc in c.pieces],
+                    )
+                    for c in _prox_clusters
+                ]
+                logger.info(
+                    "PROXIMITY-CLUSTER: frame_id={} tolerance={} clusters=[{}]",
+                    self._frame_count, _prox_tolerance, ", ".join(_prox_cluster_strs),
+                )
+                _proximity_clusters_overlay = [
+                    (
+                        c.front_tangent_x,
+                        [(pc.tangent_x, pc.center_y, pc.radius) for pc in c.pieces],
+                    )
+                    for c in _prox_clusters
+                ]
+            # --- END DIAGNOSTIC ---
+
             self._inference_view.set_belt_frame(
                 belt, _disp_belt_dets, px_per_mm=1.0, crop_rect=_disp_belt_crop,
                 debug_mask=_belt_debug_mask,
             )
-            # Grid visualization: compute row assignments from current
-            # cloth_detections for coloring in _draw_detection.
-            _row_count_display: int | None = None
-            if self._cfg.detection.use_row_grouping and cloth_detections:
-                # Gap-cluster grouping with boundary filter (same filter as stop decision).
-                # Excluded pieces (X <= committed_boundary_x) are drawn gray (-1);
-                # only eligible pieces participate in the gap-cluster row coloring.
-                _disp_bnd = self._committed_boundary_x
-                _disp_eligible = [
-                    d for d in cloth_detections
-                    if _disp_bnd is None or leading_edge_x(d) > _disp_bnd
-                ]
-                _disp_excluded = [
-                    d for d in cloth_detections
-                    if _disp_bnd is not None and leading_edge_x(d) <= _disp_bnd
-                ]
-                _grouped, _ = group_by_gap(
-                    _disp_eligible, self._cfg.detection.row_gap_threshold_px,
-                )
-                _row_count_display = len(_grouped)
-                # Map detection object → index for O(1) lookup; assign row colours.
-                _det_to_idx = {id(det): i for i, det in enumerate(cloth_detections)}
-                _grid_row_asgn: dict[int, int] = {}
-                for _det in _disp_excluded:
-                    _di = _det_to_idx.get(id(_det))
-                    if _di is not None:
-                        _grid_row_asgn[_di] = -1  # gray — boundary-excluded
-                for _gi, _grp in enumerate(_grouped[:2]):
-                    for _det in _grp:
-                        _di = _det_to_idx.get(id(_det))
-                        if _di is not None:
-                            _grid_row_asgn[_di] = _gi + 1  # 1 = front/magenta, 2 = second/cyan
-                _ref_x = self._cycle_ref_tangent_x
-                _ref_lbl = f"{int(_ref_x)}" if _ref_x is not None else "—"
-                _grs = self._cfg.detection.grid_rows
-                _grid_label = (
-                    f"Active Row: {self._active_row_index + 1}/"
-                    f"{_grs if _grs > 0 else '?'} "
-                    f"| Status: {self._row_status} | Ref: {_ref_lbl}px"
-                )
-            else:
-                _grid_row_asgn = None
-                _ref_x = None
-                _grid_label = None
+            # Cluster-state label: live count of tracked clusters by state,
+            # replacing the old grid/row "Active Row: N/M" display.
+            _n_active = sum(1 for tc in self._cluster_tracker.tracked if tc.state == "ACTIVE")
+            _n_clearing = sum(1 for tc in self._cluster_tracker.tracked if tc.state == "FIRED")
+            _cluster_state_label = f"Clusters: {_n_active} active, {_n_clearing} clearing"
 
             self._inference_view.set_cloth_frame(
                 cloth,
@@ -1185,19 +1055,13 @@ class MainWindow(QMainWindow):
                 row_profile=_diag_row_profile,
                 row_profile_x_offset=cloth_crop_rect[0],
                 row_profile_scale=_diag_row_profile_scale,
-                # Tangent-stop path draws per-piece leading-edge lines inside
-                # _draw_detection; vertical row-position lines not shown.
-                row_lines=None,
-                row_count=_row_count_display,
                 # Bridge IS the detection band (FIX 2 unified): don't double-draw
                 # the same region. Pass None so only the bridge overlay renders.
                 detection_band=None,
-                current_row_centroids=None,
                 detection_zone_outer_x=self._detection_zone_outer_x,
-                grid_row_assignments=_grid_row_asgn,
-                grid_ref_tangent_x=_ref_x,
-                grid_label=_grid_label,
+                cluster_state_label=_cluster_state_label,
                 debug_mask=_cloth_debug_mask,
+                proximity_clusters=_proximity_clusters_overlay,
             )
             self._inference_view.set_inference_ms(self._latest_pipeline_ms)
             self._inference_view.set_plc_signals(
@@ -1318,6 +1182,21 @@ class MainWindow(QMainWindow):
             self._belt_clear_count = 0
             logger.info("Belt inspection window CLOSED — disabled by toggle")
 
+    def _on_proximity_clustering_enabled_changed(self, enabled: bool) -> None:
+        """Diagnostic/visualization only (Service > Diagnostics). Toggles the
+        tangent-based proximity clustering log/overlay — see
+        viscontrol/detection/proximity_clustering.py. Never affects
+        StopTuchabzug firing, the row state machine, or active_row tracking.
+        """
+        self._cfg.proximity_clustering.enabled = enabled
+        self._save_cfg()
+
+    def _on_proximity_clustering_tolerance_changed(self, tolerance_px: int) -> None:
+        """Live-adjustable; takes effect on the next processed frame, no
+        restart needed. Diagnostic/visualization only."""
+        self._cfg.proximity_clustering.tolerance_px = max(1, tolerance_px)
+        self._save_cfg()
+
     def _read_belt_inspect_signal(self) -> bool:
         """Resolve the belt-inspection-window source.
 
@@ -1331,13 +1210,20 @@ class MainWindow(QMainWindow):
                 logger.exception("plc.read_einlaufband_running failed")
         return self._manual_einlaufband_toggle
 
-    def _apply_tripwire_edge(self, r: object, profile: "ProductProfile") -> None:
-        """Drive the row-at-line state machine from the per-frame tripwire reading.
+    def _track_row_phase(self, r: object, profile: "ProductProfile") -> None:
+        """Track RowPhase (IDLE/AT_LINE/TRANSFERRING) from the per-frame
+        tripwire occupancy reading.
 
-        StopTuchabzug fires ONLY on IDLE → AT_LINE (a genuinely new row).
-        During TRANSFERRING the tripwire is suppressed — the same row cannot
-        trigger twice.  TRANSFERRING → IDLE requires line_clear_debounce_frames
-        consecutive clear frames so a partially transferred row doesn't re-arm
+        Renamed from the old _apply_tripwire_edge: this method no longer
+        fires StopTuchabzug itself — cluster-based firing
+        (_apply_cluster_stop_edge) is the sole fire-decision owner now. It
+        still owns RowPhase, whose transitions drive other bookkeeping used
+        regardless of firing mode: belt-fault-debounce reset on transfer
+        start (_on_tuchabzug_rising_row_phase), the transfer_timeout_ms
+        warning below in _on_frame, and the UI's row-phase label.
+
+        TRANSFERRING → IDLE requires line_clear_debounce_frames consecutive
+        clear frames so a partially transferred row doesn't re-arm
         prematurely.
         """
         occupied_now: bool = r.tripwire_occupied  # type: ignore[attr-defined]
@@ -1359,18 +1245,16 @@ class MainWindow(QMainWindow):
         if stable:
             # ---- line occupied ----
             if self._row_phase == RowPhase.IDLE:
-                # New row reached the line: IDLE → AT_LINE, fire StopTuchabzug.
+                # New row reached the line: IDLE → AT_LINE. Firing moved to
+                # the cluster tracker; this only updates RowPhase now.
                 self._row_phase = RowPhase.AT_LINE
                 self._tripwire_prev_stable = True
                 logger.info(
-                    "Row AT_LINE: StopTuchabzug TRUE (new row), "
+                    "Row AT_LINE (cluster logic owns StopTuchabzug), "
                     "occupancy={:.1%} at transfer_line_local={}",
                     r.tripwire_occupancy,  # type: ignore[attr-defined]
                     profile.transfer_line_x - profile.roi_split_x,
                 )
-                self._sm.handle_stop_tuchabzug_trigger()
-                self._push_signals_to_opcua()
-                self._request_plc_stop_pulse()
             # AT_LINE: already handled — do nothing.
             # TRANSFERRING: row still on line during transfer — suppressed.
 
@@ -1391,8 +1275,7 @@ class MainWindow(QMainWindow):
                 self._tripwire_prev_stable = False
                 if self._row_phase == RowPhase.AT_LINE:
                     self._row_phase = RowPhase.IDLE
-                logger.info("StopTuchabzug FALSE: line cleared, tripwire re-armed")
-                self._sm.handle_stop_tuchabzug_clear()
+                logger.info("Line cleared, tripwire re-armed")
                 self._push_signals_to_opcua()
 
     def _band_filter(
@@ -1417,9 +1300,8 @@ class MainWindow(QMainWindow):
     # ---------- DEBUG LOGGING (determinism analysis) ----------
 
     def _log_state(self, field: str, old: object, new: object, trigger: str) -> None:
-        """Uniform "STATE:" transition line for row_status/active_row_index/
-        boundary_phase/committed_boundary_x/anchor mutations. Logging only —
-        never affects behavior."""
+        """Uniform "STATE:" transition line for cluster ACTIVE/FIRED/CLEARED
+        mutations. Logging only — never affects behavior."""
         logger.info("STATE: {}: {} -> {} (trigger={})", field, old, new, trigger)
 
     def _log_plc_edge(self, edge: str) -> None:
@@ -1437,462 +1319,161 @@ class MainWindow(QMainWindow):
     def _log_fire_trace(
         self,
         *,
-        state: str,
-        active_idx: int,
-        tangent: float | None,
         transfer_x: float,
-        boundary: float | None,
+        clusters_active: int,
+        clusters_clearing: int,
         pieces_total: int,
         pieces_excluded: int,
-        fire_eligible: bool,
-        fired: bool,
+        fired_cluster_ids: list[int],
     ) -> None:
-        """One line per processed frame summarizing the fire decision."""
+        """One line per processed frame summarizing the cluster fire decision."""
         logger.info(
-            "FIRE-TRACE frame_id={} state={} active_row={} tangent={} "
-            "transfer_x={} boundary={} pieces_total={} pieces_excluded={} "
-            "fire_eligible={} fired={}",
+            "FIRE-TRACE frame_id={} transfer_x={} clusters_active={} "
+            "clusters_clearing={} pieces_total={} pieces_excluded={} fired={}",
             self._frame_count,
-            state,
-            active_idx,
-            int(round(tangent)) if tangent is not None else "none",
             int(round(transfer_x)),
-            int(round(boundary)) if boundary is not None else "none",
+            clusters_active,
+            clusters_clearing,
             pieces_total,
             pieces_excluded,
-            "true" if fire_eligible else "false",
-            "true" if fired else "false",
+            fired_cluster_ids,
         )
 
-    def _apply_tangent_stop_edge(self, r: object, profile: "ProductProfile") -> None:
-        """USE_ROW_GROUPING=ON firing path — explicit per-row state machine.
+    def _apply_cluster_stop_edge(self, r: object, profile: "ProductProfile") -> None:
+        """Grid-free firing path — the sole StopTuchabzug fire-decision owner.
 
-        Each frame while TuchabzugRunning is True:
-        1. Skip entirely if the cycle is complete (_active_row_index >= grid_rows).
-        2. Look ONLY at grouped_rows[_active_row_index] for the stop decision.
-        3. Fire StopTuchabzug when that row's leftmost tangent <= transfer_x
-           and its status is WAITING; set status to STOPPED.
-        Row advancement (STOPPED -> DONE, index++) happens in the rising-edge
-        handler. Full-cycle reset (index -> 0, all WAITING) also happens there
-        once all rows are DONE.
+        Replaces the old grid/row state machine (Layer 1 gap-cluster
+        grouping, Layer 2 sticky anchor tracking, active_row_index,
+        row_status) entirely. Each frame: evaluate per-cluster
+        FIRED -> cleared lifecycle, filter out pieces behind a still-firing
+        cluster's boundary, cluster the remaining pieces by tangent_x, match
+        against tracked clusters by identity, and fire independently for
+        every ACTIVE cluster whose front (minimum) tangent_x has reached
+        transfer_x. No row count, no grid, no "switch to next row" —
+        clusters are detected and fired continuously as they arrive. See
+        viscontrol/detection/proximity_clustering.py: ClusterTracker.
         """
         transfer_x = float(profile.transfer_line_x - profile.roi_split_x)
         all_detections = r.detections  # type: ignore[attr-defined]
+        now = time.monotonic()
 
         raw_diameter = median_piece_diameter(all_detections) or float(profile.expected_width_px)
         effective_width = max(float(profile.transfer_bridge_width_px), raw_diameter)
         self._active_bridge_width_px = int(effective_width)
 
-        grid_cols = self._cfg.detection.grid_columns
-        grid_rows = self._cfg.detection.grid_rows
+        # Idle/batch bookkeeping — logging-only, see detection.cycle_idle_reset_ms.
+        if all_detections:
+            self._last_piece_seen_time = now
+            if not self._batch_active:
+                self._batch_active = True
+                self._batch_start_time = now
 
-        # Post-fire CLEARING -> ARMED evaluation. Only runs once the next rising
-        # edge (row advance) has started the clock/streak — see the rising-edge
-        # handler. Firing stays blocked (Step 3 below) until we reach ARMED.
-        if (
-            self._boundary_phase == "CLEARING"
-            and self._boundary_clearing_since is not None
-            and self._committed_boundary_x is not None
-        ):
-            _clearing_excluded = [
-                d for d in all_detections if leading_edge_x(d) <= self._committed_boundary_x
-            ]
-            if not _clearing_excluded:
-                self._boundary_clear_streak += 1
-            else:
-                self._boundary_clear_streak = 0
-            _clearing_elapsed = time.monotonic() - self._boundary_clearing_since
-            if self._boundary_clear_streak >= _BOUNDARY_CLEAR_STREAK:
-                self._boundary_phase = "ARMED"
-                self._cycle_clearing_durations_ms.append(_clearing_elapsed * 1000.0)
-                self._cycle_armed_reasons.append("leftovers_cleared")
-                self._log_state("boundary_phase", "CLEARING", "ARMED", "leftovers_cleared")
-                logger.info(
-                    "Post-fire state: ARMED (reason=leftovers_cleared), "
-                    "boundary filter disabled",
-                )
-            elif _clearing_elapsed >= self._cfg.detection.clearing_timeout_ms / 1000.0:
-                self._boundary_phase = "ARMED"
-                self._cycle_clearing_durations_ms.append(_clearing_elapsed * 1000.0)
-                self._cycle_armed_reasons.append("timeout")
-                self._log_state("boundary_phase", "CLEARING", "ARMED", "timeout")
-                logger.info(
-                    "Post-fire state: ARMED (reason=timeout), boundary filter disabled",
-                )
+        # Per-cluster FIRED -> cleared evaluation: a straight port of the old
+        # global ARMED/CLEARING boundary logic, now scoped to one cluster at
+        # a time (see ClusterTracker.evaluate_clearing).
+        _all_tangent_xs = [leading_edge_x(d) for d in all_detections]
+        _clearing_timeout_s = self._cfg.detection.clearing_timeout_ms / 1000.0
+        for _tc in self._cluster_tracker.evaluate_clearing(_all_tangent_xs, _clearing_timeout_s):
+            self._log_state(f"cluster[{_tc.id}]", "FIRED", "CLEARED", "leftovers_cleared_or_timeout")
+            logger.info(
+                "Post-fire state: CLEARED cluster={} (boundary={})",
+                _tc.id,
+                int(round(_tc.committed_boundary_x)) if _tc.committed_boundary_x is not None else "none",
+            )
 
-        # Boundary filter: exclude pieces already handled by a previously-fired row.
-        # Pieces with leading_edge_x <= committed_boundary_x are leftovers from a
-        # row whose stop already fired and must not be regrouped as the new active
-        # row. Only applied while CLEARING — once ARMED the filter is fully
-        # disabled (all detected pieces eligible for grouping, anchor, and tangent).
-        _bnd_x = self._committed_boundary_x if self._boundary_phase == "CLEARING" else None
+        # Boundary filter: exclude pieces behind any still-FIRED cluster's
+        # committed boundary, so a just-fired cluster's own trailing pieces
+        # aren't mistaken for a new arrival.
+        _clearing_boundaries = [
+            tc.committed_boundary_x for tc in self._cluster_tracker.tracked
+            if tc.state == "FIRED" and tc.committed_boundary_x is not None
+        ]
+        _bnd_x = max(_clearing_boundaries) if _clearing_boundaries else None
         _eligible = [d for d in all_detections if _bnd_x is None or leading_edge_x(d) > _bnd_x]
         _excluded = [d for d in all_detections if _bnd_x is not None and leading_edge_x(d) <= _bnd_x]
         logger.info(
             "Boundary filter: {} pieces detected, {} excluded (X<=boundary {}), "
-            "{} eligible for grouping",
+            "{} eligible for clustering",
             len(all_detections),
             len(_excluded),
             int(round(_bnd_x)) if _bnd_x is not None else "none",
             len(_eligible),
         )
-        if _excluded:
-            _all_sorted_for_cand = sorted(all_detections, key=leading_edge_x)
-            _candidate_ids = {id(d) for d in _all_sorted_for_cand[:grid_cols]}
-            for _excl_d in _excluded:
-                if id(_excl_d) in _candidate_ids:
-                    logger.info(
-                        "Boundary filter EXCLUDED piece at X={} from grouping "
-                        "(would have been row candidate)",
-                        int(round(leading_edge_x(_excl_d))),
-                    )
 
-        grouped_rows, _row_gaps = group_by_gap(_eligible, self._cfg.detection.row_gap_threshold_px)
-
-        # Outlier rejection: only meaningful for an over-full cluster (more
-        # pieces than a row should hold) — a straggler that slipped past the
-        # boundary filter or gap threshold could still land in a group and
-        # skew its front tangent. Leave-one-out check — drop any member
-        # farther than reject_group_outliers' max_dist_px from the median of
-        # the others so it can't contaminate a legitimate row's group. A
-        # cluster with grid_cols or fewer members is left alone: it's a valid
-        # (possibly partial) row, not a candidate for rejection.
-        _cleaned_grouped_rows: list[list[Any]] = []
-        for _grp in grouped_rows:
-            if len(_grp) > grid_cols:
-                _grp_kept, _grp_rejected = reject_group_outliers(_grp)
-                for _out_d, _out_med, _out_dist in _grp_rejected:
-                    logger.info(
-                        "Grouping outlier rejected: X={} median={} dist={}",
-                        int(round(leading_edge_x(_out_d))),
-                        int(round(_out_med)),
-                        int(round(_out_dist)),
-                    )
-            else:
-                _grp_kept = _grp
-                if 0 < len(_grp_kept) < grid_cols:
-                    logger.info("Partial cluster: {} pieces", len(_grp_kept))
-            _cleaned_grouped_rows.append(_grp_kept)
-        grouped_rows = _cleaned_grouped_rows
-
-        # Gap-cluster grouping log (unthrottled — diagnostic).
-        _log_xs = [int(round(leading_edge_x(d))) for d in sorted(_eligible, key=leading_edge_x)]
-        _log_groups = [[int(round(leading_edge_x(d))) for d in grp] for grp in grouped_rows]
-        logger.info(
-            "Gap-cluster grouping: {} pieces -> {} clusters, gaps={}",
-            len(_eligible), len(_log_groups), [int(round(g)) for g in _row_gaps],
-        )
-        logger.info(
-            "Gap-cluster groups: sorted X={}, clusters={}",
-            _log_xs, _log_groups,
+        # Cluster the eligible pieces and match against tracked clusters by
+        # identity (front_tangent_x proximity, within tolerance_px).
+        tolerance_px = self._cfg.proximity_clustering.tolerance_px
+        current_clusters = cluster_by_tangent(pieces_from_detections(_eligible), tolerance_px)
+        tracked = self._cluster_tracker.update(
+            current_clusters, tolerance_px, self._cfg.detection.max_memory_frames,
         )
 
-        active_idx = self._active_row_index
-
-        # --- Step 1: cycle complete — skip stop evaluation ---
-        if active_idx >= grid_rows:
-            self._cycle_front_row = []
-            self._cycle_row2 = []
-            self._cycle_ref_tangent_x = None
-            _now_log = time.monotonic()
-            if _now_log >= self._cycle_log_next_time:
-                self._cycle_log_next_time = _now_log + 0.2
-                logger.info(
-                    "Row-SM: cycle already complete, waiting for full reset "
-                    "(active_row_index={} >= grid_rows={})",
-                    active_idx, grid_rows,
-                )
-            self._log_fire_trace(
-                state="IDLE",
-                active_idx=active_idx,
-                tangent=None,
-                transfer_x=transfer_x,
-                boundary=self._committed_boundary_x,
-                pieces_total=len(all_detections),
-                pieces_excluded=len(_excluded),
-                fire_eligible=False,
-                fired=False,
+        # Fire: every ACTIVE cluster whose front tangent_x has reached
+        # transfer_x fires independently — no expected-count check.
+        _fired_ids: list[int] = []
+        for tc in tracked:
+            if tc.state != "ACTIVE" or tc.front_tangent_x > transfer_x:
+                continue
+            _fired_tangent_x = tc.front_tangent_x
+            _piece_count = len(tc.pieces)
+            _fired_ids.append(tc.id)
+            self._cluster_tracker.mark_fired(
+                tc.id, _fired_tangent_x, self._cfg.detection.boundary_offset_px,
             )
-            return
-
-        # --- Step 2: select the active row group ---
-        # In anchor mode (set immediately when a row fires): find the eligible group
-        # whose front tangent is closest to where the tracked row was last seen.
-        # This keeps us following the SAME physical row as the cloth moves, instead
-        # of whatever happens to sort into "first N pieces" each fresh frame.
-        # In normal mode (fresh cycle or no active anchor): use the front-most group.
-        if self._tracked_anchor_x is not None and grouped_rows:
-            active_row = min(
-                grouped_rows,
-                key=lambda g: abs(min(leading_edge_x(d) for d in g) - self._tracked_anchor_x)
-                if g
-                else float("inf"),
-            )
-            _new_anchor = min(leading_edge_x(d) for d in active_row) if active_row else None
-            if _new_anchor is not None:
-                self._tracked_anchor_x = _new_anchor  # follow the group as it moves
-            row2 = []  # no "second group" in anchor mode; display shows tracked row only
-        else:
-            active_row = grouped_rows[0] if grouped_rows else []
-            row2 = grouped_rows[1] if len(grouped_rows) > 1 else []
-
-        # Partial-detection warning: fires once when active row smaller than expected.
-        grid_cols = self._cfg.detection.grid_columns
-        if not self._cycle_partial_warned and 0 < len(active_row) < grid_cols:
-            self._cycle_partial_warned = True
-            logger.warning(
-                "Partial detection: expected {} pieces in active row {}, got {} "
-                "(groups={}) — proceeding",
-                grid_cols, active_idx, len(active_row), len(grouped_rows),
-            )
-
-        # Leftmost tangent of the active row
-        min_tang_x = min(leading_edge_x(d) for d in active_row) if active_row else None
-
-        # ---- DIAGNOSTIC: group-selection tracing ----
-        _dbg_groups_str = "[" + ", ".join(
-            f"(idx={gi}, tangent={int(round(min(leading_edge_x(d) for d in grp)))})"
-            if grp else f"(idx={gi}, tangent=None)"
-            for gi, grp in enumerate(grouped_rows)
-        ) + "]"
-        _dbg_sel_idx: int | str
-        _dbg_sel_method: str
-        if self._tracked_anchor_x is not None:
-            _dbg_sel_idx = "anchor"
-            _dbg_sel_method = (
-                f"anchor-proximity (anchor={int(round(self._tracked_anchor_x))}, tracking row_idx={self._tracked_anchor_idx})"
-                if grouped_rows
-                else "anchor mode but no groups detected, used []"
-            )
-        elif grouped_rows:
-            _dbg_sel_idx = 0
-            _dbg_sel_method = "grouped_rows[0] (front-most group)"
-        else:
-            _dbg_sel_idx = "N/A"
-            _dbg_sel_method = "grouped_rows[0] out of range (no groups detected), used []"
-        if self._row_advance_pending_log:
-            self._row_advance_pending_log = False
+            self._log_state(f"cluster[{tc.id}]", "ACTIVE", "FIRED", "fire")
+            _overshoot_px = transfer_x - _fired_tangent_x
             logger.info(
-                "Row-SM POST-ADVANCE CHECK: active_row_index just became {} "
-                "this frame's all_groups={} about to select using method='{}'",
-                active_idx, _dbg_groups_str, _dbg_sel_method,
+                "FIRE OVERSHOOT: cluster={} fired_tangent={} transfer_x={:.0f} "
+                "overshoot_px={} piece_count={}",
+                tc.id, int(_fired_tangent_x), transfer_x,
+                int(round(_overshoot_px)), _piece_count,
             )
-        logger.info(
-            "Row-SM SELECT DEBUG: active_row_index={} all_groups={} "
-            "selected_group_list_index={} selection_method='{}' fresh_tangent={}",
-            active_idx,
-            _dbg_groups_str,
-            _dbg_sel_idx,
-            _dbg_sel_method,
-            int(round(min_tang_x)) if min_tang_x is not None else "none",
-        )
-        # ---- END DIAGNOSTIC ----
+            self._batch_cluster_ids_fired.append(tc.id)
+            self._batch_fire_tangents.append(_fired_tangent_x)
+            self._batch_overshoots_px.append(_overshoot_px)
 
-        # Position memory fallback — applied to the active row's tracked position.
-        max_mem = self._cfg.detection.max_memory_frames
-        if min_tang_x is not None:
-            self._last_known_row_leading_x = min_tang_x
-            self._memory_frame_count = 0
-            effective_tang_x = min_tang_x
-            _using_fallback = False
-        elif (
-            self._last_known_row_leading_x is not None
-            and self._memory_frame_count < max_mem
-        ):
-            self._memory_frame_count += 1
-            effective_tang_x = self._last_known_row_leading_x
-            _using_fallback = True
-            logger.info(
-                "Fallback row position: {}px (frame {}/{})",
-                int(self._last_known_row_leading_x),
-                self._memory_frame_count,
-                max_mem,
-            )
-        else:
-            effective_tang_x = None
-            _using_fallback = False
+            self._sm.handle_stop_tuchabzug_trigger()
+            self._push_signals_to_opcua()
+            self._request_plc_stop_pulse()
 
-        # Update display state (consumed by display block every frame).
-        self._cycle_front_row = active_row
-        self._cycle_row2 = row2
-        self._cycle_ref_tangent_x = effective_tang_x
-
-        # Throttled state log (~5 Hz).
-        _now_log = time.monotonic()
-        if _now_log >= self._cycle_log_next_time:
-            self._cycle_log_next_time = _now_log + 0.2
-            logger.info(
-                "Row-SM state: active_row={} status={} this_row_tangent={} "
-                "transfer_x={:.0f} grid_rows={}",
-                active_idx,
-                self._row_status,
-                f"{int(effective_tang_x)}" if effective_tang_x is not None else "none",
-                transfer_x,
-                grid_rows,
-            )
-            if self._tracked_anchor_x is not None:
-                logger.info(
-                    "Row-SM TRACK: following Row {}, current tangent={}, transfer_x={:.0f}",
-                    (self._tracked_anchor_idx or 0) + 1,
-                    int(effective_tang_x) if effective_tang_x is not None else "none",
-                    transfer_x,
-                )
-
-        # --- Step 3: stop trigger for the active row ---
-        # Captured BEFORE the fire block (below) can mutate boundary_phase, so
-        # the FIRE-TRACE line at the end of this function reflects the state
-        # that actually gated THIS frame's decision, not the post-fire state.
-        _trace_state = self._boundary_phase
-        _fired_this_frame = False
-        # In anchor mode _fire_idx differs from active_row_index: we fire against
-        # the tracked row's status slot, not the SM's current slot, so Row 2 can
-        # fire even before the next TuchabzugRunning rising edge formally advances
-        # the SM. The SM still advances on rising edges as before (bookkeeping).
-        _fire_idx = (
-            self._tracked_anchor_idx
-            if self._tracked_anchor_idx is not None
-            else active_idx
-        )
+        # Cycle-idle-reset (logging-only, requirement 4): once no pieces have
+        # been seen for cycle_idle_reset_ms AND nothing is ACTIVE or still
+        # clearing, the batch is "finished" — log a summary and reset the
+        # batch-scoped counters. Clustering/firing itself never stops or
+        # resets because of this; it's purely an observability boundary.
         if (
-            self._boundary_phase == "ARMED"
-            and _fire_idx < len(self._row_status)
-            and self._row_status[_fire_idx] == "WAITING"
+            self._batch_active
+            and self._last_piece_seen_time is not None
+            and not self._cluster_tracker.tracked
+            and (now - self._last_piece_seen_time) * 1000.0 >= self._cfg.detection.cycle_idle_reset_ms
         ):
-            # Post-reset guard: only in normal mode (anchor only activates mid-cycle,
-            # never right after a FULL RESET, so the guard is never needed there).
-            _allow_fire = True
-            if self._tracked_anchor_idx is None and self._post_reset_pending and effective_tang_x is not None:
-                _pr_threshold = transfer_x + self._cfg.detection.post_reset_fresh_margin_px
-                if effective_tang_x > _pr_threshold:
-                    self._post_reset_pending = False
-                    logger.info(
-                        "Post-reset: fresh row confirmed — tangent {} > {:.0f} "
-                        "(active_row={}), fire gate now open",
-                        int(effective_tang_x), _pr_threshold, active_idx,
-                    )
-                    # tangent > threshold > transfer_x — won't fire this frame but
-                    # _allow_fire stays True so subsequent frames fire normally
-                else:
-                    _allow_fire = False
-                    _now_log = time.monotonic()
-                    if _now_log >= self._cycle_log_next_time:
-                        self._cycle_log_next_time = _now_log + 0.2
-                        logger.info(
-                            "Post-reset: rejecting instant-fire, tangent {} not yet "
-                            "confirmed fresh (need > {:.0f})",
-                            int(effective_tang_x), _pr_threshold,
-                        )
-            if _allow_fire and effective_tang_x is not None and effective_tang_x <= transfer_x:
-                _fired_this_frame = True
-                self._log_state(f"row_status[{_fire_idx}]", "WAITING", "STOPPED", "fire")
-                self._row_status[_fire_idx] = "STOPPED"
-                logger.info(
-                    "Row-SM FIRE: row {} tangent {} <= transfer_x {:.0f} "
-                    "-> StopTuchabzug | row_status={}",
-                    _fire_idx + 1,
-                    int(effective_tang_x),
-                    transfer_x,
-                    self._row_status,
-                )
-                _overshoot_px = transfer_x - effective_tang_x
-                _last_clearing_ms = (
-                    self._cycle_clearing_durations_ms[-1]
-                    if self._cycle_clearing_durations_ms else 0.0
-                )
-                _last_clearing_reason = (
-                    self._cycle_armed_reasons[-1]
-                    if self._cycle_armed_reasons else "n/a"
-                )
-                logger.info(
-                    "FIRE OVERSHOOT: row={} fired_tangent={} transfer_x={:.0f} "
-                    "overshoot_px={} clearing_duration_ms={} clearing_exit_reason={}",
-                    _fire_idx + 1,
-                    int(effective_tang_x),
-                    transfer_x,
-                    int(round(_overshoot_px)),
-                    int(round(_last_clearing_ms)),
-                    _last_clearing_reason,
-                )
-                self._cycle_rows_fired.append(_fire_idx + 1)
-                self._cycle_fire_tangents.append(effective_tang_x)
-                _old_committed_bnd = self._committed_boundary_x
-                self._committed_boundary_x = effective_tang_x + self._cfg.detection.boundary_offset_px
-                self._cycle_boundaries.append(self._committed_boundary_x)
-                self._log_state(
-                    "committed_boundary_x", _old_committed_bnd, self._committed_boundary_x, "fire",
-                )
-                logger.info(
-                    "Committed boundary SET: X={} (fired_tangent={} + offset={})",
-                    int(round(self._committed_boundary_x)),
-                    int(effective_tang_x),
-                    self._cfg.detection.boundary_offset_px,
-                )
-                self._log_state("boundary_phase", self._boundary_phase, "CLEARING", "fire")
-                self._boundary_phase = "CLEARING"
-                self._boundary_clearing_since = None  # evaluation starts at the next rising edge
-                self._boundary_clear_streak = 0
-                logger.info(
-                    "Post-fire state: CLEARING (boundary={})",
-                    int(round(self._committed_boundary_x)),
-                )
+            _batch_ms = (
+                (now - self._batch_start_time) * 1000.0
+                if self._batch_start_time is not None else 0.0
+            )
+            logger.info(
+                "CYCLE-SUMMARY cluster_ids_fired={} fire_tangents={} overshoot_px={} "
+                "total_batch_ms={}",
+                self._batch_cluster_ids_fired,
+                [int(round(t)) for t in self._batch_fire_tangents],
+                [int(round(o)) for o in self._batch_overshoots_px],
+                int(round(_batch_ms)),
+            )
+            self._batch_active = False
+            self._batch_start_time = None
+            self._batch_cluster_ids_fired = []
+            self._batch_fire_tangents = []
+            self._batch_overshoots_px = []
 
-                # Immediately switch tracking to the next row in the SAME frame.
-                if self._tracked_anchor_idx is None:
-                    # Normal (non-anchor) fire: Row N just fired — capture Row N+1's
-                    # position from this frame's grouping (row2 = grouped_rows[1]).
-                    _next_idx = _fire_idx + 1
-                    _next_anchor = (
-                        min(leading_edge_x(d) for d in row2) if row2 else None
-                    )
-                    if _next_anchor is not None and _next_idx < len(self._row_status):
-                        self._log_state(
-                            "anchor", (None, None), (_next_anchor, _next_idx), "fire",
-                        )
-                        self._tracked_anchor_x = _next_anchor
-                        self._tracked_anchor_idx = _next_idx
-                        logger.info(
-                            "Row-SM SWITCH: Row {} fired -> immediately switching active "
-                            "reference to Row {} (captured tangent={})",
-                            _fire_idx + 1, _next_idx + 1, int(_next_anchor),
-                        )
-                        # Same-frame display switch: show Row 2's red line immediately.
-                        self._cycle_front_row = row2
-                        self._cycle_ref_tangent_x = _next_anchor
-                    else:
-                        logger.info(
-                            "Row-SM SWITCH: Row {} fired -> Row {} not detected this "
-                            "frame; will pick up by anchor on next frame",
-                            _fire_idx + 1, _fire_idx + 2,
-                        )
-                else:
-                    # Anchor-tracked row fired: clear anchor; SM advances on next rising edge.
-                    logger.info(
-                        "Row-SM TRACK DONE: Row {} (anchor-tracked) fired, anchor cleared",
-                        _fire_idx + 1,
-                    )
-                    self._log_state(
-                        "anchor",
-                        (self._tracked_anchor_x, self._tracked_anchor_idx),
-                        (None, None),
-                        "fire",
-                    )
-                    self._tracked_anchor_x = None
-                    self._tracked_anchor_idx = None
-
-                self._sm.handle_stop_tuchabzug_trigger()
-                self._push_signals_to_opcua()
-                self._request_plc_stop_pulse()
-
+        _n_active = sum(1 for tc in tracked if tc.state == "ACTIVE")
+        _n_clearing = sum(1 for tc in tracked if tc.state == "FIRED")
         self._log_fire_trace(
-            state=_trace_state,
-            active_idx=active_idx,
-            tangent=effective_tang_x,
             transfer_x=transfer_x,
-            boundary=self._committed_boundary_x,
+            clusters_active=_n_active,
+            clusters_clearing=_n_clearing,
             pieces_total=len(all_detections),
             pieces_excluded=len(_excluded),
-            fire_eligible=(_trace_state == "ARMED" and effective_tang_x is not None),
-            fired=_fired_this_frame,
+            fired_cluster_ids=_fired_ids,
         )
 
     def _apply_belt_fault_debounce(
@@ -2034,22 +1615,6 @@ class MainWindow(QMainWindow):
             else:
                 self._row_phase = RowPhase.IDLE
                 self._line_clear_debounce_count = 0
-        if self._cfg.detection.use_row_grouping:
-            logger.info(
-                "Row-SM pulse reset: StopTuchabzug=False | "
-                "active_row={} status={} (unchanged)",
-                self._active_row_index,
-                self._row_status,
-            )
-            if "WAITING" in self._row_status:
-                logger.info(
-                    "CYCLE-INCOMPLETE rows_status={} last_state={} last_tangent={} "
-                    "reason=falling_edge_before_fire",
-                    self._row_status,
-                    self._boundary_phase,
-                    int(round(self._cycle_ref_tangent_x))
-                    if self._cycle_ref_tangent_x is not None else "none",
-                )
 
     def _on_simulate_pulse(self) -> None:
         if self._cfg.app.mode != "demo":
@@ -2528,59 +2093,6 @@ class MainWindow(QMainWindow):
         self._refresh_profile_cache()
         logger.info("transfer bridge width set to {} px (profile {})", width, profile.name)
 
-    def _on_wizard_grid_columns_changed(self, columns: int) -> None:
-        """Persist columns-per-row (app-level detection setting)."""
-        self._cfg.detection.grid_columns = max(1, columns)
-        self._save_cfg()
-        self._row_line_tracker.reset()
-        logger.info("grid columns/row set to {}", columns)
-
-    def _on_wizard_grid_rows_changed(self, rows: int) -> None:
-        """Persist number-of-rows on the cloth (app-level detection setting)."""
-        self._cfg.detection.grid_rows = max(0, rows)
-        self._save_cfg()
-        self._active_row_index = 0
-        self._row_status = ["WAITING"] * max(0, self._cfg.detection.grid_rows)
-        self._committed_boundary_x = None
-        self._boundary_phase = "ARMED"
-        self._boundary_clearing_since = None
-        self._boundary_clear_streak = 0
-        self._post_reset_pending = False
-        self._tracked_anchor_x = None
-        self._tracked_anchor_idx = None
-        logger.info("grid rows set to {}", rows)
-
-    def _on_row_grouping_changed(self, enabled: bool) -> None:
-        """Toggle the per-row-stop row-grouping mode (app-level, shared flag).
-
-        Persists config.detection.use_row_grouping and pushes it back to the
-        calibration page so the checkbox + on/off label stay in sync. Resets the
-        row tracker so the new mode starts clean on the next crossing.
-        """
-        self._cfg.detection.use_row_grouping = enabled
-        self._save_cfg()
-        self._row_line_tracker.reset()
-        self._row_group_stop_active = False
-        self._row_lines = []
-        self._row_count = 0
-        self._active_row_index = 0
-        self._row_status = ["WAITING"] * max(0, self._cfg.detection.grid_rows)
-        self._committed_boundary_x = None
-        self._boundary_phase = "ARMED"
-        self._boundary_clearing_since = None
-        self._boundary_clear_streak = 0
-        self._post_reset_pending = False
-        self._tracked_anchor_x = None
-        self._tracked_anchor_idx = None
-        self._cycle_partial_warned = False
-        self._cycle_front_row = []
-        self._cycle_row2 = []
-        self._cycle_ref_tangent_x = None
-        self._last_known_row_leading_x = None
-        self._memory_frame_count = 0
-        self._wizard_view.set_detection_settings(self._cfg.detection)
-        logger.info("cloth row grouping (per-row stop): {}", "ON" if enabled else "OFF")
-
     def _on_fill_mask_holes_changed(self, value: bool) -> None:
         self._cfg.detection.fill_mask_holes = value
         self._save_cfg()
@@ -2733,6 +2245,16 @@ class MainWindow(QMainWindow):
         install_translator(self._cfg.app.language)  # type: ignore[arg-type]
         self._show_view("inference")
         self._sm.force_reset_to_waiting()
+        # Geometry (roi_split_x/transfer_line_x) may have just changed —
+        # any in-flight tracked clusters' tangent_x is relative to the old
+        # geometry, so discard them rather than risk a stale match/fire.
+        self._cluster_tracker.reset()
+        self._last_piece_seen_time = None
+        self._batch_active = False
+        self._batch_start_time = None
+        self._batch_cluster_ids_fired = []
+        self._batch_fire_tangents = []
+        self._batch_overshoots_px = []
 
     # ---------- OPC UA ----------
 
@@ -2837,11 +2359,6 @@ class MainWindow(QMainWindow):
         self._line_clear_debounce_count = 0
         self._belt_fault_debounce_count = 0
         self._transfer_timeout_warned = False
-        self._row_line_tracker.reset()
-        self._row_group_stop_active = False
-        self._row_lines = []
-        self._row_count = 0
-        self._current_row_centroids = []
         self._detection_band = None
         self._last_hough_time = 0.0       # run immediately on first eligible frame
         self._cached_cloth_detections = []
@@ -2849,17 +2366,12 @@ class MainWindow(QMainWindow):
         self._cached_tripwire_occupied = False
         self._active_bridge_width_px = 0
         self._detection_zone_outer_x = None
-        # USE_ROW_GROUPING: _active_row_index/_row_status state machine persists
-        # across rising edges and is managed in the rising-edge handler (_on_frame).
-        # handle_tuchabzug_falling() already cleared stop_tuchabzug on the falling
-        # edge, so no manual clear is needed here.
-        self._cycle_partial_warned = False
-        self._cycle_front_row = []
-        self._cycle_row2 = []
-        self._cycle_ref_tangent_x = None
-        self._cycle_log_next_time = 0.0  # log immediately on first Hough run
-        self._last_known_row_leading_x = None  # clear per-cycle position memory
-        self._memory_frame_count = 0
+        # Cluster tracking deliberately persists across TuchabzugRunning
+        # rising/falling edges — dough pieces don't disappear just because
+        # the signal toggles. handle_tuchabzug_falling() already cleared
+        # stop_tuchabzug on the falling edge, so no manual clear is needed
+        # here. See ClusterTracker.reset()'s callers for the events that DO
+        # discontinue tracking (detection disabled, wizard completion).
         self._clear_sticky_overlay()
         logger.debug("Tracking session reset — new cycle")
 

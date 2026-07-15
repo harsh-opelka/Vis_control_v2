@@ -607,9 +607,6 @@ class WizardView(QWidget):
     # FIX 2: cloth detection method, changeable from the Calibration page —
     # same shared setting as the Service page's combo (see MainWindow wiring).
     detection_method_changed = Signal(str)
-    # Row grouping (per-row stop): emits the new on/off state; MainWindow
-    # persists it to config.detection.use_row_grouping (shared app-level flag).
-    row_grouping_changed = Signal(bool)
     # Cloth Reference (Hough gating): emits the chosen brightness threshold;
     # MainWindow._on_save_cloth_reference captures the empty-cloth mask at that
     # threshold and persists it (config.detection.hough.cloth_reference_path).
@@ -617,9 +614,6 @@ class WizardView(QWidget):
     # SECTION 4: transfer bridge width (px, profile field). MainWindow persists
     # it to the active profile's transfer_bridge_width_px.
     transfer_bridge_width_changed = Signal(int)
-    # SECTION 6: grid columns per row and number of rows (config.detection.*).
-    grid_columns_changed = Signal(int)
-    grid_rows_changed = Signal(int)
 
     STEPS = [
         "Orientation",
@@ -636,8 +630,6 @@ class WizardView(QWidget):
     _DEFAULT_EXPOSURE_US = 2000
     _DEFAULT_GAIN = 0.0
     _DEFAULT_BRIDGE_WIDTH_PX = 40   # SECTION 4
-    _DEFAULT_GRID_COLUMNS = 8       # SECTION 6
-    _DEFAULT_GRID_ROWS = 2          # default number of rows on the cloth
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -1114,39 +1106,6 @@ class WizardView(QWidget):
         method_row.addWidget(self._calib_method_combo, 0)
         method_row.addWidget(self._calib_active_method_lbl, 0)
         method_row.addStretch(1)
-
-        # Row grouping (per-row stop) — shared app-level flag
-        # (config.detection.use_row_grouping). Off = legacy single-line tripwire
-        # (unchanged); on = fire StopTuchabzug once per detected row.
-        self._calib_row_grouping_chk = QCheckBox(self.tr("Use row grouping (per-row stop)"))
-        self._calib_row_grouping_chk.toggled.connect(self._on_calib_row_grouping_changed)
-        self._calib_row_grouping_lbl = QLabel("")
-        self._calib_row_grouping_lbl.setStyleSheet(
-            f"color: {SUCCESS_GREEN}; font-size: {FONT_SMALL}pt; font-weight: 600;"
-        )
-        method_row.addWidget(self._calib_row_grouping_chk, 0)
-        method_row.addWidget(self._calib_row_grouping_lbl, 0)
-
-        # Grid structure: pieces per row (columns) and total number of rows on
-        # the cloth. Both feed the grid-aware tangent stop that identifies Row 1
-        # and fires StopTuchabzug when Row 1's trailing tangent hits the bridge.
-        cols_lbl = QLabel(self.tr("Columns per row:"))
-        cols_lbl.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: {FONT_SMALL}pt;")
-        self._grid_columns_spin = QSpinBox()
-        self._grid_columns_spin.setRange(1, 64)
-        self._grid_columns_spin.setValue(self._DEFAULT_GRID_COLUMNS)
-        self._grid_columns_spin.valueChanged.connect(self.grid_columns_changed.emit)
-        rows_lbl = QLabel(self.tr("Number of rows:"))
-        rows_lbl.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: {FONT_SMALL}pt;")
-        self._grid_rows_spin = QSpinBox()
-        self._grid_rows_spin.setRange(0, 32)
-        self._grid_rows_spin.setSpecialValueText(self.tr("?"))
-        self._grid_rows_spin.setValue(self._DEFAULT_GRID_ROWS)
-        self._grid_rows_spin.valueChanged.connect(self.grid_rows_changed.emit)
-        method_row.addWidget(cols_lbl, 0)
-        method_row.addWidget(self._grid_columns_spin, 0)
-        method_row.addWidget(rows_lbl, 0)
-        method_row.addWidget(self._grid_rows_spin, 0)
         layout.addLayout(method_row)
 
         self._det_canvas = _DetectionCanvas()
@@ -1629,21 +1588,6 @@ class WizardView(QWidget):
                 m=self._METHOD_LABELS.get(detection_cfg.method, detection_cfg.method)
             )
         )
-        # Mirror the row-grouping flag onto the checkbox + on/off label (receive
-        # path — no signal). blockSignals so this doesn't re-emit a change.
-        self._calib_row_grouping_chk.blockSignals(True)
-        self._calib_row_grouping_chk.setChecked(detection_cfg.use_row_grouping)
-        self._calib_row_grouping_chk.blockSignals(False)
-        self._calib_row_grouping_lbl.setText(
-            self.tr("Active: ON") if detection_cfg.use_row_grouping else self.tr("Active: OFF")
-        )
-        # Mirror grid columns and rows onto their spin boxes (receive path — no signal).
-        self._grid_columns_spin.blockSignals(True)
-        self._grid_columns_spin.setValue(detection_cfg.grid_columns)
-        self._grid_columns_spin.blockSignals(False)
-        self._grid_rows_spin.blockSignals(True)
-        self._grid_rows_spin.setValue(detection_cfg.grid_rows)
-        self._grid_rows_spin.blockSignals(False)
         # Seed the Cloth Reference threshold slider from the saved config so the
         # preview/save start at the persisted value (no signal — receive path).
         self._cloth_ref_thresh_slider.blockSignals(True)
@@ -1752,18 +1696,6 @@ class WizardView(QWidget):
         self.detection_method_changed.emit(method)
         if self._pending_cloth_frame is not None:
             self._run_detection_preview(self._pending_cloth_frame)
-
-    def _on_calib_row_grouping_changed(self, checked: bool) -> None:
-        """Request the row-grouping flag change (per-row stop). Mirrors the
-        method-combo pattern: update the local cfg, refresh the on/off label,
-        and let MainWindow persist + sync the shared app-level setting."""
-        self._detection_cfg = self._detection_cfg.model_copy(
-            update={"use_row_grouping": checked}
-        )
-        self._calib_row_grouping_lbl.setText(
-            self.tr("Active: ON") if checked else self.tr("Active: OFF")
-        )
-        self.row_grouping_changed.emit(checked)
 
     def set_profile_values(self, profile: ProductProfile) -> None:
         """Seed steps 2–7 with active profile values (no signals emitted)."""

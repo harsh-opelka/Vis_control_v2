@@ -52,30 +52,38 @@ class CameraViewState:
     # SECTION 3: active detection band (x_left, x_right) in image-local coords;
     # pieces outside it don't drive stops. None = not drawn.
     detection_band: tuple[int, int] | None = None
-    # SECTION 6: leading-edge centroids of the CURRENT/front row, drawn in a
-    # distinct colour so the operator sees the grouped row.
-    current_row_centroids: list[tuple[float, float]] | None = None
     # DIAGNOSTIC ONLY (two-rows-at-once investigation): column-sum dough profile
     # along the travel direction. row_profile_x_offset/scale map a profile
     # index back to image-local x: img_x = row_profile_x_offset + i / scale.
     row_profile: np.ndarray | None = None
     row_profile_x_offset: int = 0
     row_profile_scale: float = 1.0
-    # Row grouping (USE_ROW_GROUPING). row_lines = travel-direction (x) positions
-    # of each detected row's row-line, in image-local coords; drawn as vertical
-    # lines and labelled with row_count ("Rows: N"). None when the toggle is off.
-    row_lines: list[float] | None = None
-    row_count: int | None = None
     # Detection zone outer boundary (approach side), cloth-local x. Drawn as a
     # distinct orange dashed line with "det.zone" label. None = not drawn.
     detection_zone_outer_x: int | None = None
-    # Grid-aware stop visualization (USE_ROW_GROUPING=ON):
-    #   grid_row_assignments — detection index → row number (1=front, 2=second, 0=other)
-    #   grid_ref_tangent_x   — cloth-local x of the stop reference (trailing Row-1 tangent)
-    #   grid_label           — informational text: "Row 1: N | Ref: Xpx"
-    grid_row_assignments: dict[int, int] | None = None
-    grid_ref_tangent_x: float | None = None
-    grid_label: str | None = None
+    # Cluster-based stop visualization: live count of tracked clusters by
+    # state, e.g. "Clusters: 2 active, 1 clearing". None = not drawn. See
+    # MainWindow._apply_cluster_stop_edge / ClusterTracker.
+    cluster_state_label: str | None = None
+    # DIAGNOSTIC/VISUALIZATION ONLY (tangent-based proximity clustering, see
+    # viscontrol/detection/proximity_clustering.py). One entry per cluster:
+    # (front_tangent_x, [(tangent_x, center_y, radius), ...]) in image-local
+    # coords. None/empty = not drawn. An additional overlay layer only —
+    # never affects existing detection/debug overlays or any firing logic.
+    proximity_clusters: list[tuple[float, list[tuple[float, float, float]]]] | None = None
+
+
+# DIAGNOSTIC/VISUALIZATION ONLY: fixed color cycle for the proximity-cluster
+# overlay (see CameraViewState.proximity_clusters). Wraps when there are more
+# clusters than colors.
+_PROXIMITY_CLUSTER_PALETTE = [
+    QColor(255, 60, 60),    # red
+    QColor(60, 220, 100),   # green
+    QColor(80, 140, 255),   # blue
+    QColor(255, 220, 0),    # yellow
+    QColor(255, 60, 220),   # magenta
+    QColor(0, 220, 220),    # cyan
+]
 
 
 class _Canvas(QWidget):
@@ -212,39 +220,19 @@ class _Canvas(QWidget):
             x_px = int(dx + state.transfer_line_local_x * sx)
             p.drawLine(x_px, dy, x_px, dy + pixmap.height())
 
-        # Detections — row_num drives grid row coloring (1=magenta, 2=cyan, 0=default).
-        _row_asgn = state.grid_row_assignments or {}
-        for i, det in enumerate(state.detections or []):
-            self._draw_detection(p, det, dx, dy, sx, sy, state.px_per_mm,
-                                 row_num=_row_asgn.get(i, 0))
+        # Detections.
+        for det in state.detections or []:
+            self._draw_detection(p, det, dx, dy, sx, sy, state.px_per_mm)
 
-        # Grid stop reference tangent: red full-height line at the Row-1 trailing
-        # piece's left tangent — the piece whose crossing fires StopTuchabzug.
-        if state.grid_ref_tangent_x is not None:
-            ref_x = int(dx + state.grid_ref_tangent_x * sx)
-            ref_pen = QPen(QColor(255, 60, 60))
-            ref_pen.setWidth(3)
-            ref_pen.setStyle(Qt.PenStyle.SolidLine)
-            p.setPen(ref_pen)
-            p.drawLine(ref_x, dy - 6, ref_x, dy + pixmap.height() + 6)
-
-        # FIX 1: row count badge — "Rows: N" text only (no row-lines drawn).
-        if state.row_count is not None:
+        # Cluster-state badge: "Clusters: N active, M clearing" — replaces
+        # the old grid/row "Active Row: N/M" display.
+        if state.cluster_state_label:
             font = QFont()
             font.setPointSize(max(8, FONT_NORMAL))
             font.setBold(True)
             p.setFont(font)
             p.setPen(QColor("#00E5A0"))
-            p.drawText(dx + 8, dy + 20, f"Rows: {state.row_count}")
-
-        # Grid label: "Row 1: N | Ref: Xpx" — drawn in yellow-gold at top-left.
-        if state.grid_label:
-            font = QFont()
-            font.setPointSize(FONT_SMALL)
-            font.setBold(True)
-            p.setFont(font)
-            p.setPen(QColor(255, 220, 0))
-            p.drawText(dx + 8, dy + 40, state.grid_label)
+            p.drawText(dx + 8, dy + 20, state.cluster_state_label)
 
         # Front-row highlights (cloth tracking).
         for cx, cy in state.highlight_centroids or []:
@@ -260,6 +248,15 @@ class _Canvas(QWidget):
         # the tripwire. Delete this block to remove the overlay entirely.
         if state.row_profile is not None and state.row_profile.size > 1:
             self._draw_row_profile(p, state, dx, dy, sx, pixmap)
+        # --- END DIAGNOSTIC ---
+
+        # --- DIAGNOSTIC/VISUALIZATION ONLY: tangent-based proximity
+        # clusters (see viscontrol/detection/proximity_clustering.py).
+        # Additional overlay layer, drawn after all existing detection/debug
+        # overlays so it never hides or interferes with them — piece circles
+        # are outlined only (no fill).
+        if state.proximity_clusters:
+            self._draw_proximity_clusters(p, state.proximity_clusters, dx, dy, sx, sy, pixmap)
         # --- END DIAGNOSTIC ---
 
         # Debug mask thumbnail: bottom-right corner of the image area.
@@ -443,43 +440,6 @@ class _Canvas(QWidget):
         p.drawEllipse(QPointF(x, y), 10, 10)
 
     @staticmethod
-    def _draw_row_lines(
-        p: QPainter,
-        state: "CameraViewState",
-        dx: int,
-        dy: int,
-        sx: float,
-        w: int,
-        pixmap: "QPixmap",
-    ) -> None:
-        """Row grouping overlay: a solid vertical line at each row's row-line
-        (the transfer line is vertical, so rows run perpendicular to travel and
-        their row-lines are vertical too), plus a "Rows: N" count badge.
-
-        Display only — driven by CameraViewState.row_lines / row_count, which
-        MainWindow populates from RowLineTracker. Does not affect detection,
-        the tripwire, or firing.
-        """
-        line_color = QColor("#00E5A0")  # distinct teal, separate from transfer line
-        pen = QPen(line_color)
-        pen.setWidth(2)
-        pen.setStyle(Qt.PenStyle.SolidLine)
-        p.setPen(pen)
-        for rx in state.row_lines or []:
-            if not (0 <= rx < w):
-                continue
-            x_px = int(dx + rx * sx)
-            p.drawLine(x_px, dy, x_px, dy + pixmap.height())
-
-        count = state.row_count if state.row_count is not None else len(state.row_lines or [])
-        font = QFont()
-        font.setPointSize(max(8, FONT_NORMAL))
-        font.setBold(True)
-        p.setFont(font)
-        p.setPen(line_color)
-        p.drawText(dx + 8, dy + 20, f"Rows: {count}")
-
-    @staticmethod
     def _draw_row_profile(
         p: QPainter,
         state: "CameraViewState",
@@ -517,6 +477,43 @@ class _Canvas(QWidget):
         font.setPointSize(max(6, FONT_SMALL - 2))
         p.setFont(font)
         p.drawText(dx + 4, top_y + 12, "row profile (DIAG)")
+
+    @staticmethod
+    def _draw_proximity_clusters(
+        p: QPainter,
+        clusters: list[tuple[float, list[tuple[float, float, float]]]],
+        dx: int,
+        dy: int,
+        sx: float,
+        sy: float,
+        pixmap: "QPixmap",
+    ) -> None:
+        """DIAGNOSTIC/VISUALIZATION ONLY: tangent-based proximity clusters
+        (two-rows-at-once / grid-free investigation, see
+        viscontrol/detection/proximity_clustering.py). Each cluster gets a
+        distinct color (cycling through _PROXIMITY_CLUSTER_PALETTE): its
+        pieces' circle outlines are drawn in that color, plus a full-height
+        marker line at the cluster's front tangent_x (its leading piece).
+        Read-only — does not affect detection, the tripwire, or firing."""
+        for i, (front_tangent_x, pieces) in enumerate(clusters):
+            color = _PROXIMITY_CLUSTER_PALETTE[i % len(_PROXIMITY_CLUSTER_PALETTE)]
+
+            pen = QPen(color)
+            pen.setWidth(2)
+            p.setPen(pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            for tangent_x, cy, radius in pieces:
+                cx = tangent_x + radius
+                x = dx + cx * sx
+                y = dy + cy * sy
+                r = radius * max(sx, sy)
+                p.drawEllipse(QPointF(x, y), r, r)
+
+            marker_pen = QPen(color)
+            marker_pen.setWidth(3)
+            p.setPen(marker_pen)
+            fx = dx + front_tangent_x * sx
+            p.drawLine(QPointF(fx, dy), QPointF(fx, dy + pixmap.height()))
 
 
 class CameraView(QFrame):

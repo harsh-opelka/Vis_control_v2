@@ -290,29 +290,6 @@ class _DetectionSection(BaseModel):
     """
 
     method: DetectionMethod = "blob"
-    use_row_grouping: bool = Field(
-        False,
-        description=(
-            "Cloth side only. False (default) = legacy single-line tripwire "
-            "(MainWindow._apply_tripwire_edge), behaviour unchanged. True = "
-            "group detected pieces into rows by travel position and fire "
-            "StopTuchabzug once per row as each row-line crosses the transfer "
-            "line, so two back-to-back rows with no gap stop twice. See "
-            "viscontrol/detection/row_grouping.py."
-        ),
-    )
-    row_grouping_gap_diameters: float = Field(
-        0.6,
-        gt=0,
-        description=(
-            "USE_ROW_GROUPING only. Row split tolerance as a multiple of the "
-            "median DETECTED piece diameter: pieces whose travel coordinates "
-            "differ by less than (this × diameter) are the same row; a larger "
-            "gap starts the next row. Scales with dough size. Lower = split more "
-            "readily (more rows); higher = merge more (fewer rows). Typical "
-            "0.5-1.0."
-        ),
-    )
     fill_mask_holes: bool = Field(
         False,
         description=(
@@ -322,26 +299,6 @@ class _DetectionSection(BaseModel):
         ),
     )
     fill_mask_holes_kernel: int = Field(9, ge=1)
-    grid_columns: int = Field(
-        8, ge=1,
-        description=(
-            "SECTION 6: number of dough pieces per row in the loaded grid. "
-            "USE_ROW_GROUPING uses this to identify the FRONT/CURRENT row as "
-            "the N pieces closest to the transfer bridge (by leading edge) and "
-            "to fire one StopTuchabzug per row. Settable in the wizard."
-        ),
-    )
-    row_gap_threshold_px: int = Field(
-        150, ge=1,
-        description=(
-            "USE_ROW_GROUPING only. Pieces are sorted by leading-edge X and "
-            "split into clusters wherever the gap to the next piece exceeds "
-            "this many pixels — each cluster is one physical row, regardless "
-            "of missing/extra detections. Replaces the old fixed-size "
-            "sort-slice-by-grid_columns grouping. See "
-            "viscontrol/detection/row_grouping.py: group_by_gap."
-        ),
-    )
     detection_zone_width_px: int = Field(
         600, ge=0,
         description=(
@@ -354,80 +311,45 @@ class _DetectionSection(BaseModel):
             "Default 600 px ≈ 2× typical dough diameter."
         ),
     )
-    grid_rows: int = Field(
-        0, ge=0,
-        description=(
-            "SECTION 6: expected number of rows on the cloth (0 = unknown / "
-            "unbounded). Informational; row firing is driven per-row as each "
-            "row reaches the bridge, not by this count."
-        ),
-    )
     max_memory_frames: int = Field(
         5, ge=0,
         description=(
-            "USE_ROW_GROUPING only. Number of frames to hold the last known "
-            "front-row leading-edge position when detection drops or returns "
-            "fewer pieces than expected (frame drop fallback). 0 = disabled. "
-            "See MainWindow._apply_tangent_stop_edge."
-        ),
-    )
-    row_x_tolerance_px: int = Field(
-        0, ge=0,
-        description=(
-            "USE_ROW_GROUPING only. Tolerance in pixels for grouping staggered "
-            "pieces into the same row by leading-edge X. 0 = auto (1× detected "
-            "piece diameter). Pieces whose leading_edge_x differs from the "
-            "previous piece by at most this value belong to the same row. Set "
-            "to ~1 piece diameter to absorb stagger within a row while still "
-            "splitting clearly separated rows. Used identically by the stop "
-            "decision and the display coloring (single source of truth)."
-        ),
-    )
-    boundary_safety_margin_px: int = Field(
-        80, ge=0,
-        description=(
-            "USE_ROW_GROUPING only. Minimum distance (px) that committed_boundary_x "
-            "must stay BEHIND transfer_x. When a row fires, the boundary is set to "
-            "min(fired_tangent_x, transfer_x - boundary_safety_margin_px). This "
-            "prevents the boundary from overlapping the fire zone of the next row "
-            "when the previous row fired very close to the transfer line. "
-            "~half a dough diameter (default 80px) ensures the next row's pieces "
-            "are never excluded at the instant they would otherwise satisfy the "
-            "tangent <= transfer_x fire condition. 0 = no safety cap."
+            "Number of frames an ACTIVE tracked cluster may go unmatched "
+            "(e.g. a dropped Hough frame) before it's dropped from tracking. "
+            "0 = disabled (drop immediately on any miss). See "
+            "viscontrol/detection/proximity_clustering.py: ClusterTracker."
         ),
     )
     boundary_offset_px: int = Field(
         25, ge=0,
         description=(
-            "USE_ROW_GROUPING only. Added to the fired tangent when setting "
+            "Added to a cluster's fired tangent when setting its "
             "committed_boundary_x: boundary = fired_tangent_x + boundary_offset_px. "
-            "0 = boundary sits exactly at the fired tangent. Default 25px (was "
-            "12px, originally 30px) balances a narrow dead zone above transfer_x "
-            "against grouping/outlier logic that now also guards against stragglers."
+            "0 = boundary sits exactly at the fired tangent. Pieces at/behind "
+            "this boundary are excluded from clustering while the cluster is "
+            "still CLEARING, so its own trailing pieces aren't mistaken for a "
+            "new arrival."
         ),
     )
     clearing_timeout_ms: int = Field(
         400, ge=0,
         description=(
-            "USE_ROW_GROUPING only. Safety timeout for the post-fire CLEARING -> "
-            "ARMED transition: if the leftovers-cleared streak hasn't been "
-            "satisfied within this many milliseconds of the next rising edge, "
-            "ARMED is forced anyway so the boundary filter can't block a "
-            "legitimate fire indefinitely. Default 400ms (was a hardcoded 1.5s)."
+            "Per-cluster safety timeout for the FIRED -> cleared transition: "
+            "if the leftovers-cleared streak hasn't been satisfied within "
+            "this many milliseconds of firing, the cluster is cleared anyway "
+            "so the boundary filter can't block new arrivals indefinitely."
         ),
     )
-    post_reset_fresh_margin_px: int = Field(
-        200, ge=0,
+    cycle_idle_reset_ms: int = Field(
+        3000, ge=1,
         description=(
-            "USE_ROW_GROUPING only. After a FULL RESET (all rows complete, "
-            "active_row_index back to 0), the first fire of the new cycle is "
-            "gated: the active row's tangent must be seen ABOVE "
-            "(transfer_x + this margin) at least once before it can fire. "
-            "This prevents leftover/straggler pieces from the just-completed "
-            "cycle from instant-firing as the new Row 1. Does NOT apply after "
-            "a mid-cycle ADVANCE — Row 2+ can fire immediately. "
-            "~1–2 dough diameters (default 200px) is recommended. "
-            "0 = disabled (no post-reset gate)."
+            "Logging/observability only — does not gate firing. When zero "
+            "pieces have been detected for this many milliseconds AND no "
+            "tracked cluster is ACTIVE or still clearing, the current batch "
+            "is considered finished: a CYCLE-SUMMARY line is logged (clusters "
+            "fired this batch, their overshoot values, timing) and the "
+            "batch-scoped counters reset. Clustering/firing itself keeps "
+            "running continuously regardless of this boundary."
         ),
     )
     contour_external: _ContourExternalSection = Field(default_factory=_ContourExternalSection)
@@ -442,10 +364,9 @@ class _ColumnLearningSection(BaseModel):
     learning. See viscontrol/detection/column_learning.py (ColumnLearner).
 
     Purely observational groundwork for a possible future column-based
-    tracking mode — never read by fire_eligible, active_row, tangent
-    selection, or any StopTuchabzug decision. Layer 1 (group_by_gap) and
-    Layer 2 (sticky anchor tracking) are unaffected regardless of this
-    section's values.
+    tracking mode — never read by the cluster-based fire decision (see
+    viscontrol/detection/proximity_clustering.py: ClusterTracker) or any
+    state-machine decision.
     """
 
     enabled: bool = Field(
@@ -466,6 +387,48 @@ class _ColumnLearningSection(BaseModel):
             "How often (in frames fed to ColumnLearner.update) column_y_bands "
             "are recomputed from the current window, rather than every frame, "
             "so bands stay stable rather than jittery."
+        ),
+    )
+    expected_columns: int = Field(
+        8, ge=1,
+        description=(
+            "Number of Y-bands ColumnLearner splits its rolling window into. "
+            "Decoupled from the retired detection.grid_columns (a different, "
+            "row-firing-only field) — this is ColumnLearner's own knob."
+        ),
+    )
+
+
+class _ProximityClusteringSection(BaseModel):
+    """Tangent-based proximity clustering: cluster_by_tangent (see
+    viscontrol/detection/proximity_clustering.py) groups detected pieces by
+    proximity along tangent_x only (X axis), with no fixed expected count
+    and no outlier rejection — this is the grid-free replacement for the
+    old fixed-grid/row model.
+
+    ``tolerance_px`` is now load-bearing for the actual StopTuchabzug fire
+    decision (MainWindow._apply_cluster_stop_edge / ClusterTracker), not
+    just the diagnostic overlay. ``enabled`` still only gates the
+    PROXIMITY-CLUSTER diagnostic log line and overlay — firing itself runs
+    unconditionally regardless of this flag.
+    """
+
+    enabled: bool = Field(
+        True,
+        description=(
+            "Master on/off for PROXIMITY-CLUSTER logging and the cluster "
+            "overlay only. When False, no diagnostic log/overlay is "
+            "produced, but tolerance_px still governs live firing."
+        ),
+    )
+    tolerance_px: int = Field(
+        150, ge=1,
+        description=(
+            "Gap threshold along tangent_x: a new cluster starts whenever "
+            "the tangent_x gap between two sorted pieces exceeds this many "
+            "pixels. Also used as the cross-frame cluster-matching tolerance "
+            "in ClusterTracker. Live-adjustable from Service > Diagnostics — "
+            "takes effect on the next frame, no restart needed."
         ),
     )
 
@@ -523,6 +486,7 @@ class AppConfig(BaseModel):
     inspection: _InspectionSection = Field(default_factory=_InspectionSection)
     detection: _DetectionSection = Field(default_factory=_DetectionSection)
     column_learning: _ColumnLearningSection = Field(default_factory=_ColumnLearningSection)
+    proximity_clustering: _ProximityClusteringSection = Field(default_factory=_ProximityClusteringSection)
     profiles: list[ProductProfile] = Field(default_factory=list)
     opcua: _OpcuaSection = Field(default_factory=_OpcuaSection)
     web: _WebSection = Field(default_factory=_WebSection)

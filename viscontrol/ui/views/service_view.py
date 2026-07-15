@@ -88,6 +88,11 @@ class ServiceView(QWidget):
     show_belt_mask_changed = Signal(bool)
     show_cloth_mask_changed = Signal(bool)
     belt_detection_enabled_changed = Signal(bool)
+    # DIAGNOSTIC/VISUALIZATION ONLY (tangent-based proximity clustering, see
+    # viscontrol/detection/proximity_clustering.py). Never affects
+    # StopTuchabzug firing, the row state machine, or active_row tracking.
+    proximity_clustering_enabled_changed = Signal(bool)
+    proximity_clustering_tolerance_changed = Signal(int)
     # Cloth-side alternative detection methods (A/B comparison). See
     # core/config.py _DetectionSection and detection/pipeline.py run_cloth_tracking.
     detection_method_changed = Signal(str)   # "blob" | "contour_external" | "hough" | "bg_subtract"
@@ -487,6 +492,36 @@ class ServiceView(QWidget):
         )
         self._cloth_mask_check.toggled.connect(self.show_cloth_mask_changed.emit)
         form.addRow("", self._cloth_mask_check)
+
+        self._proximity_cluster_check = QCheckBox(self.tr("Proximity clustering overlay"))
+        self._proximity_cluster_check.setToolTip(
+            self.tr(
+                "Diagnostic/visualization only — groups detected pieces by "
+                "proximity along tangent_x (X axis, no fixed row count) and "
+                "draws each cluster in a distinct color on the cloth view. "
+                "Never affects StopTuchabzug firing, the row state machine, "
+                "or active_row tracking."
+            )
+        )
+        self._proximity_cluster_check.toggled.connect(
+            self.proximity_clustering_enabled_changed.emit
+        )
+        form.addRow("", self._proximity_cluster_check)
+
+        self._proximity_tolerance_spin = QSpinBox()
+        self._proximity_tolerance_spin.setRange(20, 400)
+        self._proximity_tolerance_spin.setSuffix(" px")
+        self._proximity_tolerance_spin.setToolTip(
+            self.tr(
+                "Gap threshold along tangent_x: a new cluster starts once "
+                "the tangent_x gap to the next piece exceeds this many "
+                "pixels. Takes effect on the next frame — no restart needed."
+            )
+        )
+        self._proximity_tolerance_spin.valueChanged.connect(
+            self.proximity_clustering_tolerance_changed.emit
+        )
+        form.addRow(self.tr("Cluster tolerance"), self._proximity_tolerance_spin)
         return card
 
     def _build_frame_source_section(self) -> QWidget:
@@ -682,6 +717,12 @@ class ServiceView(QWidget):
         self._belt_detection_check.blockSignals(True)
         self._belt_detection_check.setChecked(cfg.inspection.belt_detection_enabled)
         self._belt_detection_check.blockSignals(False)
+        self._proximity_cluster_check.blockSignals(True)
+        self._proximity_cluster_check.setChecked(cfg.proximity_clustering.enabled)
+        self._proximity_cluster_check.blockSignals(False)
+        self._proximity_tolerance_spin.blockSignals(True)
+        self._proximity_tolerance_spin.setValue(cfg.proximity_clustering.tolerance_px)
+        self._proximity_tolerance_spin.blockSignals(False)
         self._bg_reference_status.setText(
             self.tr("Reference captured.") if cfg.detection.bg_subtract.reference_path
             else self.tr("No reference captured yet.")
