@@ -91,8 +91,8 @@ profiles:
 # the default "blob" behavior without removing it.
 detection:
   method: "blob"            # blob | contour_external | hough | bg_subtract
-  cycle_idle_reset_ms: 3000  # logging-only: no pieces detected for this long + no tracked
-                             # clusters -> log a CYCLE-SUMMARY and reset batch counters
+  cycle_idle_reset_ms: 3000  # logging-only: no pieces detected for this long -> log a
+                             # CYCLE-SUMMARY and reset batch counters + DONE-cluster state
   detection_zone_width_px: 600  # pixels of approach-side cloth beyond the bridge where Hough runs;
                                 # 0 = full ROI (no restriction). Outer edge drawn on cloth view.
   fill_mask_holes: false     # blob-only: pre-fill enclosed mask holes before extraction

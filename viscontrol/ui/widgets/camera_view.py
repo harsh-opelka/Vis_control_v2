@@ -62,7 +62,7 @@ class CameraViewState:
     # distinct orange dashed line with "det.zone" label. None = not drawn.
     detection_zone_outer_x: int | None = None
     # Cluster-based stop visualization: live count of tracked clusters by
-    # state, e.g. "Clusters: 2 active, 1 clearing". None = not drawn. See
+    # state, e.g. "Clusters: 2 pending, 1 done". None = not drawn. See
     # MainWindow._apply_cluster_stop_edge / ClusterTracker.
     cluster_state_label: str | None = None
     # DIAGNOSTIC/VISUALIZATION ONLY (tangent-based proximity clustering, see
@@ -224,7 +224,7 @@ class _Canvas(QWidget):
         for det in state.detections or []:
             self._draw_detection(p, det, dx, dy, sx, sy, state.px_per_mm)
 
-        # Cluster-state badge: "Clusters: N active, M clearing" — replaces
+        # Cluster-state badge: "Clusters: N pending, M done" — replaces
         # the old grid/row "Active Row: N/M" display.
         if state.cluster_state_label:
             font = QFont()

@@ -314,41 +314,22 @@ class _DetectionSection(BaseModel):
     max_memory_frames: int = Field(
         5, ge=0,
         description=(
-            "Number of frames an ACTIVE tracked cluster may go unmatched "
+            "Number of frames a PENDING tracked cluster may go unmatched "
             "(e.g. a dropped Hough frame) before it's dropped from tracking. "
             "0 = disabled (drop immediately on any miss). See "
             "viscontrol/detection/proximity_clustering.py: ClusterTracker."
-        ),
-    )
-    boundary_offset_px: int = Field(
-        25, ge=0,
-        description=(
-            "Added to a cluster's fired tangent when setting its "
-            "committed_boundary_x: boundary = fired_tangent_x + boundary_offset_px. "
-            "0 = boundary sits exactly at the fired tangent. Pieces at/behind "
-            "this boundary are excluded from clustering while the cluster is "
-            "still CLEARING, so its own trailing pieces aren't mistaken for a "
-            "new arrival."
-        ),
-    )
-    clearing_timeout_ms: int = Field(
-        400, ge=0,
-        description=(
-            "Per-cluster safety timeout for the FIRED -> cleared transition: "
-            "if the leftovers-cleared streak hasn't been satisfied within "
-            "this many milliseconds of firing, the cluster is cleared anyway "
-            "so the boundary filter can't block new arrivals indefinitely."
         ),
     )
     cycle_idle_reset_ms: int = Field(
         3000, ge=1,
         description=(
             "Logging/observability only — does not gate firing. When zero "
-            "pieces have been detected for this many milliseconds AND no "
-            "tracked cluster is ACTIVE or still clearing, the current batch "
-            "is considered finished: a CYCLE-SUMMARY line is logged (clusters "
-            "fired this batch, their overshoot values, timing) and the "
-            "batch-scoped counters reset. Clustering/firing itself keeps "
+            "pieces have been detected for this many milliseconds, the "
+            "current batch is considered finished: a CYCLE-SUMMARY line is "
+            "logged (clusters fired this batch, their overshoot values, "
+            "timing), then the batch-scoped counters, the DONE-cluster set, "
+            "and the excluded-piece-identity set (DonePieceTracker) all "
+            "reset for the next batch. Clustering/firing itself keeps "
             "running continuously regardless of this boundary."
         ),
     )

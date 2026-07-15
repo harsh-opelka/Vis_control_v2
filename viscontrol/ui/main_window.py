@@ -46,6 +46,7 @@ from viscontrol.detection.column_learning import ColumnLearner
 from viscontrol.detection.pipeline import InspectionPipeline
 from viscontrol.detection.proximity_clustering import (
     ClusterTracker,
+    DonePieceTracker,
     cluster_by_tangent,
     pieces_from_detections,
 )
@@ -210,11 +211,15 @@ class MainWindow(QMainWindow):
         # display; None when zone disabled or detection hasn't run yet.
         self._detection_zone_outer_x: int | None = None
         # Cluster-based firing (replaces the old grid/row state machine
-        # entirely). ClusterTracker owns per-cluster ACTIVE/FIRED lifecycle —
-        # see viscontrol/detection/proximity_clustering.py. Continuous by
+        # entirely). ClusterTracker owns per-cluster PENDING/DONE lifecycle
+        # (DONE is permanent — no clearing/timeout); DonePieceTracker
+        # permanently excludes a DONE cluster's pieces, by identity, from
+        # ever rejoining clustering. See
+        # viscontrol/detection/proximity_clustering.py. Continuous by
         # design: never reset on TuchabzugRunning edges (only on genuinely
-        # discontinuous events — see _disable_detection).
+        # discontinuous events — see _disable_detection — or cycle end).
         self._cluster_tracker = ClusterTracker()
+        self._done_piece_tracker = DonePieceTracker()
         # Idle/batch bookkeeping for the logging-only CYCLE-SUMMARY boundary
         # (detection.cycle_idle_reset_ms) — does not gate firing.
         self._last_piece_seen_time: float | None = None
@@ -576,6 +581,7 @@ class MainWindow(QMainWindow):
         self._active_bridge_width_px = 0
         self._detection_zone_outer_x = None
         self._cluster_tracker.reset()
+        self._done_piece_tracker.reset()
         self._last_piece_seen_time = None
         self._batch_active = False
         self._batch_start_time = None
@@ -1031,9 +1037,9 @@ class MainWindow(QMainWindow):
             )
             # Cluster-state label: live count of tracked clusters by state,
             # replacing the old grid/row "Active Row: N/M" display.
-            _n_active = sum(1 for tc in self._cluster_tracker.tracked if tc.state == "ACTIVE")
-            _n_clearing = sum(1 for tc in self._cluster_tracker.tracked if tc.state == "FIRED")
-            _cluster_state_label = f"Clusters: {_n_active} active, {_n_clearing} clearing"
+            _n_pending = sum(1 for tc in self._cluster_tracker.tracked if tc.state == "PENDING")
+            _n_done = sum(1 for tc in self._cluster_tracker.tracked if tc.state == "DONE")
+            _cluster_state_label = f"Clusters: {_n_pending} pending, {_n_done} done"
 
             self._inference_view.set_cloth_frame(
                 cloth,
@@ -1320,20 +1326,20 @@ class MainWindow(QMainWindow):
         self,
         *,
         transfer_x: float,
-        clusters_active: int,
-        clusters_clearing: int,
+        clusters_pending: int,
+        clusters_done: int,
         pieces_total: int,
         pieces_excluded: int,
         fired_cluster_ids: list[int],
     ) -> None:
         """One line per processed frame summarizing the cluster fire decision."""
         logger.info(
-            "FIRE-TRACE frame_id={} transfer_x={} clusters_active={} "
-            "clusters_clearing={} pieces_total={} pieces_excluded={} fired={}",
+            "FIRE-TRACE frame_id={} transfer_x={} clusters_pending={} "
+            "clusters_done={} pieces_total={} pieces_excluded={} fired={}",
             self._frame_count,
             int(round(transfer_x)),
-            clusters_active,
-            clusters_clearing,
+            clusters_pending,
+            clusters_done,
             pieces_total,
             pieces_excluded,
             fired_cluster_ids,
@@ -1342,16 +1348,16 @@ class MainWindow(QMainWindow):
     def _apply_cluster_stop_edge(self, r: object, profile: "ProductProfile") -> None:
         """Grid-free firing path — the sole StopTuchabzug fire-decision owner.
 
-        Replaces the old grid/row state machine (Layer 1 gap-cluster
-        grouping, Layer 2 sticky anchor tracking, active_row_index,
-        row_status) entirely. Each frame: evaluate per-cluster
-        FIRED -> cleared lifecycle, filter out pieces behind a still-firing
-        cluster's boundary, cluster the remaining pieces by tangent_x, match
-        against tracked clusters by identity, and fire independently for
-        every ACTIVE cluster whose front (minimum) tangent_x has reached
-        transfer_x. No row count, no grid, no "switch to next row" —
-        clusters are detected and fired continuously as they arrive. See
-        viscontrol/detection/proximity_clustering.py: ClusterTracker.
+        Each frame: permanently exclude pieces that belong to an already-
+        DONE cluster (by piece identity, see DonePieceTracker), cluster the
+        remaining pieces by tangent_x, match against tracked clusters by
+        identity, then pick the single "active target" — the PENDING
+        cluster with the smallest front (minimum) tangent_x — and check
+        ONLY that one cluster against transfer_x. Firing is permanent: a
+        fired cluster is marked DONE immediately and never re-checked or
+        re-clustered for the rest of the cycle, so one physical row fires
+        exactly once. See viscontrol/detection/proximity_clustering.py:
+        ClusterTracker, DonePieceTracker.
         """
         transfer_x = float(profile.transfer_line_x - profile.roi_split_x)
         all_detections = r.detections  # type: ignore[attr-defined]
@@ -1368,67 +1374,60 @@ class MainWindow(QMainWindow):
                 self._batch_active = True
                 self._batch_start_time = now
 
-        # Per-cluster FIRED -> cleared evaluation: a straight port of the old
-        # global ARMED/CLEARING boundary logic, now scoped to one cluster at
-        # a time (see ClusterTracker.evaluate_clearing).
-        _all_tangent_xs = [leading_edge_x(d) for d in all_detections]
-        _clearing_timeout_s = self._cfg.detection.clearing_timeout_ms / 1000.0
-        for _tc in self._cluster_tracker.evaluate_clearing(_all_tangent_xs, _clearing_timeout_s):
-            self._log_state(f"cluster[{_tc.id}]", "FIRED", "CLEARED", "leftovers_cleared_or_timeout")
-            logger.info(
-                "Post-fire state: CLEARED cluster={} (boundary={})",
-                _tc.id,
-                int(round(_tc.committed_boundary_x)) if _tc.committed_boundary_x is not None else "none",
-            )
-
-        # Boundary filter: exclude pieces behind any still-FIRED cluster's
-        # committed boundary, so a just-fired cluster's own trailing pieces
-        # aren't mistaken for a new arrival.
-        _clearing_boundaries = [
-            tc.committed_boundary_x for tc in self._cluster_tracker.tracked
-            if tc.state == "FIRED" and tc.committed_boundary_x is not None
-        ]
-        _bnd_x = max(_clearing_boundaries) if _clearing_boundaries else None
-        _eligible = [d for d in all_detections if _bnd_x is None or leading_edge_x(d) > _bnd_x]
-        _excluded = [d for d in all_detections if _bnd_x is not None and leading_edge_x(d) <= _bnd_x]
+        # Permanent, identity-based exclusion: pieces that belonged to a
+        # cluster that already fired (DONE) never rejoin clustering, no
+        # matter how they drift or whether detection briefly loses and
+        # re-acquires them near the same spot.
+        tolerance_px = self._cfg.proximity_clustering.tolerance_px
+        _all_pieces = pieces_from_detections(all_detections)
+        _eligible_pieces = self._done_piece_tracker.filter_out_done(_all_pieces, tolerance_px)
+        _excluded_count = len(_all_pieces) - len(_eligible_pieces)
         logger.info(
-            "Boundary filter: {} pieces detected, {} excluded (X<=boundary {}), "
-            "{} eligible for clustering",
-            len(all_detections),
-            len(_excluded),
-            int(round(_bnd_x)) if _bnd_x is not None else "none",
-            len(_eligible),
+            "Done-piece filter: {} pieces detected, {} excluded (belong to a "
+            "DONE cluster), {} eligible for clustering",
+            len(_all_pieces), _excluded_count, len(_eligible_pieces),
         )
 
         # Cluster the eligible pieces and match against tracked clusters by
         # identity (front_tangent_x proximity, within tolerance_px).
-        tolerance_px = self._cfg.proximity_clustering.tolerance_px
-        current_clusters = cluster_by_tangent(pieces_from_detections(_eligible), tolerance_px)
+        current_clusters = cluster_by_tangent(_eligible_pieces, tolerance_px)
         tracked = self._cluster_tracker.update(
             current_clusters, tolerance_px, self._cfg.detection.max_memory_frames,
         )
 
-        # Fire: every ACTIVE cluster whose front tangent_x has reached
-        # transfer_x fires independently — no expected-count check.
+        # Active target: the single PENDING cluster closest to the transfer
+        # line. Only this one is ever checked against transfer_x this
+        # frame — every other cluster (further-back PENDING, or already
+        # DONE) is ignored for the fire decision.
+        target = self._cluster_tracker.get_active_target()
+        logger.debug(
+            "ACTIVE-TARGET: cluster={} front_tangent={}",
+            target.id if target is not None else "none",
+            int(round(target.front_tangent_x)) if target is not None else "none",
+        )
+
         _fired_ids: list[int] = []
-        for tc in tracked:
-            if tc.state != "ACTIVE" or tc.front_tangent_x > transfer_x:
-                continue
-            _fired_tangent_x = tc.front_tangent_x
-            _piece_count = len(tc.pieces)
-            _fired_ids.append(tc.id)
-            self._cluster_tracker.mark_fired(
-                tc.id, _fired_tangent_x, self._cfg.detection.boundary_offset_px,
-            )
-            self._log_state(f"cluster[{tc.id}]", "ACTIVE", "FIRED", "fire")
+        if target is not None and target.front_tangent_x <= transfer_x:
+            _fired_tangent_x = target.front_tangent_x
+            _piece_count = len(target.pieces)
+            _fired_ids.append(target.id)
+            self._cluster_tracker.mark_done(target.id, _fired_tangent_x)
+            self._done_piece_tracker.mark_done(target.pieces)
+            self._log_state(f"cluster[{target.id}]", "PENDING", "DONE", "fire")
             _overshoot_px = transfer_x - _fired_tangent_x
             logger.info(
                 "FIRE OVERSHOOT: cluster={} fired_tangent={} transfer_x={:.0f} "
                 "overshoot_px={} piece_count={}",
-                tc.id, int(_fired_tangent_x), transfer_x,
+                target.id, int(_fired_tangent_x), transfer_x,
                 int(round(_overshoot_px)), _piece_count,
             )
-            self._batch_cluster_ids_fired.append(tc.id)
+            logger.info(
+                "ACTIVE-TARGET FIRE: cluster={} front_tangent={} transfer_x={:.0f} "
+                "piece_count={} overshoot_px={}",
+                target.id, int(_fired_tangent_x), transfer_x,
+                _piece_count, int(round(_overshoot_px)),
+            )
+            self._batch_cluster_ids_fired.append(target.id)
             self._batch_fire_tangents.append(_fired_tangent_x)
             self._batch_overshoots_px.append(_overshoot_px)
 
@@ -1436,15 +1435,15 @@ class MainWindow(QMainWindow):
             self._push_signals_to_opcua()
             self._request_plc_stop_pulse()
 
-        # Cycle-idle-reset (logging-only, requirement 4): once no pieces have
-        # been seen for cycle_idle_reset_ms AND nothing is ACTIVE or still
-        # clearing, the batch is "finished" — log a summary and reset the
-        # batch-scoped counters. Clustering/firing itself never stops or
+        # Cycle-idle-reset (logging-only, requirement 4): once no pieces
+        # have been seen for cycle_idle_reset_ms, the batch is "finished" —
+        # log a summary and reset the batch-scoped counters, the DONE-
+        # cluster set, and the excluded-piece-identity set so the next
+        # batch starts fresh. Clustering/firing itself never stops or
         # resets because of this; it's purely an observability boundary.
         if (
             self._batch_active
             and self._last_piece_seen_time is not None
-            and not self._cluster_tracker.tracked
             and (now - self._last_piece_seen_time) * 1000.0 >= self._cfg.detection.cycle_idle_reset_ms
         ):
             _batch_ms = (
@@ -1464,15 +1463,17 @@ class MainWindow(QMainWindow):
             self._batch_cluster_ids_fired = []
             self._batch_fire_tangents = []
             self._batch_overshoots_px = []
+            self._cluster_tracker.reset()
+            self._done_piece_tracker.reset()
 
-        _n_active = sum(1 for tc in tracked if tc.state == "ACTIVE")
-        _n_clearing = sum(1 for tc in tracked if tc.state == "FIRED")
+        _n_pending = sum(1 for tc in tracked if tc.state == "PENDING")
+        _n_done = sum(1 for tc in tracked if tc.state == "DONE")
         self._log_fire_trace(
             transfer_x=transfer_x,
-            clusters_active=_n_active,
-            clusters_clearing=_n_clearing,
+            clusters_pending=_n_pending,
+            clusters_done=_n_done,
             pieces_total=len(all_detections),
-            pieces_excluded=len(_excluded),
+            pieces_excluded=_excluded_count,
             fired_cluster_ids=_fired_ids,
         )
 
@@ -2249,6 +2250,7 @@ class MainWindow(QMainWindow):
         # any in-flight tracked clusters' tangent_x is relative to the old
         # geometry, so discard them rather than risk a stale match/fire.
         self._cluster_tracker.reset()
+        self._done_piece_tracker.reset()
         self._last_piece_seen_time = None
         self._batch_active = False
         self._batch_start_time = None

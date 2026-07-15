@@ -1,5 +1,5 @@
 app:
-  mode: demo
+  mode: production
   language: en
   active_profile: Default
 camera:
@@ -40,8 +40,6 @@ detection:
   fill_mask_holes_kernel: 9
   detection_zone_width_px: 1000
   max_memory_frames: 5
-  boundary_offset_px: 25
-  clearing_timeout_ms: 400
   cycle_idle_reset_ms: 3000
   contour_external:
     min_circularity: 0.55
@@ -76,7 +74,7 @@ column_learning:
   expected_columns: 8
 proximity_clustering:
   enabled: true
-  tolerance_px: 149
+  tolerance_px: 70
 profiles:
 - name: Default
   expected_area_px: 60000
@@ -90,7 +88,7 @@ profiles:
   camera_exposure_us: 2754
   camera_gain: 0.0
   roi_split_x: 1859
-  transfer_line_x: 2017
+  transfer_line_x: 2031
   dough_is_darker: true
   belt_crop:
     top: 264
@@ -113,7 +111,7 @@ profiles:
   solidity_tolerance: 0.85
   fused_merge_distance_factor: 1.15
   dilation_kernel_size: 5
-  transfer_bridge_width_px: 60
+  transfer_bridge_width_px: 70
   tripwire_half_width_px: 15
   tripwire_occupancy_threshold: 0.12
   tripwire_debounce_frames: 2
