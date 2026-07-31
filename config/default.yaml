@@ -97,6 +97,10 @@ detection:
                                 # 0 = full ROI (no restriction). Outer edge drawn on cloth view.
   fill_mask_holes: false     # blob-only: pre-fill enclosed mask holes before extraction
   fill_mask_holes_kernel: 9  # odd, px — morphological-close kernel for the fill step
+  min_fresh_confirmations: 2 # diagnostic: consecutive FRESH Hough frames before a piece is
+                             # eligible for clustering/firing; 1 disables (pass-through)
+  roi_valid_y_min: null      # diagnostic Y-axis sanity gate; null = disabled
+  roi_valid_y_max: null      # diagnostic Y-axis sanity gate; null = disabled
   shape_filter:              # SECTION 2: reject non-dough (reflections) by shape+size
     enabled: true
     min_circularity: 0.6     # blob/contour roundness floor (Hough returns ideal circles)
@@ -149,6 +153,20 @@ column_learning:
 proximity_clustering:
   enabled: true
   tolerance_px: 150   # gap threshold (px) along tangent_x; live-adjustable in Service > Diagnostics
+
+# DIAGNOSTIC ONLY (visualization + logging): TransferEventTracker, see
+# viscontrol/transfer_event_tracker.py. Tracks a looser cross-frame "transfer
+# event" identity for tuning/debugging transfer-line timing. Completely
+# separate from proximity_clustering/ClusterTracker above — never read by the
+# real StopTuchabzug fire decision.
+transfer_event_tracker:
+  enabled: true
+  event_match_distance_px: 120
+  event_new_row_min_upstream_px: 60
+  event_new_event_group_merge_px: 130
+  event_arm_min_frames: 5
+  event_max_missed_frames: 8
+  event_max_late_overshoot_px: 30
 
 opcua:
   endpoint: "opc.tcp://0.0.0.0:4840/viscontrol/"

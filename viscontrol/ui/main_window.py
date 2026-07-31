@@ -47,10 +47,12 @@ from viscontrol.detection.pipeline import InspectionPipeline
 from viscontrol.detection.proximity_clustering import (
     ClusterTracker,
     DonePieceTracker,
+    PieceConfirmationTracker,
     cluster_by_tangent,
     pieces_from_detections,
 )
 from viscontrol.detection.row_grouping import leading_edge_x, median_piece_diameter
+from viscontrol.transfer_event_tracker import ClusterSnapshot, TransferEventTracker
 from viscontrol.io.camera import OrientationTransform, PlaybackCamera, make_camera
 from viscontrol.io.recorder import FrameRecorder
 from viscontrol.ui.i18n import install_translator
@@ -204,6 +206,15 @@ class MainWindow(QMainWindow):
         self._cached_cloth_detections: list = []
         self._cached_cloth_highlight: list[tuple[float, float]] = []
         self._cached_tripwire_occupied: bool = False
+        # Fix A (display staleness): frame_count as of the last successful
+        # Hough run, so the display path can compute how many frames old
+        # the currently-shown detections are, even on frames Hough skips.
+        self._last_hough_frame_count: int = 0
+        # Fix D (visualization only): unconfirmed candidate pieces from the
+        # most recent PieceConfirmationTracker.update() call, snapshotted
+        # here so the throttled display block (which runs later in the same
+        # or a later _on_frame call) can draw them.
+        self._last_unconfirmed_pieces: list = []
         # FIX 2: size-adaptive bridge/band width (px) computed from detected
         # piece diameter; 0 = not yet computed, fallback to profile value.
         self._active_bridge_width_px: int = 0
@@ -220,6 +231,28 @@ class MainWindow(QMainWindow):
         # discontinuous events — see _disable_detection — or cycle end).
         self._cluster_tracker = ClusterTracker()
         self._done_piece_tracker = DonePieceTracker()
+        # Fix D (diagnostic quality gate): requires a candidate piece to
+        # appear in min_fresh_confirmations consecutive FRESH Hough frames
+        # before it's eligible for clustering/firing. See
+        # viscontrol/detection/proximity_clustering.py: PieceConfirmationTracker.
+        self._confirmation_tracker = PieceConfirmationTracker()
+        # DIAGNOSTIC ONLY (visualization + logging): TransferEventTracker, see
+        # viscontrol/transfer_event_tracker.py. Watches the same per-frame
+        # cluster_by_tangent output as _apply_cluster_stop_edge but tracks its
+        # own looser event identity and never feeds back into ClusterTracker,
+        # DonePieceTracker, or the real StopTuchabzug fire decision.
+        self.transfer_tracker: TransferEventTracker | None = (
+            TransferEventTracker(
+                event_match_distance_px=self._cfg.transfer_event_tracker.event_match_distance_px,
+                event_new_row_min_upstream_px=self._cfg.transfer_event_tracker.event_new_row_min_upstream_px,
+                event_new_event_group_merge_px=self._cfg.transfer_event_tracker.event_new_event_group_merge_px,
+                event_arm_min_frames=self._cfg.transfer_event_tracker.event_arm_min_frames,
+                event_max_missed_frames=self._cfg.transfer_event_tracker.event_max_missed_frames,
+                event_max_late_overshoot_px=self._cfg.transfer_event_tracker.event_max_late_overshoot_px,
+            )
+            if self._cfg.transfer_event_tracker.enabled
+            else None
+        )
         # Idle/batch bookkeeping for the logging-only CYCLE-SUMMARY boundary
         # (detection.cycle_idle_reset_ms) — does not gate firing.
         self._last_piece_seen_time: float | None = None
@@ -403,6 +436,11 @@ class MainWindow(QMainWindow):
             self._cfg.proximity_clustering.tolerance_px,
             self._proximity_cluster_frames_processed,
         )
+        if self.transfer_tracker is not None:
+            try:
+                self.transfer_tracker.shutdown()
+            except Exception:  # noqa: BLE001
+                logger.exception("[TRACKER-ERROR] transfer_tracker.shutdown failed")
         try:
             self._camera.stop()
         except Exception:  # noqa: BLE001
@@ -582,6 +620,9 @@ class MainWindow(QMainWindow):
         self._detection_zone_outer_x = None
         self._cluster_tracker.reset()
         self._done_piece_tracker.reset()
+        self._confirmation_tracker.reset()
+        self._last_hough_frame_count = 0
+        self._last_unconfirmed_pieces = []
         self._last_piece_seen_time = None
         self._batch_active = False
         self._batch_start_time = None
@@ -665,6 +706,7 @@ class MainWindow(QMainWindow):
         _t_rowgroup_ms = 0.0   # SECTION 1: row-grouping / tripwire-edge decision time
         _t_belt_ms = 0.0
         _detection_ran = False  # SECTION 1: did a detection pass run this frame?
+        _hough_ran_this_frame = False  # Fix A: True only when Hough actually ran+succeeded this frame
 
         if self._detection_enabled and self._sm.state != State.SERVICE:
             snap = self._sm.snapshot()
@@ -731,6 +773,11 @@ class MainWindow(QMainWindow):
                         bg_reference_cloth=self._bg_reference_cloth,
                     )
                     _t_detect_ms = (time.perf_counter() - _t_d0) * 1000.0
+                    # Fix A: mark this frame's detections as fresh (Hough
+                    # just ran and succeeded) and record when for the
+                    # display-path staleness computation below.
+                    _hough_ran_this_frame = True
+                    self._last_hough_frame_count = self._frame_count
                     # Cache for reuse between Hough runs.
                     self._cached_cloth_detections = r.detections
                     self._cached_cloth_highlight = list(r.front_row_centroids)
@@ -738,6 +785,19 @@ class MainWindow(QMainWindow):
                     cloth_detections = r.detections
                     highlight = r.front_row_centroids
                     _tripwire_occupied = r.tripwire_occupied
+                    if not r.detections:
+                        # Fix C: a fresh Hough pass explicitly found zero
+                        # pieces — clear cache/local state immediately
+                        # rather than leaving anything for a later fallback
+                        # to reuse.
+                        self._cached_cloth_detections = []
+                        self._cached_cloth_highlight = []
+                        self._cached_tripwire_occupied = False
+                        cloth_detections = []
+                        logger.info(
+                            "[DET] DETECTION-CLEAR frame={} reason=fresh_empty_result",
+                            self._frame_count,
+                        )
                     if r.inference_ms > 50.0:
                         logger.debug("cloth_tracking slow: {:.0f} ms", r.inference_ms)
 
@@ -899,6 +959,14 @@ class MainWindow(QMainWindow):
         # display gate so it is defined on both the refresh and skip paths.
         snap_display = self._sm.snapshot()
 
+        # Fix A: detection freshness for the display path. Computed every
+        # frame regardless of whether Hough ran this frame (or at all), so a
+        # skipped frame's age keeps growing and a never-run session reads
+        # as maximally stale. detection_is_fresh reflects whether
+        # cloth_detections (below) came from THIS frame's Hough pass.
+        _detection_age_frames = self._frame_count - self._last_hough_frame_count
+        detection_is_fresh = _hough_ran_this_frame
+
         # Display: throttled to _DISPLAY_INTERVAL_S.
         # Detection runs at full camera rate above; only the QImage conversion
         # and QPixmap scaling (the expensive part) is held back.
@@ -1004,7 +1072,11 @@ class MainWindow(QMainWindow):
             # overlay only — everything above this block keeps firing
             # exactly as it does today).
             _proximity_clusters_overlay: list[tuple[float, list[tuple[float, float, float]]]] | None = None
-            if self._cfg.proximity_clustering.enabled:
+            # Fix A: only feed the diagnostic cluster_by_tangent call with
+            # THIS frame's fresh Hough output — a cached/stale
+            # cloth_detections would otherwise silently overlay clusters
+            # from a previous detection frame.
+            if self._cfg.proximity_clustering.enabled and _hough_ran_this_frame:
                 self._proximity_cluster_frames_processed += 1
                 _prox_tolerance = self._cfg.proximity_clustering.tolerance_px
                 _prox_clusters = cluster_by_tangent(
@@ -1029,6 +1101,45 @@ class MainWindow(QMainWindow):
                     )
                     for c in _prox_clusters
                 ]
+            elif self._cfg.proximity_clustering.enabled:
+                logger.debug(
+                    "[DET] DETECTION-CACHED frame={} age_frames={} skipping_diag_cluster={}",
+                    self._frame_count, _detection_age_frames, True,
+                )
+            # --- END DIAGNOSTIC ---
+
+            # --- DIAGNOSTIC/VISUALIZATION ONLY: TransferEventTracker overlay
+            # (see viscontrol/transfer_event_tracker.py). Snapshots the
+            # tracker's current event list (already updated for this frame in
+            # _apply_cluster_stop_edge) into plain tuples for drawing. Never
+            # allowed to crash the frame loop.
+            _transfer_events_overlay: list[tuple[int, str, float, float]] | None = None
+            if self.transfer_tracker is not None:
+                try:
+                    _transfer_events_overlay = [
+                        (ev.event_id, ev.state, ev.front_tangent, ev.back_tangent)
+                        for ev in self.transfer_tracker.events
+                    ]
+                except Exception:  # noqa: BLE001
+                    logger.exception("[TRACKER-ERROR] transfer_events overlay build failed")
+                    _transfer_events_overlay = None
+            # --- END DIAGNOSTIC ---
+
+            # --- DIAGNOSTIC/VISUALIZATION ONLY: Fix D unconfirmed-candidate
+            # overlay (see viscontrol/detection/proximity_clustering.py:
+            # PieceConfirmationTracker). Snapshots the most recent
+            # unconfirmed-piece list into plain tuples for drawing. Never
+            # fed into clustering/firing — display only.
+            _unconfirmed_overlay: list[tuple[float, float, float, int]] | None = None
+            try:
+                if self._last_unconfirmed_pieces:
+                    _unconfirmed_overlay = [
+                        (up.center_x - up.radius, up.center_y, up.radius, up.fresh_count)
+                        for up in self._last_unconfirmed_pieces
+                    ]
+            except Exception:  # noqa: BLE001
+                logger.exception("[DET-ERROR] unconfirmed overlay build failed")
+                _unconfirmed_overlay = None
             # --- END DIAGNOSTIC ---
 
             self._inference_view.set_belt_frame(
@@ -1068,6 +1179,10 @@ class MainWindow(QMainWindow):
                 cluster_state_label=_cluster_state_label,
                 debug_mask=_cloth_debug_mask,
                 proximity_clusters=_proximity_clusters_overlay,
+                transfer_events=_transfer_events_overlay,
+                detection_is_fresh=detection_is_fresh,
+                detection_age_frames=_detection_age_frames,
+                unconfirmed_detections=_unconfirmed_overlay,
             )
             self._inference_view.set_inference_ms(self._latest_pipeline_ms)
             self._inference_view.set_plc_signals(
@@ -1380,12 +1495,56 @@ class MainWindow(QMainWindow):
         # re-acquires them near the same spot.
         tolerance_px = self._cfg.proximity_clustering.tolerance_px
         _all_pieces = pieces_from_detections(all_detections)
-        _eligible_pieces = self._done_piece_tracker.filter_out_done(_all_pieces, tolerance_px)
+
+        # Fix E: Y-axis ROI sanity gate — rejects impossible detections
+        # (e.g. a reflection above/below the cloth) before they ever reach
+        # confirmation tracking or clustering. Y is NEVER used for matching
+        # or clustering itself, only this presence check. Zero overhead
+        # (skipped entirely) when both bounds are null.
+        _roi_y_min = self._cfg.detection.roi_valid_y_min
+        _roi_y_max = self._cfg.detection.roi_valid_y_max
+        if _roi_y_min is not None or _roi_y_max is not None:
+            try:
+                _lo = _roi_y_min if _roi_y_min is not None else float("-inf")
+                _hi = _roi_y_max if _roi_y_max is not None else float("inf")
+                _roi_kept: list = []
+                for _p in _all_pieces:
+                    if _lo <= _p.center_y <= _hi:
+                        _roi_kept.append(_p)
+                    else:
+                        logger.info(
+                            "[DET] DETECTION-ROI-REJECT tangent_x={} center_y={} "
+                            "roi_y=[{},{}] frame={}",
+                            round(_p.center_x - _p.radius, 1), round(_p.center_y, 1),
+                            _roi_y_min, _roi_y_max, self._frame_count,
+                        )
+                _all_pieces = _roi_kept
+            except Exception:  # noqa: BLE001
+                logger.exception("[DET-ERROR] ROI Y-filter failed")
+
+        # Fix D: require min_fresh_confirmations consecutive FRESH Hough
+        # frames before a candidate piece is eligible for clustering/firing
+        # — filters out one-frame noise/reflections. A no-op (all pieces
+        # pass through unchanged) when min_fresh_confirmations <= 1. See
+        # viscontrol/detection/proximity_clustering.py: PieceConfirmationTracker.
+        try:
+            _confirmed_pieces, _unconfirmed_pieces = self._confirmation_tracker.update(
+                _all_pieces, self._frame_count, tolerance_px,
+                self._cfg.detection.min_fresh_confirmations,
+                self._cfg.detection.max_memory_frames,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("[DET-ERROR] confirmation_tracker.update failed")
+            _confirmed_pieces, _unconfirmed_pieces = _all_pieces, []
+        self._last_unconfirmed_pieces = _unconfirmed_pieces
+
+        _eligible_pieces = self._done_piece_tracker.filter_out_done(_confirmed_pieces, tolerance_px)
+        _done_excluded_count = len(_confirmed_pieces) - len(_eligible_pieces)
         _excluded_count = len(_all_pieces) - len(_eligible_pieces)
         logger.info(
             "Done-piece filter: {} pieces detected, {} excluded (belong to a "
             "DONE cluster), {} eligible for clustering",
-            len(_all_pieces), _excluded_count, len(_eligible_pieces),
+            len(_confirmed_pieces), _done_excluded_count, len(_eligible_pieces),
         )
 
         # Cluster the eligible pieces and match against tracked clusters by
@@ -1394,6 +1553,32 @@ class MainWindow(QMainWindow):
         tracked = self._cluster_tracker.update(
             current_clusters, tolerance_px, self._cfg.detection.max_memory_frames,
         )
+
+        # --- DIAGNOSTIC/VISUALIZATION ONLY: TransferEventTracker (see
+        # viscontrol/transfer_event_tracker.py). Observes the same
+        # current_clusters computed just above, purely for a debug overlay +
+        # [TRACKER] logging — it never feeds back into target selection,
+        # mark_done, or any StopTuchabzug/PLC path below. Never allowed to
+        # crash the frame loop.
+        if self.transfer_tracker is not None:
+            try:
+                _tracker_snapshots = [
+                    ClusterSnapshot(
+                        cluster_id=_ci,
+                        front_tangent=cluster.front_tangent_x,
+                        back_tangent=max(p.tangent_x for p in cluster.pieces),
+                        center_tangent=(
+                            cluster.front_tangent_x + max(p.tangent_x for p in cluster.pieces)
+                        ) / 2.0,
+                        piece_count=len(cluster.pieces),
+                        center_y=sum(p.center_y for p in cluster.pieces) / len(cluster.pieces),
+                    )
+                    for _ci, cluster in enumerate(current_clusters)
+                ]
+                self.transfer_tracker.update(_tracker_snapshots, self._frame_count, transfer_x)
+            except Exception:  # noqa: BLE001
+                logger.exception("[TRACKER-ERROR] transfer_tracker.update failed")
+        # --- END DIAGNOSTIC ---
 
         # Active target: the single PENDING cluster closest to the transfer
         # line. Only this one is ever checked against transfer_x this
@@ -1405,6 +1590,30 @@ class MainWindow(QMainWindow):
             target.id if target is not None else "none",
             int(round(target.front_tangent_x)) if target is not None else "none",
         )
+
+        # --- DIAGNOSTIC ONLY (Fix F): FIRE-DECISION-CONFLICT check. The
+        # TransferEventTracker above may have judged a cluster too-late to
+        # even create an event (EVENT-CREATE-SKIP-LATE) while the real,
+        # independent fire logic below still treats that same cluster as
+        # the active target. This never blocks or alters the real fire
+        # decision — it's purely a signal for tuning tracker parameters.
+        if target is not None and self.transfer_tracker is not None:
+            try:
+                _skip_late_fronts = self.transfer_tracker.get_last_skip_late_fronts()
+                if any(
+                    abs(target.front_tangent_x - _f) <= tolerance_px
+                    for _f in _skip_late_fronts
+                ):
+                    logger.warning(
+                        "[DET] FIRE-DECISION-CONFLICT frame={} cluster_front={} "
+                        "tracker=SKIP-LATE production=WOULD-FIRE transfer_x={} "
+                        "detection_is_fresh=True",
+                        self._frame_count, round(target.front_tangent_x, 1),
+                        round(transfer_x, 1),
+                    )
+            except Exception:  # noqa: BLE001
+                logger.exception("[DET-ERROR] FIRE-DECISION-CONFLICT check failed")
+        # --- END DIAGNOSTIC ---
 
         _fired_ids: list[int] = []
         if target is not None and target.front_tangent_x <= transfer_x:
@@ -2366,6 +2575,9 @@ class MainWindow(QMainWindow):
         self._cached_cloth_detections = []
         self._cached_cloth_highlight = []
         self._cached_tripwire_occupied = False
+        self._last_hough_frame_count = self._frame_count
+        self._last_unconfirmed_pieces = []
+        self._confirmation_tracker.reset()
         self._active_bridge_width_px = 0
         self._detection_zone_outer_x = None
         # Cluster tracking deliberately persists across TuchabzugRunning

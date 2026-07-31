@@ -435,6 +435,10 @@ class InferenceView(QWidget):
         cluster_state_label: str | None = None,
         debug_mask: np.ndarray | None = None,
         proximity_clusters: list[tuple[float, list[tuple[float, float, float]]]] | None = None,
+        transfer_events: list[tuple[int, str, float, float]] | None = None,
+        detection_is_fresh: bool = True,
+        detection_age_frames: int = 0,
+        unconfirmed_detections: list[tuple[float, float, float, int]] | None = None,
     ) -> None:
         self._cloth_view.set_state(
             CameraViewState(
@@ -456,6 +460,10 @@ class InferenceView(QWidget):
                 cluster_state_label=cluster_state_label,
                 debug_mask=debug_mask,
                 proximity_clusters=proximity_clusters,
+                transfer_events=transfer_events,
+                detection_is_fresh=detection_is_fresh,
+                detection_age_frames=detection_age_frames,
+                unconfirmed_detections=unconfirmed_detections,
             )
         )
 

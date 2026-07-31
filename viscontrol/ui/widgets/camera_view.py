@@ -71,6 +71,25 @@ class CameraViewState:
     # coords. None/empty = not drawn. An additional overlay layer only —
     # never affects existing detection/debug overlays or any firing logic.
     proximity_clusters: list[tuple[float, list[tuple[float, float, float]]]] | None = None
+    # DIAGNOSTIC/VISUALIZATION ONLY (see viscontrol/transfer_event_tracker.py:
+    # TransferEventTracker). One entry per active tracked transfer event:
+    # (event_id, state, front_tangent, back_tangent) in image-local coords
+    # (same space as proximity_clusters). None/empty = not drawn. A separate
+    # identity model from proximity_clusters above — for tuning/debugging
+    # transfer-line timing only, never affects detection or firing.
+    transfer_events: list[tuple[int, str, float, float]] | None = None
+    # Fix A (display staleness): whether `detections` came from THIS frame's
+    # fresh Hough pass (True) or a reused/cached previous result (False).
+    # detection_age_frames is how many frames old the cache is (0 when
+    # fresh). Purely visual — never affects detection or firing.
+    detection_is_fresh: bool = True
+    detection_age_frames: int = 0
+    # DIAGNOSTIC/VISUALIZATION ONLY (Fix D, see
+    # viscontrol/detection/proximity_clustering.py: PieceConfirmationTracker).
+    # One entry per candidate piece still awaiting confirmation:
+    # (tangent_x, center_y, radius, fresh_count) in image-local coords.
+    # None/empty = not drawn. Never fed into detection/firing.
+    unconfirmed_detections: list[tuple[float, float, float, int]] | None = None
 
 
 # DIAGNOSTIC/VISUALIZATION ONLY: fixed color cycle for the proximity-cluster
@@ -84,6 +103,15 @@ _PROXIMITY_CLUSTER_PALETTE = [
     QColor(255, 60, 220),   # magenta
     QColor(0, 220, 220),    # cyan
 ]
+
+# DIAGNOSTIC/VISUALIZATION ONLY: state -> color for the TransferEventTracker
+# overlay (see CameraViewState.transfer_events).
+_TRANSFER_EVENT_COLORS = {
+    "TRACKING": QColor(255, 255, 255),    # white
+    "ARMED": QColor(255, 220, 0),         # yellow
+    "WOULD_FIRE": QColor(40, 255, 90),    # bright green
+    "DONE": QColor(140, 140, 140),        # gray
+}
 
 
 class _Canvas(QWidget):
@@ -222,7 +250,19 @@ class _Canvas(QWidget):
 
         # Detections.
         for det in state.detections or []:
-            self._draw_detection(p, det, dx, dy, sx, sy, state.px_per_mm)
+            self._draw_detection(
+                p, det, dx, dy, sx, sy, state.px_per_mm, fresh=state.detection_is_fresh,
+            )
+
+        # Fix A: staleness label — only shown when this frame's overlay is
+        # NOT from a fresh Hough pass. Positioned below the cluster-state
+        # badge so the two never overlap.
+        if not state.detection_is_fresh and state.detection_age_frames > 0:
+            font = QFont()
+            font.setPointSize(10)
+            p.setFont(font)
+            p.setPen(QColor(150, 150, 150))
+            p.drawText(dx + 8, dy + 38, f"cached +{state.detection_age_frames}f")
 
         # Cluster-state badge: "Clusters: N pending, M done" — replaces
         # the old grid/row "Active Row: N/M" display.
@@ -257,6 +297,21 @@ class _Canvas(QWidget):
         # are outlined only (no fill).
         if state.proximity_clusters:
             self._draw_proximity_clusters(p, state.proximity_clusters, dx, dy, sx, sy, pixmap)
+        # --- END DIAGNOSTIC ---
+
+        # --- DIAGNOSTIC/VISUALIZATION ONLY: TransferEventTracker overlay
+        # (see viscontrol/transfer_event_tracker.py). Drawn after all
+        # existing overlays so it never hides or interferes with them.
+        if state.transfer_events:
+            self._draw_transfer_events(p, state.transfer_events, dx, dy, sx, sy, pixmap)
+        # --- END DIAGNOSTIC ---
+
+        # --- DIAGNOSTIC/VISUALIZATION ONLY: Fix D unconfirmed-candidate
+        # overlay (see viscontrol/detection/proximity_clustering.py:
+        # PieceConfirmationTracker). Drawn after all existing overlays so it
+        # never hides or interferes with them.
+        if state.unconfirmed_detections:
+            self._draw_unconfirmed(p, state.unconfirmed_detections, dx, dy, sx, sy)
         # --- END DIAGNOSTIC ---
 
         # Debug mask thumbnail: bottom-right corner of the image area.
@@ -301,6 +356,7 @@ class _Canvas(QWidget):
         sy: float,
         px_per_mm: float,
         row_num: int = 0,
+        fresh: bool = True,
     ) -> None:
         cx, cy = det.centroid
         x = dx + cx * sx
@@ -316,15 +372,26 @@ class _Canvas(QWidget):
         else:
             color = QColor(self._color_for(det.label))
 
+        # Fix B: a stale (cached, not from this frame's fresh Hough pass)
+        # detection is drawn muted/dashed instead of its normal color so the
+        # operator can tell at a glance the overlay isn't current. Fresh
+        # detections (the default/existing behavior) are unaffected.
+        pen_style = Qt.PenStyle.SolidLine
+        if not fresh:
+            color = QColor(120, 120, 120)
+            pen_style = Qt.PenStyle.DashLine
+
         if det.label == "single":
             pen = QPen(color)
-            pen.setWidth(2)
+            pen.setWidth(2 if fresh else 1)
+            pen.setStyle(pen_style)
             p.setPen(pen)
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawEllipse(QPointF(x, y), radius_px, radius_px)
         elif det.label == "row_fused":
             pen = QPen(color)
-            pen.setWidth(5)
+            pen.setWidth(5 if fresh else 3)
+            pen.setStyle(pen_style)
             p.setPen(pen)
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawEllipse(QPointF(x, y), radius_px, radius_px)
@@ -340,13 +407,15 @@ class _Canvas(QWidget):
             )
         elif det.label == "column_fused":
             pen = QPen(color)
-            pen.setWidth(2)
+            pen.setWidth(2 if fresh else 1)
+            pen.setStyle(pen_style)
             p.setPen(pen)
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawEllipse(QPointF(x, y), radius_px, radius_px)
         elif det.label == "unknown":
             pen = QPen(color)
-            pen.setWidth(3)
+            pen.setWidth(3 if fresh else 2)
+            pen.setStyle(pen_style)
             p.setPen(pen)
             font = QFont()
             font.setPointSize(FONT_NORMAL + 6)
@@ -369,8 +438,11 @@ class _Canvas(QWidget):
                 tang_color = QColor(130, 130, 130)   # gray — boundary-excluded
             else:
                 tang_color = QColor(255, 220, 0)     # yellow-gold
+            if not fresh:
+                tang_color = QColor(120, 120, 120)
             tang_pen = QPen(tang_color)
-            tang_pen.setWidth(2)
+            tang_pen.setWidth(2 if fresh else 1)
+            tang_pen.setStyle(pen_style)
             p.setPen(tang_pen)
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawLine(
@@ -514,6 +586,86 @@ class _Canvas(QWidget):
             p.setPen(marker_pen)
             fx = dx + front_tangent_x * sx
             p.drawLine(QPointF(fx, dy), QPointF(fx, dy + pixmap.height()))
+
+    @staticmethod
+    def _draw_transfer_events(
+        p: QPainter,
+        events: list[tuple[int, str, float, float]],
+        dx: int,
+        dy: int,
+        sx: float,
+        sy: float,
+        pixmap: "QPixmap",
+    ) -> None:
+        """DIAGNOSTIC/VISUALIZATION ONLY: TransferEventTracker overlay (see
+        viscontrol/transfer_event_tracker.py). Draws one colored bracket per
+        active event near the top of the ROI (stacked so overlapping events
+        stay readable), color-coded by state, with an "E<id> <STATE>" label.
+        WOULD_FIRE events also get a short vertical tick at their front edge.
+        Read-only — does not affect detection, the tripwire, or firing."""
+        font = QFont()
+        font.setPointSize(max(6, FONT_SMALL - 1))
+        for i, (event_id, state_name, front_tangent, back_tangent) in enumerate(events):
+            color = _TRANSFER_EVENT_COLORS.get(state_name, QColor(255, 255, 255))
+            y = dy + 40 + i * 16
+
+            x_front = dx + front_tangent * sx
+            x_back = dx + back_tangent * sx
+            x_left, x_right = min(x_front, x_back), max(x_front, x_back)
+
+            pen = QPen(color)
+            pen.setWidth(3)
+            p.setPen(pen)
+            p.drawLine(QPointF(x_left, y), QPointF(x_right, y))
+            # End caps so the bracket reads clearly even when very narrow.
+            p.drawLine(QPointF(x_left, y - 4), QPointF(x_left, y + 4))
+            p.drawLine(QPointF(x_right, y - 4), QPointF(x_right, y + 4))
+
+            p.setFont(font)
+            p.setPen(color)
+            p.drawText(int(x_left), int(y) - 6, f"E{event_id} {state_name}")
+
+            if state_name == "WOULD_FIRE":
+                tick_y = dy + pixmap.height() / 2.0
+                tick_pen = QPen(_TRANSFER_EVENT_COLORS["WOULD_FIRE"])
+                tick_pen.setWidth(4)
+                p.setPen(tick_pen)
+                p.drawLine(QPointF(x_front, tick_y - 12), QPointF(x_front, tick_y + 12))
+
+    @staticmethod
+    def _draw_unconfirmed(
+        p: QPainter,
+        pieces: list[tuple[float, float, float, int]],
+        dx: int,
+        dy: int,
+        sx: float,
+        sy: float,
+    ) -> None:
+        """DIAGNOSTIC/VISUALIZATION ONLY (Fix D, see
+        viscontrol/detection/proximity_clustering.py:
+        PieceConfirmationTracker). Draws each not-yet-confirmed candidate as
+        a small hollow, dashed, orange circle with an "unconf N" label
+        (N = fresh_count) — visually distinct from normal (confirmed)
+        detections so the operator never mistakes one for the other.
+        Read-only — does not affect detection, the tripwire, or firing."""
+        color = QColor(255, 160, 0)
+        pen = QPen(color)
+        pen.setWidth(1)
+        pen.setStyle(Qt.PenStyle.DashLine)
+        font = QFont()
+        font.setPointSize(max(6, FONT_SMALL - 1))
+        font.setBold(False)
+        for tangent_x, cy, radius, fresh_count in pieces:
+            cx = tangent_x + radius
+            x = dx + cx * sx
+            y = dy + cy * sy
+            r = radius * max(sx, sy)
+            p.setPen(pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(QPointF(x, y), r, r)
+            p.setFont(font)
+            p.setPen(color)
+            p.drawText(QPointF(x + r + 2, y), f"unconf {fresh_count}")
 
 
 class CameraView(QFrame):

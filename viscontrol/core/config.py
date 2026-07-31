@@ -333,6 +333,33 @@ class _DetectionSection(BaseModel):
             "running continuously regardless of this boundary."
         ),
     )
+    min_fresh_confirmations: int = Field(
+        2, ge=1,
+        description=(
+            "Quality gate (diagnostic Fix D): a candidate piece must appear "
+            "in this many consecutive FRESH Hough frames (tangent_x-matched "
+            "within proximity_clustering.tolerance_px) before it becomes "
+            "eligible for clustering/firing — filters out one-frame "
+            "reflections/noise. 1 disables the gate entirely: every piece "
+            "passes through unchanged, zero overhead. See "
+            "viscontrol/detection/proximity_clustering.py: "
+            "PieceConfirmationTracker."
+        ),
+    )
+    roi_valid_y_min: float | None = Field(
+        None,
+        description=(
+            "Y-axis sanity gate (diagnostic Fix E): pieces with center_y "
+            "below this value are rejected before clustering/confirmation. "
+            "null = disabled. Y is never used for matching or clustering "
+            "itself — this is a pure presence filter for impossible "
+            "detections (e.g. a reflection above/below the cloth)."
+        ),
+    )
+    roi_valid_y_max: float | None = Field(
+        None,
+        description="Y-axis sanity gate upper bound (diagnostic Fix E). null = disabled.",
+    )
     contour_external: _ContourExternalSection = Field(default_factory=_ContourExternalSection)
     hough: _HoughSection = Field(default_factory=_HoughSection)
     bg_subtract: _BgSubtractSection = Field(default_factory=_BgSubtractSection)
@@ -414,6 +441,51 @@ class _ProximityClusteringSection(BaseModel):
     )
 
 
+class _TransferEventTrackerSection(BaseModel):
+    """DIAGNOSTIC (visualization + logging only): TransferEventTracker (see
+    viscontrol/transfer_event_tracker.py). Tracks a looser, cross-frame
+    "transfer event" identity for tuning/debugging the transfer line
+    behavior — completely separate from ClusterTracker and never read by the
+    real StopTuchabzug fire decision (MainWindow._apply_cluster_stop_edge).
+    """
+
+    enabled: bool = Field(
+        True,
+        description=(
+            "Master on/off. When False, the tracker is not instantiated and "
+            "not called — zero overhead, zero behavior change."
+        ),
+    )
+    event_match_distance_px: float = Field(
+        120, ge=0,
+        description="Max interval gap between a cluster's and an event's tangent_x range to count as a match.",
+    )
+    event_new_row_min_upstream_px: float = Field(
+        60, ge=0,
+        description="An unmatched cluster must have front_tangent > transfer_x + this to seed a new event.",
+    )
+    event_new_event_group_merge_px: float = Field(
+        130, ge=0,
+        description=(
+            "Max interval distance between two unmatched upstream clusters for them to be "
+            "grouped into a single new TransferEvent (one physical row). Separate from "
+            "event_match_distance_px, which matches clusters to already-existing events."
+        ),
+    )
+    event_arm_min_frames: int = Field(
+        5, ge=1,
+        description="Minimum observed_frames before a TRACKING event can become ARMED.",
+    )
+    event_max_missed_frames: int = Field(
+        8, ge=1,
+        description="Drop an event after this many consecutive frames with no matching cluster.",
+    )
+    event_max_late_overshoot_px: float = Field(
+        30, ge=0,
+        description="Documents how close to/past the line an unmatched cluster can be and still be IGNORE-LATE rather than a new event.",
+    )
+
+
 class _OpcuaSection(BaseModel):
     endpoint: str = "opc.tcp://0.0.0.0:4840/viscontrol/"
     namespace: str = "http://opelka.com/viscontrol"
@@ -468,6 +540,7 @@ class AppConfig(BaseModel):
     detection: _DetectionSection = Field(default_factory=_DetectionSection)
     column_learning: _ColumnLearningSection = Field(default_factory=_ColumnLearningSection)
     proximity_clustering: _ProximityClusteringSection = Field(default_factory=_ProximityClusteringSection)
+    transfer_event_tracker: _TransferEventTrackerSection = Field(default_factory=_TransferEventTrackerSection)
     profiles: list[ProductProfile] = Field(default_factory=list)
     opcua: _OpcuaSection = Field(default_factory=_OpcuaSection)
     web: _WebSection = Field(default_factory=_WebSection)
