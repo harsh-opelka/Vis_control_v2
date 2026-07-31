@@ -40,19 +40,19 @@ from viscontrol.core.events import Mode, PipelineResult, RowPhase, State, Verdic
 from viscontrol.core.logger import logger
 from viscontrol.core.profiles import ProductProfile
 from viscontrol.core.state_machine import StateMachine
+from viscontrol.core.transfer_events import ClusterObservation
+from viscontrol.core.transfer_events import EventType as TransferEventType
+from viscontrol.core.transfer_orchestrator import TransferOrchestrator
 from viscontrol.detection.calibration import learn_reference
 from viscontrol.detection.classical import ClassicalDetector
 from viscontrol.detection.column_learning import ColumnLearner
 from viscontrol.detection.pipeline import InspectionPipeline
 from viscontrol.detection.proximity_clustering import (
-    ClusterTracker,
-    DonePieceTracker,
     PieceConfirmationTracker,
     cluster_by_tangent,
     pieces_from_detections,
 )
 from viscontrol.detection.row_grouping import leading_edge_x, median_piece_diameter
-from viscontrol.transfer_event_tracker import ClusterSnapshot, TransferEventTracker
 from viscontrol.io.camera import OrientationTransform, PlaybackCamera, make_camera
 from viscontrol.io.recorder import FrameRecorder
 from viscontrol.ui.i18n import install_translator
@@ -221,46 +221,28 @@ class MainWindow(QMainWindow):
         # Detection zone outer boundary (approach-side, cloth-local x), for
         # display; None when zone disabled or detection hasn't run yet.
         self._detection_zone_outer_x: int | None = None
-        # Cluster-based firing (replaces the old grid/row state machine
-        # entirely). ClusterTracker owns per-cluster PENDING/DONE lifecycle
-        # (DONE is permanent — no clearing/timeout); DonePieceTracker
-        # permanently excludes a DONE cluster's pieces, by identity, from
-        # ever rejoining clustering. See
-        # viscontrol/detection/proximity_clustering.py. Continuous by
-        # design: never reset on TuchabzugRunning edges (only on genuinely
-        # discontinuous events — see _disable_detection — or cycle end).
-        self._cluster_tracker = ClusterTracker()
-        self._done_piece_tracker = DonePieceTracker()
         # Fix D (diagnostic quality gate): requires a candidate piece to
         # appear in min_fresh_confirmations consecutive FRESH Hough frames
         # before it's eligible for clustering/firing. See
         # viscontrol/detection/proximity_clustering.py: PieceConfirmationTracker.
         self._confirmation_tracker = PieceConfirmationTracker()
-        # DIAGNOSTIC ONLY (visualization + logging): TransferEventTracker, see
-        # viscontrol/transfer_event_tracker.py. Watches the same per-frame
-        # cluster_by_tangent output as _apply_cluster_stop_edge but tracks its
-        # own looser event identity and never feeds back into ClusterTracker,
-        # DonePieceTracker, or the real StopTuchabzug fire decision.
-        self.transfer_tracker: TransferEventTracker | None = (
-            TransferEventTracker(
-                event_match_distance_px=self._cfg.transfer_event_tracker.event_match_distance_px,
-                event_new_row_min_upstream_px=self._cfg.transfer_event_tracker.event_new_row_min_upstream_px,
-                event_new_event_group_merge_px=self._cfg.transfer_event_tracker.event_new_event_group_merge_px,
-                event_arm_min_frames=self._cfg.transfer_event_tracker.event_arm_min_frames,
-                event_max_missed_frames=self._cfg.transfer_event_tracker.event_max_missed_frames,
-                event_max_late_overshoot_px=self._cfg.transfer_event_tracker.event_max_late_overshoot_px,
-            )
-            if self._cfg.transfer_event_tracker.enabled
-            else None
+
+        # THE SINGLE SOURCE OF TRUTH for row/transfer state (replaces the
+        # old ClusterTracker/DonePieceTracker fire path and the diagnostic
+        # TransferEventTracker — see viscontrol/core/transfer_orchestrator.py).
+        # _orchestrator_stop_sink is the ONLY production call path to
+        # StopTuchabzug in the repository.
+        def _orchestrator_stop_sink(snapshot) -> None:  # noqa: ANN001
+            self._sm.handle_stop_tuchabzug_trigger()
+            self._push_signals_to_opcua()
+            self._request_plc_stop_pulse()
+
+        self._orchestrator = TransferOrchestrator(
+            cfg=self._cfg.transfer_orchestrator,
+            stop_command_sink=_orchestrator_stop_sink,
+            now_fn=time.monotonic,
+            logger=logger,
         )
-        # Idle/batch bookkeeping for the logging-only CYCLE-SUMMARY boundary
-        # (detection.cycle_idle_reset_ms) — does not gate firing.
-        self._last_piece_seen_time: float | None = None
-        self._batch_active: bool = False
-        self._batch_start_time: float | None = None
-        self._batch_cluster_ids_fired: list[int] = []
-        self._batch_fire_tangents: list[float] = []
-        self._batch_overshoots_px: list[float] = []
         # DEBUG LOGGING (determinism analysis) — see PLC-EDGE / FRAME-GAP
         # logs. Purely observational; never read by decision logic.
         self._last_tuchabzug_edge_time: float | None = None  # time.monotonic() of last rising/falling edge
@@ -436,11 +418,10 @@ class MainWindow(QMainWindow):
             self._cfg.proximity_clustering.tolerance_px,
             self._proximity_cluster_frames_processed,
         )
-        if self.transfer_tracker is not None:
-            try:
-                self.transfer_tracker.shutdown()
-            except Exception:  # noqa: BLE001
-                logger.exception("[TRACKER-ERROR] transfer_tracker.shutdown failed")
+        try:
+            self._orchestrator.shutdown()
+        except Exception:  # noqa: BLE001
+            logger.exception("[ORCH-ERROR] orchestrator.shutdown failed")
         try:
             self._camera.stop()
         except Exception:  # noqa: BLE001
@@ -618,17 +599,13 @@ class MainWindow(QMainWindow):
         self._cached_tripwire_occupied = False
         self._active_bridge_width_px = 0
         self._detection_zone_outer_x = None
-        self._cluster_tracker.reset()
-        self._done_piece_tracker.reset()
         self._confirmation_tracker.reset()
         self._last_hough_frame_count = 0
         self._last_unconfirmed_pieces = []
-        self._last_piece_seen_time = None
-        self._batch_active = False
-        self._batch_start_time = None
-        self._batch_cluster_ids_fired = []
-        self._batch_fire_tangents = []
-        self._batch_overshoots_px = []
+        try:
+            self._orchestrator.start_cycle(self._frame_count)
+        except Exception:  # noqa: BLE001
+            logger.exception("[ORCH-ERROR] orchestrator.start_cycle failed (STOP button)")
         self._belt_inspect_window_open = False
         self._belt_window_fault_latched = False
         self._clear_sticky_overlay()
@@ -832,14 +809,14 @@ class MainWindow(QMainWindow):
                         )
                     # --- END DIAGNOSTIC ---
 
-                    # Firing path: cluster-based (grid-free), the sole owner
-                    # of StopTuchabzug firing. _track_row_phase still runs
-                    # for its RowPhase bookkeeping (belt-fault-debounce
-                    # reset, transfer-timeout warning, UI label) but no
-                    # longer fires anything itself.
+                    # Firing path: TransferOrchestrator, the sole owner of
+                    # StopTuchabzug firing. _track_row_phase still runs for
+                    # its RowPhase bookkeeping (belt-fault-debounce reset,
+                    # transfer-timeout warning, UI label) but no longer
+                    # fires anything itself.
                     _t_r0 = time.perf_counter()
                     self._track_row_phase(r, profile)
-                    self._apply_cluster_stop_edge(r, profile)
+                    self._run_transfer_orchestrator(r, profile)
                     _t_rowgroup_ms = (time.perf_counter() - _t_r0) * 1000.0
 
                     # --- DIAGNOSTIC: row-profile bump/valley log (two-rows-at-once
@@ -1108,22 +1085,17 @@ class MainWindow(QMainWindow):
                 )
             # --- END DIAGNOSTIC ---
 
-            # --- DIAGNOSTIC/VISUALIZATION ONLY: TransferEventTracker overlay
-            # (see viscontrol/transfer_event_tracker.py). Snapshots the
-            # tracker's current event list (already updated for this frame in
-            # _apply_cluster_stop_edge) into plain tuples for drawing. Never
-            # allowed to crash the frame loop.
-            _transfer_events_overlay: list[tuple[int, str, float, float]] | None = None
-            if self.transfer_tracker is not None:
-                try:
-                    _transfer_events_overlay = [
-                        (ev.event_id, ev.state, ev.front_tangent, ev.back_tangent)
-                        for ev in self.transfer_tracker.events
-                    ]
-                except Exception:  # noqa: BLE001
-                    logger.exception("[TRACKER-ERROR] transfer_events overlay build failed")
-                    _transfer_events_overlay = None
-            # --- END DIAGNOSTIC ---
+            # Orchestrator snapshot for display — the UI reads this and
+            # NOTHING else from the orchestrator (see
+            # viscontrol/core/transfer_orchestrator.py: TransferOrchestrator.
+            # snapshot() returns deep copies; the UI can never mutate
+            # orchestrator state through it).
+            _orchestrator_snapshot = None
+            try:
+                _orchestrator_snapshot = self._orchestrator.snapshot()
+            except Exception:  # noqa: BLE001
+                logger.exception("[ORCH-ERROR] orchestrator.snapshot failed")
+                _orchestrator_snapshot = None
 
             # --- DIAGNOSTIC/VISUALIZATION ONLY: Fix D unconfirmed-candidate
             # overlay (see viscontrol/detection/proximity_clustering.py:
@@ -1146,11 +1118,19 @@ class MainWindow(QMainWindow):
                 belt, _disp_belt_dets, px_per_mm=1.0, crop_rect=_disp_belt_crop,
                 debug_mask=_belt_debug_mask,
             )
-            # Cluster-state label: live count of tracked clusters by state,
-            # replacing the old grid/row "Active Row: N/M" display.
-            _n_pending = sum(1 for tc in self._cluster_tracker.tracked if tc.state == "PENDING")
-            _n_done = sum(1 for tc in self._cluster_tracker.tracked if tc.state == "DONE")
-            _cluster_state_label = f"Clusters: {_n_pending} pending, {_n_done} done"
+            # Row-state label: four SEPARATE counts from the orchestrator
+            # snapshot — deliberately NOT a single "cluster count" number,
+            # since raw per-frame clusters are not physical rows (see
+            # viscontrol/core/transfer_events.py: OrchestratorSnapshot).
+            if _orchestrator_snapshot is not None:
+                _cluster_state_label = (
+                    f"Raw clusters now: {_orchestrator_snapshot.raw_cluster_count}  "
+                    f"Rows active: {_orchestrator_snapshot.rows_active}  "
+                    f"Transfer pending: {_orchestrator_snapshot.rows_transfer_pending}  "
+                    f"Transferred: {_orchestrator_snapshot.rows_transferred}"
+                )
+            else:
+                _cluster_state_label = "Row state unavailable"
 
             self._inference_view.set_cloth_frame(
                 cloth,
@@ -1179,7 +1159,7 @@ class MainWindow(QMainWindow):
                 cluster_state_label=_cluster_state_label,
                 debug_mask=_cloth_debug_mask,
                 proximity_clusters=_proximity_clusters_overlay,
-                transfer_events=_transfer_events_overlay,
+                orchestrator_snapshot=_orchestrator_snapshot,
                 detection_is_fresh=detection_is_fresh,
                 detection_age_frames=_detection_age_frames,
                 unconfirmed_detections=_unconfirmed_overlay,
@@ -1336,8 +1316,8 @@ class MainWindow(QMainWindow):
         tripwire occupancy reading.
 
         Renamed from the old _apply_tripwire_edge: this method no longer
-        fires StopTuchabzug itself — cluster-based firing
-        (_apply_cluster_stop_edge) is the sole fire-decision owner now. It
+        fires StopTuchabzug itself — TransferOrchestrator
+        (_run_transfer_orchestrator) is the sole fire-decision owner now. It
         still owns RowPhase, whose transitions drive other bookkeeping used
         regardless of firing mode: belt-fault-debounce reset on transfer
         start (_on_tuchabzug_rising_row_phase), the transfer_timeout_ms
@@ -1420,11 +1400,6 @@ class MainWindow(QMainWindow):
 
     # ---------- DEBUG LOGGING (determinism analysis) ----------
 
-    def _log_state(self, field: str, old: object, new: object, trigger: str) -> None:
-        """Uniform "STATE:" transition line for cluster ACTIVE/FIRED/CLEARED
-        mutations. Logging only — never affects behavior."""
-        logger.info("STATE: {}: {} -> {} (trigger={})", field, old, new, trigger)
-
     def _log_plc_edge(self, edge: str) -> None:
         """Log time since the previous TuchabzugRunning edge (any source:
         PLC ext_tuchabzug_status, OPC UA, demo simulate/force-toggle)."""
@@ -1437,62 +1412,30 @@ class MainWindow(QMainWindow):
         logger.info("PLC-EDGE {} dt_since_last_edge={}ms", edge, _dt_ms)
         self._last_tuchabzug_edge_time = _now
 
-    def _log_fire_trace(
-        self,
-        *,
-        transfer_x: float,
-        clusters_pending: int,
-        clusters_done: int,
-        pieces_total: int,
-        pieces_excluded: int,
-        fired_cluster_ids: list[int],
-    ) -> None:
-        """One line per processed frame summarizing the cluster fire decision."""
-        logger.info(
-            "FIRE-TRACE frame_id={} transfer_x={} clusters_pending={} "
-            "clusters_done={} pieces_total={} pieces_excluded={} fired={}",
-            self._frame_count,
-            int(round(transfer_x)),
-            clusters_pending,
-            clusters_done,
-            pieces_total,
-            pieces_excluded,
-            fired_cluster_ids,
-        )
+    def _run_transfer_orchestrator(self, r: object, profile: "ProductProfile") -> None:
+        """The sole StopTuchabzug fire-decision owner — see
+        viscontrol/core/transfer_orchestrator.py: TransferOrchestrator.
 
-    def _apply_cluster_stop_edge(self, r: object, profile: "ProductProfile") -> None:
-        """Grid-free firing path — the sole StopTuchabzug fire-decision owner.
-
-        Each frame: permanently exclude pieces that belong to an already-
-        DONE cluster (by piece identity, see DonePieceTracker), cluster the
-        remaining pieces by tangent_x, match against tracked clusters by
-        identity, then pick the single "active target" — the PENDING
-        cluster with the smallest front (minimum) tangent_x — and check
-        ONLY that one cluster against transfer_x. Firing is permanent: a
-        fired cluster is marked DONE immediately and never re-checked or
-        re-clustered for the rest of the cycle, so one physical row fires
-        exactly once. See viscontrol/detection/proximity_clustering.py:
-        ClusterTracker, DonePieceTracker.
+        Applies the existing freshness/ROI/confirmation gates to this
+        frame's fresh Hough detections, clusters the survivors by
+        tangent_x (pure, stateless — see cluster_by_tangent), and feeds one
+        OBSERVATION event to the orchestrator. Everything past that point
+        (row identity, lifecycle, the single stop-command call) lives in
+        the orchestrator; this method never touches PLC/SM state directly.
         """
+        if not self._cfg.transfer_orchestrator.enabled:
+            # Fail-safe: no stop is ever issued. There is no old path to
+            # fall back to (see refactor_result.txt).
+            return
+
         transfer_x = float(profile.transfer_line_x - profile.roi_split_x)
         all_detections = r.detections  # type: ignore[attr-defined]
-        now = time.monotonic()
 
+        # Bridge-width overlay (display only, unrelated to firing).
         raw_diameter = median_piece_diameter(all_detections) or float(profile.expected_width_px)
         effective_width = max(float(profile.transfer_bridge_width_px), raw_diameter)
         self._active_bridge_width_px = int(effective_width)
 
-        # Idle/batch bookkeeping — logging-only, see detection.cycle_idle_reset_ms.
-        if all_detections:
-            self._last_piece_seen_time = now
-            if not self._batch_active:
-                self._batch_active = True
-                self._batch_start_time = now
-
-        # Permanent, identity-based exclusion: pieces that belonged to a
-        # cluster that already fired (DONE) never rejoin clustering, no
-        # matter how they drift or whether detection briefly loses and
-        # re-acquires them near the same spot.
         tolerance_px = self._cfg.proximity_clustering.tolerance_px
         _all_pieces = pieces_from_detections(all_detections)
 
@@ -1524,9 +1467,10 @@ class MainWindow(QMainWindow):
 
         # Fix D: require min_fresh_confirmations consecutive FRESH Hough
         # frames before a candidate piece is eligible for clustering/firing
-        # — filters out one-frame noise/reflections. A no-op (all pieces
-        # pass through unchanged) when min_fresh_confirmations <= 1. See
-        # viscontrol/detection/proximity_clustering.py: PieceConfirmationTracker.
+        # — filters out one-frame noise/reflections. Rejected pieces are
+        # dropped HERE and never reach the orchestrator. A no-op (all
+        # pieces pass through unchanged) when min_fresh_confirmations <= 1.
+        # See viscontrol/detection/proximity_clustering.py: PieceConfirmationTracker.
         try:
             _confirmed_pieces, _unconfirmed_pieces = self._confirmation_tracker.update(
                 _all_pieces, self._frame_count, tolerance_px,
@@ -1538,153 +1482,29 @@ class MainWindow(QMainWindow):
             _confirmed_pieces, _unconfirmed_pieces = _all_pieces, []
         self._last_unconfirmed_pieces = _unconfirmed_pieces
 
-        _eligible_pieces = self._done_piece_tracker.filter_out_done(_confirmed_pieces, tolerance_px)
-        _done_excluded_count = len(_confirmed_pieces) - len(_eligible_pieces)
-        _excluded_count = len(_all_pieces) - len(_eligible_pieces)
-        logger.info(
-            "Done-piece filter: {} pieces detected, {} excluded (belong to a "
-            "DONE cluster), {} eligible for clustering",
-            len(_confirmed_pieces), _done_excluded_count, len(_eligible_pieces),
-        )
-
-        # Cluster the eligible pieces and match against tracked clusters by
-        # identity (front_tangent_x proximity, within tolerance_px).
-        current_clusters = cluster_by_tangent(_eligible_pieces, tolerance_px)
-        tracked = self._cluster_tracker.update(
-            current_clusters, tolerance_px, self._cfg.detection.max_memory_frames,
-        )
-
-        # --- DIAGNOSTIC/VISUALIZATION ONLY: TransferEventTracker (see
-        # viscontrol/transfer_event_tracker.py). Observes the same
-        # current_clusters computed just above, purely for a debug overlay +
-        # [TRACKER] logging — it never feeds back into target selection,
-        # mark_done, or any StopTuchabzug/PLC path below. Never allowed to
-        # crash the frame loop.
-        if self.transfer_tracker is not None:
-            try:
-                _tracker_snapshots = [
-                    ClusterSnapshot(
-                        cluster_id=_ci,
-                        front_tangent=cluster.front_tangent_x,
-                        back_tangent=max(p.tangent_x for p in cluster.pieces),
-                        center_tangent=(
-                            cluster.front_tangent_x + max(p.tangent_x for p in cluster.pieces)
-                        ) / 2.0,
-                        piece_count=len(cluster.pieces),
-                        center_y=sum(p.center_y for p in cluster.pieces) / len(cluster.pieces),
-                    )
-                    for _ci, cluster in enumerate(current_clusters)
-                ]
-                self.transfer_tracker.update(_tracker_snapshots, self._frame_count, transfer_x)
-            except Exception:  # noqa: BLE001
-                logger.exception("[TRACKER-ERROR] transfer_tracker.update failed")
-        # --- END DIAGNOSTIC ---
-
-        # Active target: the single PENDING cluster closest to the transfer
-        # line. Only this one is ever checked against transfer_x this
-        # frame — every other cluster (further-back PENDING, or already
-        # DONE) is ignored for the fire decision.
-        target = self._cluster_tracker.get_active_target()
-        logger.debug(
-            "ACTIVE-TARGET: cluster={} front_tangent={}",
-            target.id if target is not None else "none",
-            int(round(target.front_tangent_x)) if target is not None else "none",
-        )
-
-        # --- DIAGNOSTIC ONLY (Fix F): FIRE-DECISION-CONFLICT check. The
-        # TransferEventTracker above may have judged a cluster too-late to
-        # even create an event (EVENT-CREATE-SKIP-LATE) while the real,
-        # independent fire logic below still treats that same cluster as
-        # the active target. This never blocks or alters the real fire
-        # decision — it's purely a signal for tuning tracker parameters.
-        if target is not None and self.transfer_tracker is not None:
-            try:
-                _skip_late_fronts = self.transfer_tracker.get_last_skip_late_fronts()
-                if any(
-                    abs(target.front_tangent_x - _f) <= tolerance_px
-                    for _f in _skip_late_fronts
-                ):
-                    logger.warning(
-                        "[DET] FIRE-DECISION-CONFLICT frame={} cluster_front={} "
-                        "tracker=SKIP-LATE production=WOULD-FIRE transfer_x={} "
-                        "detection_is_fresh=True",
-                        self._frame_count, round(target.front_tangent_x, 1),
-                        round(transfer_x, 1),
-                    )
-            except Exception:  # noqa: BLE001
-                logger.exception("[DET-ERROR] FIRE-DECISION-CONFLICT check failed")
-        # --- END DIAGNOSTIC ---
-
-        _fired_ids: list[int] = []
-        if target is not None and target.front_tangent_x <= transfer_x:
-            _fired_tangent_x = target.front_tangent_x
-            _piece_count = len(target.pieces)
-            _fired_ids.append(target.id)
-            self._cluster_tracker.mark_done(target.id, _fired_tangent_x)
-            self._done_piece_tracker.mark_done(target.pieces)
-            self._log_state(f"cluster[{target.id}]", "PENDING", "DONE", "fire")
-            _overshoot_px = transfer_x - _fired_tangent_x
-            logger.info(
-                "FIRE OVERSHOOT: cluster={} fired_tangent={} transfer_x={:.0f} "
-                "overshoot_px={} piece_count={}",
-                target.id, int(_fired_tangent_x), transfer_x,
-                int(round(_overshoot_px)), _piece_count,
+        try:
+            clusters = cluster_by_tangent(_confirmed_pieces, tolerance_px)
+            observations = tuple(
+                ClusterObservation(
+                    front_tangent=c.front_tangent_x,
+                    back_tangent=max(p.tangent_x for p in c.pieces),
+                    piece_count=len(c.pieces),
+                    center_y=sum(p.center_y for p in c.pieces) / len(c.pieces),
+                    temp_cluster_index=i,
+                )
+                for i, c in enumerate(clusters)
             )
-            logger.info(
-                "ACTIVE-TARGET FIRE: cluster={} front_tangent={} transfer_x={:.0f} "
-                "piece_count={} overshoot_px={}",
-                target.id, int(_fired_tangent_x), transfer_x,
-                _piece_count, int(round(_overshoot_px)),
+            self._orchestrator.set_transfer_x(transfer_x)
+            evt = self._orchestrator.make_event(
+                TransferEventType.OBSERVATION, source_frame_id=self._frame_count,
+                observations=observations,
             )
-            self._batch_cluster_ids_fired.append(target.id)
-            self._batch_fire_tangents.append(_fired_tangent_x)
-            self._batch_overshoots_px.append(_overshoot_px)
-
-            self._sm.handle_stop_tuchabzug_trigger()
-            self._push_signals_to_opcua()
-            self._request_plc_stop_pulse()
-
-        # Cycle-idle-reset (logging-only, requirement 4): once no pieces
-        # have been seen for cycle_idle_reset_ms, the batch is "finished" —
-        # log a summary and reset the batch-scoped counters, the DONE-
-        # cluster set, and the excluded-piece-identity set so the next
-        # batch starts fresh. Clustering/firing itself never stops or
-        # resets because of this; it's purely an observability boundary.
-        if (
-            self._batch_active
-            and self._last_piece_seen_time is not None
-            and (now - self._last_piece_seen_time) * 1000.0 >= self._cfg.detection.cycle_idle_reset_ms
-        ):
-            _batch_ms = (
-                (now - self._batch_start_time) * 1000.0
-                if self._batch_start_time is not None else 0.0
+            self._orchestrator.submit(evt)
+            self._orchestrator.drain()
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "[ORCH-ERROR] _run_transfer_orchestrator failed — no fire this frame"
             )
-            logger.info(
-                "CYCLE-SUMMARY cluster_ids_fired={} fire_tangents={} overshoot_px={} "
-                "total_batch_ms={}",
-                self._batch_cluster_ids_fired,
-                [int(round(t)) for t in self._batch_fire_tangents],
-                [int(round(o)) for o in self._batch_overshoots_px],
-                int(round(_batch_ms)),
-            )
-            self._batch_active = False
-            self._batch_start_time = None
-            self._batch_cluster_ids_fired = []
-            self._batch_fire_tangents = []
-            self._batch_overshoots_px = []
-            self._cluster_tracker.reset()
-            self._done_piece_tracker.reset()
-
-        _n_pending = sum(1 for tc in tracked if tc.state == "PENDING")
-        _n_done = sum(1 for tc in tracked if tc.state == "DONE")
-        self._log_fire_trace(
-            transfer_x=transfer_x,
-            clusters_pending=_n_pending,
-            clusters_done=_n_done,
-            pieces_total=len(all_detections),
-            pieces_excluded=_excluded_count,
-            fired_cluster_ids=_fired_ids,
-        )
 
     def _apply_belt_fault_debounce(
         self, result: "PipelineResult", *, belt_roi: "np.ndarray"
@@ -1832,6 +1652,7 @@ class MainWindow(QMainWindow):
         # Demo: raise TuchabzugRunning for one simulated cloth cycle, then drop it.
         self._sm.handle_tuchabzug_rising()
         self._on_tuchabzug_rising_row_phase()
+        self._submit_orchestrator_cloth_start()
         self._push_signals_to_opcua()
         QTimer.singleShot(
             max(50, self._cfg.inspection.delay_after_pull_ms),
@@ -1841,6 +1662,7 @@ class MainWindow(QMainWindow):
     def _demo_finish_pulse(self) -> None:
         self._sm.handle_tuchabzug_falling()
         self._on_tuchabzug_falling_row_phase()
+        self._submit_orchestrator_stop_ack()
         self._push_signals_to_opcua()
 
     def _on_force_toggle_tuchabzug(self) -> None:
@@ -1850,9 +1672,11 @@ class MainWindow(QMainWindow):
         if snap.tuchabzug_running:
             self._sm.handle_tuchabzug_falling()
             self._on_tuchabzug_falling_row_phase()
+            self._submit_orchestrator_stop_ack()
         else:
             self._sm.handle_tuchabzug_rising()
             self._on_tuchabzug_rising_row_phase()
+            self._submit_orchestrator_cloth_start()
         self._push_signals_to_opcua()
 
     def _on_save_snapshot(self) -> None:
@@ -2456,16 +2280,12 @@ class MainWindow(QMainWindow):
         self._show_view("inference")
         self._sm.force_reset_to_waiting()
         # Geometry (roi_split_x/transfer_line_x) may have just changed —
-        # any in-flight tracked clusters' tangent_x is relative to the old
+        # any in-flight tracked rows' tangent_x is relative to the old
         # geometry, so discard them rather than risk a stale match/fire.
-        self._cluster_tracker.reset()
-        self._done_piece_tracker.reset()
-        self._last_piece_seen_time = None
-        self._batch_active = False
-        self._batch_start_time = None
-        self._batch_cluster_ids_fired = []
-        self._batch_fire_tangents = []
-        self._batch_overshoots_px = []
+        try:
+            self._orchestrator.start_cycle(self._frame_count)
+        except Exception:  # noqa: BLE001
+            logger.exception("[ORCH-ERROR] orchestrator.start_cycle failed (wizard completed)")
 
     # ---------- OPC UA ----------
 
@@ -2496,16 +2316,48 @@ class MainWindow(QMainWindow):
     # ---------- Production PLC client callbacks ----------
 
     def _on_plc_tuchabzug_change(self, value: bool) -> None:
-        """Called from the PLC polling thread on ext_tuchabzug_status edge."""
+        """Called from the PLC polling thread on ext_tuchabzug_status edge.
+
+        Runs on the PLC worker thread, NOT the GUI thread. It must not
+        mutate orchestrator state directly — it only submit()s events
+        (thread-safe, just appends to a queue); the queued events are
+        processed by drain() on the GUI thread inside
+        _run_transfer_orchestrator, which is what serializes PLC edges
+        against detection events. See viscontrol/core/transfer_orchestrator.py.
+        """
         snap = self._sm.snapshot()
         was = snap.tuchabzug_running
         if value and not was:
             self._sm.handle_tuchabzug_rising()
             self._on_tuchabzug_rising_row_phase()
+            self._submit_orchestrator_cloth_start()
         elif (not value) and was:
             self._sm.handle_tuchabzug_falling()
             self._on_tuchabzug_falling_row_phase()
+            self._submit_orchestrator_stop_ack()
         self._push_signals_to_opcua()
+
+    def _submit_orchestrator_cloth_start(self) -> None:
+        """Submit a PLC_CLOTH_START event (TuchabzugRunning False->True edge,
+        from the PLC worker thread or a demo control). Thread-safe — only
+        enqueues; see TransferOrchestrator.submit/drain."""
+        try:
+            self._orchestrator.submit(self._orchestrator.make_event(
+                TransferEventType.PLC_CLOTH_START, source_frame_id=self._frame_count,
+            ))
+        except Exception:  # noqa: BLE001
+            logger.exception("[ORCH-ERROR] submit PLC_CLOTH_START failed")
+
+    def _submit_orchestrator_stop_ack(self) -> None:
+        """Submit a PLC_STOP_ACK event (TuchabzugRunning True->False edge,
+        from the PLC worker thread or a demo control). Thread-safe — only
+        enqueues; see TransferOrchestrator.submit/drain."""
+        try:
+            self._orchestrator.submit(self._orchestrator.make_event(
+                TransferEventType.PLC_STOP_ACK, source_frame_id=self._frame_count,
+            ))
+        except Exception:  # noqa: BLE001
+            logger.exception("[ORCH-ERROR] submit PLC_STOP_ACK failed")
 
     def _on_plc_error_quit(self, value: bool) -> None:
         """Called from the PLC polling thread on the rising edge of ext_error_quit.
@@ -2580,12 +2432,14 @@ class MainWindow(QMainWindow):
         self._confirmation_tracker.reset()
         self._active_bridge_width_px = 0
         self._detection_zone_outer_x = None
-        # Cluster tracking deliberately persists across TuchabzugRunning
-        # rising/falling edges — dough pieces don't disappear just because
-        # the signal toggles. handle_tuchabzug_falling() already cleared
-        # stop_tuchabzug on the falling edge, so no manual clear is needed
-        # here. See ClusterTracker.reset()'s callers for the events that DO
-        # discontinue tracking (detection disabled, wizard completion).
+        # New TuchabzugRunning pull = new orchestrator cycle: any row still
+        # in-flight from the previous pull is abandoned (reason=
+        # "cycle_restart") rather than silently carried over — see
+        # viscontrol/core/transfer_orchestrator.py: TransferOrchestrator.start_cycle.
+        try:
+            self._orchestrator.start_cycle(self._frame_count)
+        except Exception:  # noqa: BLE001
+            logger.exception("[ORCH-ERROR] orchestrator.start_cycle failed")
         self._clear_sticky_overlay()
         logger.debug("Tracking session reset — new cycle")
 

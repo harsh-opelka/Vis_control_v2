@@ -154,19 +154,24 @@ proximity_clustering:
   enabled: true
   tolerance_px: 150   # gap threshold (px) along tangent_x; live-adjustable in Service > Diagnostics
 
-# DIAGNOSTIC ONLY (visualization + logging): TransferEventTracker, see
-# viscontrol/transfer_event_tracker.py. Tracks a looser cross-frame "transfer
-# event" identity for tuning/debugging transfer-line timing. Completely
-# separate from proximity_clustering/ClusterTracker above — never read by the
-# real StopTuchabzug fire decision.
-transfer_event_tracker:
+# THE SINGLE SOURCE OF TRUTH for row/transfer state and StopTuchabzug
+# firing. See viscontrol/core/transfer_orchestrator.py: TransferOrchestrator.
+# Supersedes the retired ClusterTracker/DonePieceTracker fire path and the
+# diagnostic TransferEventTracker.
+transfer_orchestrator:
   enabled: true
-  event_match_distance_px: 120
-  event_new_row_min_upstream_px: 60
-  event_new_event_group_merge_px: 130
-  event_arm_min_frames: 5
-  event_max_missed_frames: 8
-  event_max_late_overshoot_px: 30
+  # association
+  row_match_distance_px: 120
+  row_group_merge_px: 130
+  row_new_min_upstream_px: 60
+  row_new_min_gap_px: 150       # min separation to create a NEW row
+  # lifecycle
+  row_arm_min_frames: 3
+  row_max_missed_frames: 8
+  row_exit_margin_px: 80
+  # timeouts (seconds)
+  stop_ack_timeout_s: 5.0
+  transfer_complete_timeout_s: 15.0
 
 opcua:
   endpoint: "opc.tcp://0.0.0.0:4840/viscontrol/"

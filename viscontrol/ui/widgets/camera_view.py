@@ -17,6 +17,7 @@ from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPaintEvent, QPen, QPixmap
 from PySide6.QtWidgets import QFrame, QSizePolicy, QVBoxLayout, QWidget, QLabel
 
+from viscontrol.core.transfer_events import OrchestratorSnapshot, RowState
 from viscontrol.detection.base import Detection
 from viscontrol.ui.theme import (
     BORDER,
@@ -61,23 +62,24 @@ class CameraViewState:
     # Detection zone outer boundary (approach side), cloth-local x. Drawn as a
     # distinct orange dashed line with "det.zone" label. None = not drawn.
     detection_zone_outer_x: int | None = None
-    # Cluster-based stop visualization: live count of tracked clusters by
-    # state, e.g. "Clusters: 2 pending, 1 done". None = not drawn. See
-    # MainWindow._apply_cluster_stop_edge / ClusterTracker.
+    # Row-state summary label: four separate counts (raw clusters, active,
+    # transfer-pending, transferred) from the orchestrator snapshot, e.g.
+    # "Raw clusters now: 3  Rows active: 1  Transfer pending: 1  Transferred: 5".
+    # None = not drawn. See viscontrol/core/transfer_orchestrator.py.
     cluster_state_label: str | None = None
     # DIAGNOSTIC/VISUALIZATION ONLY (tangent-based proximity clustering, see
-    # viscontrol/detection/proximity_clustering.py). One entry per cluster:
-    # (front_tangent_x, [(tangent_x, center_y, radius), ...]) in image-local
-    # coords. None/empty = not drawn. An additional overlay layer only —
-    # never affects existing detection/debug overlays or any firing logic.
+    # viscontrol/detection/proximity_clustering.py). One entry per per-frame
+    # TEMPORARY cluster (NOT row identity — see orchestrator_snapshot below
+    # for actual rows): (front_tangent_x, [(tangent_x, center_y, radius), ...])
+    # in image-local coords. None/empty = not drawn. An additional overlay
+    # layer only — never affects existing detection/debug overlays or any
+    # firing logic.
     proximity_clusters: list[tuple[float, list[tuple[float, float, float]]]] | None = None
-    # DIAGNOSTIC/VISUALIZATION ONLY (see viscontrol/transfer_event_tracker.py:
-    # TransferEventTracker). One entry per active tracked transfer event:
-    # (event_id, state, front_tangent, back_tangent) in image-local coords
-    # (same space as proximity_clusters). None/empty = not drawn. A separate
-    # identity model from proximity_clusters above — for tuning/debugging
-    # transfer-line timing only, never affects detection or firing.
-    transfer_events: list[tuple[int, str, float, float]] | None = None
+    # The orchestrator's read-only snapshot (see
+    # viscontrol/core/transfer_events.py: OrchestratorSnapshot). The ONLY
+    # thing the UI ever reads from TransferOrchestrator — never mutated
+    # here. None/empty rows = nothing drawn.
+    orchestrator_snapshot: OrchestratorSnapshot | None = None
     # Fix A (display staleness): whether `detections` came from THIS frame's
     # fresh Hough pass (True) or a reused/cached previous result (False).
     # detection_age_frames is how many frames old the cache is (0 when
@@ -104,13 +106,17 @@ _PROXIMITY_CLUSTER_PALETTE = [
     QColor(0, 220, 220),    # cyan
 ]
 
-# DIAGNOSTIC/VISUALIZATION ONLY: state -> color for the TransferEventTracker
-# overlay (see CameraViewState.transfer_events).
-_TRANSFER_EVENT_COLORS = {
-    "TRACKING": QColor(255, 255, 255),    # white
-    "ARMED": QColor(255, 220, 0),         # yellow
-    "WOULD_FIRE": QColor(40, 255, 90),    # bright green
-    "DONE": QColor(140, 140, 140),        # gray
+# Row state -> color for the orchestrator row overlay (see
+# CameraViewState.orchestrator_snapshot / _draw_rows).
+_ROW_STATE_COLORS = {
+    RowState.DETECTED: QColor(150, 150, 150),         # grey
+    RowState.ACTIVE: QColor(255, 255, 255),           # white
+    RowState.STOP_REQUESTED: QColor(255, 150, 0),     # orange
+    RowState.STOPPED: QColor(230, 50, 50),            # red
+    RowState.TRANSFER_PENDING: QColor(255, 220, 0),   # yellow
+    RowState.TRANSFERRING: QColor(0, 220, 255),       # cyan
+    RowState.TRANSFERRED: QColor(40, 140, 70),        # dim green
+    RowState.ABANDONED: QColor(90, 90, 90),           # dark grey (drawn dashed)
 }
 
 
@@ -299,12 +305,11 @@ class _Canvas(QWidget):
             self._draw_proximity_clusters(p, state.proximity_clusters, dx, dy, sx, sy, pixmap)
         # --- END DIAGNOSTIC ---
 
-        # --- DIAGNOSTIC/VISUALIZATION ONLY: TransferEventTracker overlay
-        # (see viscontrol/transfer_event_tracker.py). Drawn after all
-        # existing overlays so it never hides or interferes with them.
-        if state.transfer_events:
-            self._draw_transfer_events(p, state.transfer_events, dx, dy, sx, sy, pixmap)
-        # --- END DIAGNOSTIC ---
+        # Orchestrator row overlay (see viscontrol/core/transfer_orchestrator.py).
+        # Drawn after all existing overlays so it never hides or interferes
+        # with them. Read-only — this widget never mutates the snapshot.
+        if state.orchestrator_snapshot is not None and state.orchestrator_snapshot.rows:
+            self._draw_rows(p, state.orchestrator_snapshot, dx, dy, sx, sy, pixmap)
 
         # --- DIAGNOSTIC/VISUALIZATION ONLY: Fix D unconfirmed-candidate
         # overlay (see viscontrol/detection/proximity_clustering.py:
@@ -565,8 +570,13 @@ class _Canvas(QWidget):
         viscontrol/detection/proximity_clustering.py). Each cluster gets a
         distinct color (cycling through _PROXIMITY_CLUSTER_PALETTE): its
         pieces' circle outlines are drawn in that color, plus a full-height
-        marker line at the cluster's front tangent_x (its leading piece).
+        marker line at the cluster's front tangent_x (its leading piece),
+        labelled "temp cluster {i}" — a per-frame index, NOT row identity
+        (see CameraViewState.orchestrator_snapshot / _draw_rows for the
+        actual, persistent row identities).
         Read-only — does not affect detection, the tripwire, or firing."""
+        font = QFont()
+        font.setPointSize(max(6, FONT_SMALL - 1))
         for i, (front_tangent_x, pieces) in enumerate(clusters):
             color = _PROXIMITY_CLUSTER_PALETTE[i % len(_PROXIMITY_CLUSTER_PALETTE)]
 
@@ -586,35 +596,41 @@ class _Canvas(QWidget):
             p.setPen(marker_pen)
             fx = dx + front_tangent_x * sx
             p.drawLine(QPointF(fx, dy), QPointF(fx, dy + pixmap.height()))
+            p.setFont(font)
+            p.setPen(color)
+            p.drawText(QPointF(fx + 3, dy + pixmap.height() - 6), f"temp cluster {i}")
 
     @staticmethod
-    def _draw_transfer_events(
+    def _draw_rows(
         p: QPainter,
-        events: list[tuple[int, str, float, float]],
+        snapshot: "OrchestratorSnapshot",
         dx: int,
         dy: int,
         sx: float,
         sy: float,
         pixmap: "QPixmap",
     ) -> None:
-        """DIAGNOSTIC/VISUALIZATION ONLY: TransferEventTracker overlay (see
-        viscontrol/transfer_event_tracker.py). Draws one colored bracket per
-        active event near the top of the ROI (stacked so overlapping events
-        stay readable), color-coded by state, with an "E<id> <STATE>" label.
-        WOULD_FIRE events also get a short vertical tick at their front edge.
-        Read-only — does not affect detection, the tripwire, or firing."""
+        """Orchestrator row overlay (see
+        viscontrol/core/transfer_orchestrator.py: TransferOrchestrator).
+        Draws one colored bracket per row near the top of the ROI (stacked
+        so overlapping rows stay readable), color-coded by RowState, with an
+        "R<display_number> <STATE>" label. Read-only — the snapshot is a
+        deep copy; this widget never mutates orchestrator state and does
+        not affect detection, the tripwire, or firing."""
         font = QFont()
         font.setPointSize(max(6, FONT_SMALL - 1))
-        for i, (event_id, state_name, front_tangent, back_tangent) in enumerate(events):
-            color = _TRANSFER_EVENT_COLORS.get(state_name, QColor(255, 255, 255))
+        for i, row in enumerate(snapshot.rows):
+            color = _ROW_STATE_COLORS.get(row.state, QColor(255, 255, 255))
             y = dy + 40 + i * 16
 
-            x_front = dx + front_tangent * sx
-            x_back = dx + back_tangent * sx
+            x_front = dx + row.front_tangent * sx
+            x_back = dx + row.back_tangent * sx
             x_left, x_right = min(x_front, x_back), max(x_front, x_back)
 
             pen = QPen(color)
             pen.setWidth(3)
+            if row.state == RowState.ABANDONED:
+                pen.setStyle(Qt.PenStyle.DashLine)
             p.setPen(pen)
             p.drawLine(QPointF(x_left, y), QPointF(x_right, y))
             # End caps so the bracket reads clearly even when very narrow.
@@ -623,11 +639,11 @@ class _Canvas(QWidget):
 
             p.setFont(font)
             p.setPen(color)
-            p.drawText(int(x_left), int(y) - 6, f"E{event_id} {state_name}")
+            p.drawText(int(x_left), int(y) - 6, f"R{row.display_number} {row.state.value}")
 
-            if state_name == "WOULD_FIRE":
+            if row.state == RowState.STOP_REQUESTED:
                 tick_y = dy + pixmap.height() / 2.0
-                tick_pen = QPen(_TRANSFER_EVENT_COLORS["WOULD_FIRE"])
+                tick_pen = QPen(_ROW_STATE_COLORS[RowState.STOP_REQUESTED])
                 tick_pen.setWidth(4)
                 p.setPen(tick_pen)
                 p.drawLine(QPointF(x_front, tick_y - 12), QPointF(x_front, tick_y + 12))

@@ -77,15 +77,18 @@ column_learning:
   expected_columns: 8
 proximity_clustering:
   enabled: true
-  tolerance_px: 85
-transfer_event_tracker:
+  tolerance_px: 50
+transfer_orchestrator:
   enabled: true
-  event_match_distance_px: 120.0
-  event_new_row_min_upstream_px: 60.0
-  event_new_event_group_merge_px: 130.0
-  event_arm_min_frames: 5
-  event_max_missed_frames: 8
-  event_max_late_overshoot_px: 30.0
+  row_match_distance_px: 120.0
+  row_group_merge_px: 130.0
+  row_new_min_upstream_px: 60.0
+  row_new_min_gap_px: 150.0
+  row_arm_min_frames: 3
+  row_max_missed_frames: 8
+  row_exit_margin_px: 80.0
+  stop_ack_timeout_s: 5.0
+  transfer_complete_timeout_s: 15.0
 profiles:
 - name: Default
   expected_area_px: 60000

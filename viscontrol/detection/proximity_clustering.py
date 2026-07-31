@@ -119,6 +119,8 @@ class TrackedCluster:
         return min(p.tangent_x for p in self.pieces)
 
 
+# DEPRECATED: superseded by viscontrol/core/transfer_orchestrator.py
+# Retained only for existing tests. Do not use in the fire path.
 class ClusterTracker:
     """Tracks proximity clusters by identity across frames and drives the
     PENDING -> DONE (permanent) lifecycle behind cluster-based StopTuchabzug
@@ -232,6 +234,8 @@ class _DonePiece:
     center_y: float
 
 
+# DEPRECATED: superseded by viscontrol/core/transfer_orchestrator.py
+# Retained only for existing tests. Do not use in the fire path.
 class DonePieceTracker:
     """Tracks individual pieces that belonged to a DONE cluster, by
     identity, so they stay permanently excluded from forming or joining any

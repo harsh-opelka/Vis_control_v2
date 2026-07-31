@@ -47,6 +47,7 @@ from PySide6.QtWidgets import (
 from viscontrol.core.events import Mode, RowPhase, State
 from viscontrol.core.logger import logger
 from viscontrol.core.profiles import ProductProfile
+from viscontrol.core.transfer_events import OrchestratorSnapshot
 from viscontrol.detection.base import Detection
 from viscontrol.io.video_recorder import ViewVideoRecorder
 from viscontrol.ui.theme import (
@@ -435,7 +436,7 @@ class InferenceView(QWidget):
         cluster_state_label: str | None = None,
         debug_mask: np.ndarray | None = None,
         proximity_clusters: list[tuple[float, list[tuple[float, float, float]]]] | None = None,
-        transfer_events: list[tuple[int, str, float, float]] | None = None,
+        orchestrator_snapshot: OrchestratorSnapshot | None = None,
         detection_is_fresh: bool = True,
         detection_age_frames: int = 0,
         unconfirmed_detections: list[tuple[float, float, float, int]] | None = None,
@@ -460,7 +461,7 @@ class InferenceView(QWidget):
                 cluster_state_label=cluster_state_label,
                 debug_mask=debug_mask,
                 proximity_clusters=proximity_clusters,
-                transfer_events=transfer_events,
+                orchestrator_snapshot=orchestrator_snapshot,
                 detection_is_fresh=detection_is_fresh,
                 detection_age_frames=detection_age_frames,
                 unconfirmed_detections=unconfirmed_detections,

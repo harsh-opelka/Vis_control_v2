@@ -1,0 +1,277 @@
+REFACTOR RESULT — structural refactor of the transfer/stop control logic
+Project root: C:\Users\harshkumar.rai\PyCharmMiscProject\Vis_control_v2
+
+============================================================
+FILES CREATED
+============================================================
+viscontrol/core/transfer_events.py       — pure data model (RowState, EventType,
+                                            ClusterObservation, TransferEvent,
+                                            TransferSnapshot, RowRecord,
+                                            OrchestratorSnapshot). No Qt/cv2 imports.
+viscontrol/core/row_associator.py        — RowAssociator + AssociationResult.
+                                            Association only; ports the retired
+                                            TransferEventTracker's interval-distance
+                                            matching + greedy group-merge sweep exactly.
+                                            No Qt/cv2 imports.
+viscontrol/core/transfer_orchestrator.py — TransferOrchestrator: the single source
+                                            of truth for row/transfer state, the
+                                            legal-transition table, the hard
+                                            ownership invariant, and the one
+                                            stop-command call path. No Qt/cv2 imports.
+tests/test_transfer_orchestrator.py      — 10 tests + FakeClock/FakeStopSink/
+                                            RecordingLogger test infrastructure.
+refactor_inventory.txt                   — STEP 0 deliverable (grep inventory,
+                                            written before any code was changed).
+refactor_result.txt                      — this file.
+
+============================================================
+FILES MODIFIED
+============================================================
+viscontrol/ui/main_window.py
+  - Deleted _apply_cluster_stop_edge() in its entirety (incl. the
+    ACTIVE-TARGET FIRE block) and its two dead-after-deletion helpers
+    (_log_state, _log_fire_trace, only ever called from that method).
+  - Added _run_transfer_orchestrator(self, r, profile), called from the
+    same Hough-gated call site (where _apply_cluster_stop_edge used to be
+    called, immediately after _track_row_phase).
+  - Constructed self._orchestrator = TransferOrchestrator(...) in __init__,
+    with a local _orchestrator_stop_sink closure as stop_command_sink.
+  - Removed self._cluster_tracker / self._done_piece_tracker (construction,
+    resets, and all call sites) and the batch/idle-bookkeeping fields whose
+    only consumer was the deleted method (_last_piece_seen_time,
+    _batch_active, _batch_start_time, _batch_cluster_ids_fired,
+    _batch_fire_tangents, _batch_overshoots_px).
+  - Removed self.transfer_tracker (TransferEventTracker construction,
+    shutdown call, ClusterSnapshot-building block, the FIRE-DECISION-CONFLICT
+    diagnostic that depended on it) — replaced by orchestrator.snapshot()
+    for display and orchestrator.shutdown() at the same shutdown call site.
+  - _track_row_phase(): inspected in full — confirmed it mutates no
+    transfer/row/stop state (see refactor_inventory.txt GREP 4). Left
+    unchanged; still runs every Hough frame for its RowPhase/belt-fault-
+    debounce/transfer-timeout bookkeeping.
+  - _on_plc_tuchabzug_change (the attach_plc_client callback, runs on the
+    PLC worker thread): now also calls the new
+    _submit_orchestrator_cloth_start()/_submit_orchestrator_stop_ack()
+    helpers (thread-safe — only orchestrator.submit(), never mutates
+    orchestrator state directly) on the same rising/falling edges it
+    already detects via the SM snapshot.
+  - _reset_tracking_session() (TuchabzugRunning rising edge): now also
+    calls self._orchestrator.start_cycle(self._frame_count) — a new
+    TuchabzugRunning pull is a new orchestrator cycle; any row still
+    in-flight from the previous pull is ABANDONED (reason="cycle_restart")
+    rather than silently persisted, matching the new per-cycle row model.
+  - _disable_detection() and the wizard-completion geometry-change handler:
+    replaced their ClusterTracker/DonePieceTracker .reset() calls with
+    self._orchestrator.start_cycle(self._frame_count) (same "genuinely
+    discontinuous event" semantics as before).
+  - Display block: builds _orchestrator_snapshot = self._orchestrator.snapshot()
+    (try/except-wrapped) and passes it to set_cloth_frame(orchestrator_snapshot=...)
+    instead of the old transfer_events overlay list. The row-count label
+    (_cluster_state_label) now reads four separate values off the snapshot
+    (raw_cluster_count, rows_active, rows_transfer_pending, rows_transferred)
+    instead of counting ClusterTracker.tracked by state.
+  - Imports: added viscontrol.core.transfer_events.{ClusterObservation,
+    EventType as TransferEventType}, viscontrol.core.transfer_orchestrator.
+    TransferOrchestrator; removed ClusterTracker/DonePieceTracker and the
+    transfer_event_tracker import. cluster_by_tangent/pieces_from_detections
+    stay imported (still used, now feeding the orchestrator instead).
+
+viscontrol/detection/proximity_clustering.py
+  - ClusterTracker and DonePieceTracker each got a
+    "# DEPRECATED: superseded by viscontrol/core/transfer_orchestrator.py.
+    Retained only for existing tests. Do not use in the fire path." comment
+    per STEP 5d. cluster_by_tangent() itself is untouched (constraint).
+  - Note: grep of tests/ at STEP 0 found ZERO existing tests referencing
+    ClusterTracker/DonePieceTracker/get_active_target — the "retained only
+    for existing tests" premise in the instructions doesn't hold today, but
+    the classes were kept (not deleted) exactly as STEP 5d specified.
+
+viscontrol/ui/views/inference_view.py
+  - set_cloth_frame(): transfer_events param replaced with
+    orchestrator_snapshot: OrchestratorSnapshot | None.
+
+viscontrol/ui/widgets/camera_view.py
+  - CameraViewState.transfer_events -> orchestrator_snapshot: OrchestratorSnapshot | None.
+  - _TRANSFER_EVENT_COLORS -> _ROW_STATE_COLORS (keyed by RowState, colors
+    exactly per STEP 7c: DETECTED grey, ACTIVE white, STOP_REQUESTED orange,
+    STOPPED red, TRANSFER_PENDING yellow, TRANSFERRING cyan, TRANSFERRED dim
+    green, ABANDONED dark grey/dashed).
+  - _draw_transfer_events() deleted; replaced by _draw_rows(painter, snapshot)
+    (same bracket-plus-label visual language, one bracket per row, labelled
+    "R<display_number> <STATE>", dashed for ABANDONED, a tick at
+    STOP_REQUESTED's front edge in place of the old WOULD_FIRE tick).
+  - _draw_proximity_clusters() kept; now also draws a "temp cluster {i}"
+    text label per cluster so the per-frame index is visibly NOT row identity.
+
+config/default.yaml, config/local.yaml, viscontrol/core/config.py
+  - Removed the orphaned transfer_event_tracker: section/model (nothing
+    would have read it after the .py file was deleted) and added
+    transfer_orchestrator: with exactly the STEP 8 fields (enabled,
+    row_match_distance_px, row_group_merge_px, row_new_min_upstream_px,
+    row_new_min_gap_px, row_arm_min_frames, row_max_missed_frames,
+    row_exit_margin_px, stop_ack_timeout_s, transfer_complete_timeout_s).
+
+============================================================
+FILES DELETED
+============================================================
+viscontrol/transfer_event_tracker.py — its association/grouping algorithm
+now lives in viscontrol/core/row_associator.py; its diagnostic overlay is
+replaced by the orchestrator-snapshot-driven row overlay.
+
+============================================================
+THE CONFIRMED SINGLE STOP CALL PATH
+============================================================
+    TransferOrchestrator._request_stop()   [transfer_orchestrator.py:~460]
+        -> self._stop_command_sink(row.snapshot)   (exactly one call site
+                                                     in the whole class)
+        == MainWindow._orchestrator_stop_sink       [main_window.py:235]
+            -> self._sm.handle_stop_tuchabzug_trigger()
+            -> self._push_signals_to_opcua()
+            -> self._request_plc_stop_pulse()
+                -> self._plc.send_stop_pulse()      [main_window.py:2386]
+                    -> PlcClient.send_stop_pulse() -> queued -> worker
+                       thread -> PlcClient._do_stop_pulse() writes
+                       ext_tuchabzug_stop=True on the real OPC UA node.
+
+Verified by grep (see STEP 10 output below): exactly one call site each of
+`self._sm.handle_stop_tuchabzug_trigger()` (main_window.py:236) and
+`self._plc.send_stop_pulse()` (main_window.py:2386) in the whole viscontrol/
+tree, both inside/behind _orchestrator_stop_sink.
+
+    $ grep -rn "send_stop_pulse\|handle_stop_tuchabzug_trigger" viscontrol/
+    viscontrol/core/state_machine.py:148:    def handle_stop_tuchabzug_trigger(self) -> bool:
+    viscontrol/io/plc_client.py:69:    def send_stop_pulse(self) -> None: ...
+    viscontrol/io/plc_client.py:84:    def send_stop_pulse(self) -> None:
+    viscontrol/io/plc_client.py:186:    def send_stop_pulse(self) -> None:
+    viscontrol/ui/main_window.py:236:            self._sm.handle_stop_tuchabzug_trigger()
+    viscontrol/ui/main_window.py:2386:            self._plc.send_stop_pulse()
+    viscontrol/ui/main_window.py:2388:            logger.exception("plc.send_stop_pulse failed")
+
+(The plc_client.py hits are the interface/implementation definitions, not
+callers; the state_machine.py hit is the method definition. main_window.py:236
+is the sole production caller of each, inside _orchestrator_stop_sink.)
+
+============================================================
+DELETED FIRE PATHS
+============================================================
+1. MainWindow._apply_cluster_stop_edge() — the entire method, including the
+   ACTIVE-TARGET FIRE block that called self._cluster_tracker.mark_done(),
+   self._done_piece_tracker.mark_done(), self._sm.handle_stop_tuchabzug_trigger(),
+   and self._request_plc_stop_pulse().
+2. self._cluster_tracker (ClusterTracker) and self._done_piece_tracker
+   (DonePieceTracker) — removed from MainWindow entirely (construction,
+   resets, all call sites). The classes remain in proximity_clustering.py,
+   marked DEPRECATED, but nothing in the fire path uses them anymore.
+3. viscontrol/transfer_event_tracker.py (TransferEventTracker) — deleted
+   outright, along with every import of it, the shutdown call, the
+   ClusterSnapshot-construction block, and the FIRE-DECISION-CONFLICT
+   diagnostic that read its output. It was diagnostic-only even before
+   this refactor (confirmed in refactor_inventory.txt), so its removal is
+   a pure cleanup with no fire-path behavior change of its own.
+4. _log_state()/_log_fire_trace() — dead code once their only caller
+   (_apply_cluster_stop_edge) was deleted.
+5. The idle/batch "CYCLE-SUMMARY" logging mechanism (_batch_active and
+   friends) — its only consumer was the deleted method; superseded by the
+   orchestrator's own CYCLE-START/ROW-CREATE/STOP-COMMAND/TRANSFER-COMPLETE/
+   CYCLE-END structured logging.
+
+============================================================
+TEST RESULTS
+============================================================
+tests/test_transfer_orchestrator.py — 10/10 PASSED:
+    test_sequential_three_rows
+    test_duplicate_crossing_blocked
+    test_out_of_order_plc_callback
+    test_old_cycle_event_rejected
+    test_display_removal_does_not_change_identity
+    test_transfer_snapshot_is_row_scoped
+    test_cluster_split_merge_preserves_identity
+    test_deterministic_under_shuffled_ordering  (100 shuffled runs, identical
+                                                  final row table + sink-call
+                                                  count every time)
+    test_detection_miss_never_transfers
+    test_invariant_never_violated
+
+Full suite: `pytest tests/ -v` -> 74 passed, 5 failed (see below), in 2.75s.
+
+The 5 failures are ALL in tests/test_detection.py and ALL pre-existing,
+unrelated to this refactor:
+    test_pipeline_cloth_tracking_crossing_moved_to_mainwindow
+    test_pipeline_cloth_tracking_no_crossing
+    test_pipeline_cloth_tracking_handles_misconfigured_transfer_line
+    test_learn_reference_median_geometry
+    test_learn_reference_requires_minimum_samples
+They fail with TypeError on InspectionPipeline.run_cloth_tracking()/
+learn_reference() argument-signature mismatches — code this refactor's
+constraints explicitly forbid touching (Hough parameters, ClassicalDetector,
+InspectionPipeline). `git status` confirms tests/test_detection.py,
+viscontrol/detection/pipeline.py, and viscontrol/detection/calibration.py
+were not modified by any command in this session, so these failures predate
+the refactor and are out of scope.
+
+============================================================
+DELIBERATE DEVIATIONS FROM THE LITERAL SPEC TEXT (with reasons)
+============================================================
+1. TransferEvent carries no transfer_x field, but the orchestrator's
+   OBSERVATION processing needs the current transfer-line x every frame.
+   Added TransferOrchestrator.set_transfer_x(x) (thread-safe, lock-guarded)
+   and RowRecord.prev_front_tangent (needed for the tripwire-crossing
+   check the spec itself describes: "Store prev_front_tangent on the row
+   before updating it"). Both are small, structurally necessary additions,
+   not scope creep.
+2. STEP 6d said "clear self._prev_tuchabzug_running" from
+   _reset_tracking_session(). Implemented literally, this would have
+   broken the EXISTING rising-edge detection in _on_frame (which sets
+   self._prev_tuchabzug_running = True immediately before calling
+   _reset_tracking_session(), so clearing it back to False there would
+   make the next frame's read look like a fresh rising edge again,
+   re-triggering start_cycle() every frame while TuchabzugRunning stays
+   True). Instead, the new PLC_CLOTH_START/PLC_STOP_ACK submission reuses
+   the `was`/`value` snapshot comparison _on_plc_tuchabzug_change already
+   computes for its own rising/falling-edge detection — no new/second
+   `_prev_tuchabzug_running` tracker was introduced, so there is nothing
+   to "clear" and no field conflict.
+3. Demo mode has no PlcClient, so _on_simulate_pulse/_demo_finish_pulse/
+   _on_force_toggle_tuchabzug — the demo-mode equivalents of the PLC
+   rising/falling edge — were also wired to call the same
+   _submit_orchestrator_cloth_start()/_submit_orchestrator_stop_ack()
+   helpers. Without this, every row driven in demo mode would sit at
+   STOP_REQUESTED until stop_ack_timeout_s and ABANDON instead of ever
+   transferring, since nothing would ever submit the PLC_STOP_ACK/
+   PLC_CLOTH_START events demo mode needs. Not in the literal STEP 6
+   snippets (which only show the PLC worker-thread callback), but
+   necessary for the orchestrator to function at all in demo mode.
+4. Test 2 (duplicate_crossing_blocked) and part of Test 10 call
+   TransferOrchestrator._request_stop() directly (white-box) a second time
+   after a normal crossing already fired once. The FSM design (a row
+   leaves ACTIVE the instant it's stopped, and only ACTIVE rows are
+   tripwire-evaluated) makes it structurally impossible for the *normal*
+   per-frame processing path to invoke _request_stop() twice for the same
+   row — which is the correct, stronger guarantee. The STOP-DUPLICATE-BLOCKED
+   guard inside _request_stop() is a defense-in-depth safety net for that
+   "should never happen" case, so the test exercises it directly rather
+   than fabricating an artificial frame sequence that fights the FSM's own
+   design to reach the same code path.
+5. Row creation's `track_id` is set equal to `row_id` (RowAssociator does
+   its own identity tracking via row matching; there is no separate
+   sub-row association layer in this design), matching STEP 1's
+   RowRecord.track_id doc ("stable association track id") without
+   inventing an unused second identity space.
+6. The CYCLE-END log prefix (used by shutdown()'s summary) isn't in
+   STEP 4's explicit prefix list, which is read as "these must all appear
+   somewhere," not "only these may ever appear" — shutdown() needed *some*
+   structured summary line, and CYCLE-END (already an EventType value)
+   was the natural choice.
+
+============================================================
+NOTHING WAS LEFT INCOMPLETE
+============================================================
+All 10 steps were completed as specified, modulo the deviations listed
+above (each justified by a genuine correctness or functionality
+requirement, not convenience). A handful of historical comments elsewhere
+in the codebase (proximity_clustering.py, row_grouping.py, column_learning.py,
+config.py docstrings) still mention `MainWindow._apply_cluster_stop_edge`
+by name as descriptive prose about what ClusterTracker/DonePieceTracker
+used to be for — these are comment-only, do not affect behavior, and were
+left as-is rather than rewriting unrelated file's historical documentation
+beyond what the constraints asked for.

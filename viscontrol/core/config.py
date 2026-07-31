@@ -441,48 +441,64 @@ class _ProximityClusteringSection(BaseModel):
     )
 
 
-class _TransferEventTrackerSection(BaseModel):
-    """DIAGNOSTIC (visualization + logging only): TransferEventTracker (see
-    viscontrol/transfer_event_tracker.py). Tracks a looser, cross-frame
-    "transfer event" identity for tuning/debugging the transfer line
-    behavior — completely separate from ClusterTracker and never read by the
-    real StopTuchabzug fire decision (MainWindow._apply_cluster_stop_edge).
+class _TransferOrchestratorSection(BaseModel):
+    """THE SINGLE SOURCE OF TRUTH for row/transfer state (see
+    viscontrol/core/transfer_orchestrator.py: TransferOrchestrator). Owns
+    row identity, the row lifecycle state machine, and the single call path
+    to StopTuchabzug. Supersedes the retired ClusterTracker/DonePieceTracker
+    fire path and the diagnostic TransferEventTracker.
     """
 
     enabled: bool = Field(
         True,
         description=(
-            "Master on/off. When False, the tracker is not instantiated and "
-            "not called — zero overhead, zero behavior change."
+            "Master on/off. When False, _run_transfer_orchestrator returns "
+            "immediately and NO stop is ever issued (fail-safe: the machine "
+            "simply does not stop — there is no fallback to the retired "
+            "fire path)."
         ),
     )
-    event_match_distance_px: float = Field(
+    row_match_distance_px: float = Field(
         120, ge=0,
-        description="Max interval gap between a cluster's and an event's tangent_x range to count as a match.",
+        description="Max interval gap between an observation's and a row's tangent_x range to count as a match.",
     )
-    event_new_row_min_upstream_px: float = Field(
-        60, ge=0,
-        description="An unmatched cluster must have front_tangent > transfer_x + this to seed a new event.",
-    )
-    event_new_event_group_merge_px: float = Field(
+    row_group_merge_px: float = Field(
         130, ge=0,
         description=(
-            "Max interval distance between two unmatched upstream clusters for them to be "
-            "grouped into a single new TransferEvent (one physical row). Separate from "
-            "event_match_distance_px, which matches clusters to already-existing events."
+            "Max interval distance between two unmatched upstream observations for them to be "
+            "grouped into a single new row candidate (one physical multi-column row)."
         ),
     )
-    event_arm_min_frames: int = Field(
-        5, ge=1,
-        description="Minimum observed_frames before a TRACKING event can become ARMED.",
+    row_new_min_upstream_px: float = Field(
+        60, ge=0,
+        description="An unmatched observation must have front_tangent > transfer_x + this to seed a new row.",
     )
-    event_max_missed_frames: int = Field(
+    row_new_min_gap_px: float = Field(
+        150, ge=0,
+        description=(
+            "Minimum interval-distance separation from every existing non-terminal row for an "
+            "unmatched observation to become a new row candidate — prevents adjacent rows merging."
+        ),
+    )
+    row_arm_min_frames: int = Field(
+        3, ge=1,
+        description="Minimum confirmed_upstream_frames before a DETECTED row can become ACTIVE.",
+    )
+    row_max_missed_frames: int = Field(
         8, ge=1,
-        description="Drop an event after this many consecutive frames with no matching cluster.",
+        description="A DETECTED or ACTIVE row is ABANDONED after this many consecutive missed frames.",
     )
-    event_max_late_overshoot_px: float = Field(
-        30, ge=0,
-        description="Documents how close to/past the line an unmatched cluster can be and still be IGNORE-LATE rather than a new event.",
+    row_exit_margin_px: float = Field(
+        80, ge=0,
+        description="A TRANSFERRING row becomes TRANSFERRED once front_tangent < transfer_x - this.",
+    )
+    stop_ack_timeout_s: float = Field(
+        5.0, ge=0,
+        description="A STOP_REQUESTED row is ABANDONED if the PLC never acknowledges within this many seconds.",
+    )
+    transfer_complete_timeout_s: float = Field(
+        15.0, ge=0,
+        description="Safety-net timeout: a TRANSFERRING row is forced to TRANSFERRED after this many seconds.",
     )
 
 
@@ -540,7 +556,7 @@ class AppConfig(BaseModel):
     detection: _DetectionSection = Field(default_factory=_DetectionSection)
     column_learning: _ColumnLearningSection = Field(default_factory=_ColumnLearningSection)
     proximity_clustering: _ProximityClusteringSection = Field(default_factory=_ProximityClusteringSection)
-    transfer_event_tracker: _TransferEventTrackerSection = Field(default_factory=_TransferEventTrackerSection)
+    transfer_orchestrator: _TransferOrchestratorSection = Field(default_factory=_TransferOrchestratorSection)
     profiles: list[ProductProfile] = Field(default_factory=list)
     opcua: _OpcuaSection = Field(default_factory=_OpcuaSection)
     web: _WebSection = Field(default_factory=_WebSection)
