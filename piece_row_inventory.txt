@@ -1,0 +1,331 @@
+STEP 0 — INSPECTION REPORT
+==========================
+(Generated before any code changes. All field names below are copy-checked
+from the actual source files, not assumed.)
+
+
+A. REAL FIELD NAMES
+--------------------
+
+viscontrol/detection/base.py — Detection dataclass:
+    bbox: tuple[int, int, int, int]      # (x, y, w, h) pixel coords
+    centroid: tuple[float, float]        # (cx, cy)
+    area_px: int
+    width_px: int
+    height_px: int
+    confidence: float
+    label: str                           # "single" | "row_fused" | "column_fused" | "unknown"
+    circularity: float = 0.0
+    solidity: float = 0.0
+    # property: is_fault -> label in ("row_fused", "unknown")
+  NOTE: Detection has NO center_x/center_y/radius fields directly. Those are
+  derived via adapters (see below). "radius" as used throughout the fire
+  path is ALWAYS max(width_px, height_px) / 2.
+
+viscontrol/detection/proximity_clustering.py — Piece (NamedTuple), the shape
+cluster_by_tangent actually consumes:
+    center_x: float
+    center_y: float
+    radius: float
+  Built by pieces_from_detections(detections) via:
+    cx, cy = d.centroid
+    radius = max(float(d.width_px or 0.0), float(d.height_px or 0.0)) / 2.0
+
+  ClusteredPiece (dataclass, augmented with tangent_x):
+    tangent_x: float   # = center_x - radius
+    center_x: float
+    center_y: float
+    radius: float
+
+  UnconfirmedPiece (dataclass, from PieceConfirmationTracker):
+    center_x: float
+    center_y: float
+    radius: float
+    fresh_count: int
+
+  There is no separate "Piece" class beneath a "pieces_from_detections"
+  concept beyond this NamedTuple — PieceTracker's RawDetection (STEP 1) will
+  mirror this exact field naming: center_x, center_y, radius.
+
+viscontrol/core/transfer_events.py — ClusterObservation (frozen dataclass),
+the CURRENT input to TransferOrchestrator (soon replaced by
+StableRowObservation, same front/back naming convention):
+    front_tangent: float   # min tangent_x (leading edge)
+    back_tangent: float    # max tangent_x (trailing edge)
+    piece_count: int
+    center_y: float        # logged only, NEVER used for matching
+    temp_cluster_index: int  # per-frame index only, NOT identity
+
+  RowRecord (mutable dataclass) — the orchestrator's own per-row state:
+    row_id: int             # PERMANENT, never reused, never an index
+    cycle_id: int
+    track_id: int           # stable association-identity id (see part C)
+    display_number: int
+    state: RowState
+    front_tangent: float
+    back_tangent: float
+    first_seen_frame: int
+    last_seen_frame: int
+    confirmed_upstream_frames: int
+    missed_frames: int
+    prev_front_tangent: float = 0.0
+    stop_event_id / transfer_event_id / snapshot / created_at / ...
+    history: list
+
+  IMPORTANT: RowRecord ALREADY HAS a `track_id` field. In the current model
+  `_create_row` sets `track_id=row_id` verbatim ("association identity ==
+  row identity in this model" — see transfer_orchestrator.py line ~435).
+  STEP 3's instruction to "Add row_track_id: int to RowRecord if not already
+  present; it MUST equal the RowTracker row_id" is satisfied by REUSING the
+  existing `track_id` field for this purpose (set track_id = obs.row_id on
+  create) rather than adding a duplicate field — tests/test_transfer_orchestrator.py
+  already asserts on `row.track_id` extensively, so the field must keep its
+  name.
+
+
+B. TransferOrchestrator.make_event SIGNATURE / ClusterObservation CONSTRUCTION
+--------------------------------------------------------------------------------
+
+TransferOrchestrator.make_event signature (transfer_orchestrator.py:100-120):
+
+    def make_event(
+        self,
+        event_type: EventType,
+        source_frame_id: int,
+        observations: tuple = (),
+        row_id: int | None = None,
+    ) -> TransferEvent:
+        # assigns event_id, stamps cycle_id + now_fn(), thread-safe
+
+Current ClusterObservation construction in main_window.py
+(_run_transfer_orchestrator, lines ~1486-1501):
+
+    clusters = cluster_by_tangent(_confirmed_pieces, tolerance_px)
+    observations = tuple(
+        ClusterObservation(
+            front_tangent=c.front_tangent_x,
+            back_tangent=max(p.tangent_x for p in c.pieces),
+            piece_count=len(c.pieces),
+            center_y=sum(p.center_y for p in c.pieces) / len(c.pieces),
+            temp_cluster_index=i,
+        )
+        for i, c in enumerate(clusters)
+    )
+    self._orchestrator.set_transfer_x(transfer_x)
+    evt = self._orchestrator.make_event(
+        TransferEventType.OBSERVATION, source_frame_id=self._frame_count,
+        observations=observations,
+    )
+    self._orchestrator.submit(evt)
+    self._orchestrator.drain()
+
+This whole block (STEP 5b) is replaced by the PieceTracker -> RowTracker ->
+StableRowObservation pipeline. `observations=tuple(stable_rows)` takes the
+place of `observations=observations` above; make_event's signature is
+UNCHANGED (observations: tuple already accepts any tuple of objects — the
+orchestrator only reads .front_tangent/.back_tangent/.piece_count/.row_id
+off whatever it's given, per STEP 3c).
+
+
+C. EVERY PLACE RowAssociator IS IMPORTED OR CALLED
+----------------------------------------------------
+
+Grep for "RowAssociator|row_associator" across the repo (excluding this
+report and refactor_inventory.txt/refactor_result.txt, which are historical
+docs from a PRIOR refactor and not code):
+
+  viscontrol/core/transfer_orchestrator.py
+      line 23:  from viscontrol.core.row_associator import RowAssociator
+      line 78:  self._associator = RowAssociator(cfg)          (__init__)
+      line 175: self._associator.reset()                        (start_cycle)
+      line 259: result = self._associator.associate(...)        (_process_observation)
+
+  viscontrol/core/row_associator.py
+      — the module itself (to be deleted).
+
+  tests/test_transfer_orchestrator.py
+      — does NOT import RowAssociator directly; it only imports
+        ClusterObservation/EventType/RowState/TransferOrchestrator. No direct
+        RowAssociator references in the test file itself (confirmed by
+        grep — it only shows up via TransferOrchestrator's docstring
+        mentioning "RowAssociator" is not present; the earlier grep hit on
+        this file was for "ClusterObservation", not RowAssociator — see
+        below). Re-checked: grep for literal "RowAssociator" only matches
+        transfer_orchestrator.py and row_associator.py in production code.
+
+  No UI file, no other core file, and no other test file imports or
+  constructs RowAssociator. Deletion surface is exactly:
+    - viscontrol/core/row_associator.py (delete file)
+    - transfer_orchestrator.py: the import line, the `self._associator`
+      attribute, its use in start_cycle() and _process_observation()
+
+  ClusterObservation is imported by:
+    viscontrol/core/row_associator.py       (to be deleted)
+    viscontrol/core/transfer_events.py      (definition — KEEP, mark deprecated)
+    viscontrol/core/transfer_orchestrator.py (docstring reference only)
+    viscontrol/ui/main_window.py            (constructs it in _run_transfer_orchestrator — to be replaced)
+    tests/test_transfer_orchestrator.py     (the `obs()` helper builds ClusterObservation — STEP 9 requires
+                                              converting these to StableRowObservation)
+
+
+D. WHERE transfer_x IS COMPUTED / WHETHER IT IS ROI-RELATIVE
+----------------------------------------------------------------
+
+main_window.py, _run_transfer_orchestrator (line ~1431):
+
+    transfer_x = float(profile.transfer_line_x - profile.roi_split_x)
+
+`profile.transfer_line_x` and `profile.roi_split_x` are both FULL-FRAME
+(original camera image) pixel coordinates (see profiles.py / set_roi_info
+in inference_view.py: "All three arguments are in FULL-FRAME coordinates").
+Subtracting roi_split_x converts to CLOTH-ROI-LOCAL coordinates — i.e. YES,
+transfer_x is ROI-relative (specifically cloth-ROI-relative), and this is
+the SAME coordinate space that front_tangent/back_tangent/tangent_x/
+center_x all already live in (Detection.centroid is produced by the
+detector already operating on the cloth ROI crop, per InspectionPipeline).
+No further coordinate transform is needed anywhere in PieceTracker/
+RowTracker — they consume detections already in this space.
+
+`self._orchestrator.set_transfer_x(transfer_x)` is called once per fresh
+frame, immediately before make_event/submit/drain, and this call ordering
+must be preserved (STEP 5 pipeline keeps this immediately before building
+the event).
+
+
+E. EXISTING MEDIAN PIECE DIAMETER UTILITY
+--------------------------------------------
+
+viscontrol/detection/row_grouping.py: median_piece_diameter(detections) DOES
+exist and is currently live (imported into main_window.py, used for the
+bridge-width overlay):
+
+    def median_piece_diameter(detections: Sequence[Any]) -> float:
+        """Median detected piece diameter (mean of width_px/height_px per piece)."""
+        diams = []
+        for d in detections:
+            w = float(getattr(d, "width_px", 0.0) or 0.0)
+            h = float(getattr(d, "height_px", 0.0) or 0.0)
+            if w > 0.0 and h > 0.0:
+                diams.append((w + h) / 2.0)
+            elif w > 0.0 or h > 0.0:
+                diams.append(max(w, h))
+        if not diams:
+            return 0.0
+        return statistics.median(diams)
+
+CAVEAT: this function duck-types on `.width_px`/`.height_px` (raw Detection
+objects), NOT on `.radius` (PieceTrack objects). RowTracker's STEP 2a spec
+explicitly says `median_diameter = median(2 * track.radius) over all live
+tracks` — a different input shape. Rather than force PieceTrack through a
+width_px/height_px shim (and violate the "no cv2/Qt-shaped duck typing"
+cleanliness of the new pure module), RowTracker will compute this median
+inline with `statistics.median` directly over `2 * track.radius`, matching
+the literal spec. `median_piece_diameter` itself is untouched and keeps
+serving its existing caller (the bridge-width overlay in main_window.py) —
+row_grouping.py is out of scope for this refactor per the CONSTRAINTS
+section (only proximity_clustering.py/classical.py/pipeline.py Hough params
+are explicitly protected, but row_grouping.py is also never touched by any
+STEP below).
+
+
+F. CURRENT PER-FRAME GATING — "Hough ran this frame" / reaching
+   _run_transfer_orchestrator
+---------------------------------------------------------------------
+
+main_window.py _on_frame (abbreviated control flow):
+
+  _hough_ran_this_frame = False   # set True only on an actual fresh Hough pass
+
+  if self._detection_enabled and self._sm.state != State.SERVICE:
+      snap = self._sm.snapshot()
+      ...
+      if snap.tuchabzug_running:
+          if _is_rising_edge:
+              self._reset_tracking_session()      # new cycle: orchestrator.start_cycle(...)
+
+          _hough_due = (
+              (_now_mono - self._last_hough_time) >= hough_interval_s
+              and self._frame_count % tripwire_check_interval == 0
+          )
+          # stagger vs. belt inspection (deferred by one frame unless overdue)
+          if _hough_due and _belt_due_this_frame and not_overdue:
+              _hough_due = False
+
+          if _hough_due:
+              _detection_ran = True
+              self._last_hough_time = _now_mono
+              r = self._pipeline.run_cloth_tracking(frame, profile, ...)
+              _hough_ran_this_frame = True
+              self._last_hough_frame_count = self._frame_count
+              self._cached_cloth_detections = r.detections
+              ...
+              self._track_row_phase(r, profile)
+              self._run_transfer_orchestrator(r, profile)   # <-- ONLY call site
+          else:
+              # Hough not due: reuse cached cloth results for display only.
+              cloth_detections = self._cached_cloth_detections
+              ...
+
+CONCLUSION: `_run_transfer_orchestrator(r, profile)` is called EXACTLY ONCE
+per `_on_frame` invocation, and ONLY inside the `if _hough_due:` branch —
+i.e. only on frames where Hough actually ran and produced a fresh result
+(`r.detections` is this frame's fresh output). It is never called on cached/
+reused detections. This means the STEP 1 "freshness contract" (PieceTracker.
+update() must only ever see fresh Hough results) is ALREADY satisfied by
+this call site with zero additional gating needed in main_window.py — the
+existing structure already guarantees it. `self._frame_count` at the point
+of the call is the correct frame_id to pass through to
+PieceTracker.update()/RowTracker.update()/DetectionRecorder.record().
+
+Additional gates that already run BEFORE reaching PieceTracker in the new
+pipeline (STEP 5) and must keep dropping detections before they arrive:
+  1. Fix E ROI Y-sanity filter (self._cfg.detection.roi_valid_y_min/max)
+  2. Fix D PieceConfirmationTracker.update() (min_fresh_confirmations gate)
+Both already operate on `Piece` (center_x/center_y/radius) objects via
+`pieces_from_detections`, so RawDetection construction in STEP 5b happens
+AFTER these two gates, from `_confirmed_pieces` — exactly mirroring where
+`cluster_by_tangent(_confirmed_pieces, tolerance_px)` is called today.
+
+
+OTHER NOTES CARRIED FORWARD INTO LATER STEPS
+----------------------------------------------
+
+- TransferOrchestrator._process_observation currently does:
+    self._last_raw_cluster_count = len(event.observations)
+  This becomes len(stable_rows) once StableRowObservation replaces
+  ClusterObservation as the tuple's element type — still meaningful (it's
+  the CONFIRMED+LOCKED row count now, not a raw per-frame cluster count).
+  The UI label build in main_window.py (~line 1126) that reads
+  `raw_cluster_count` needs to change wording since it's no longer a "raw"
+  count — see STEP 8 UI section of the main task (Raw clusters vs Live
+  pieces vs Stable rows must never be conflated in one field, per spec).
+
+- inference_view.py / camera_view.py currently take `orchestrator_snapshot:
+  OrchestratorSnapshot | None`, `cluster_state_label: str | None`,
+  `proximity_clusters: list[...] | None`, `unconfirmed_detections: list[...]
+  | None` — all passed via InferenceView.set_cloth_frame(...) ->
+  CameraViewState. STEP 8 adds two more overlay channels (PieceTrack labels,
+  RowGroup brackets) following this exact same pattern (a new
+  CameraViewState field + a new `_draw_*` method in _Canvas, wired through
+  set_cloth_frame's kwargs).
+
+- No test file currently imports/tests row_associator.py in isolation
+  (no tests/test_row_associator.py exists) — deleting it requires editing
+  only transfer_orchestrator.py and tests/test_transfer_orchestrator.py
+  (the latter only insofar as STEP 9 asks to swap ClusterObservation ->
+  StableRowObservation in its `obs()` helper and assertions, not because it
+  references RowAssociator directly).
+
+- Logger interface (viscontrol/core/logger.py): a thin loguru re-export.
+  Existing call convention throughout the codebase is
+  `logger.<level>("... {} ...", arg1, arg2, ...)` (loguru's own {}-style
+  positional formatting) — PIECE/ROW logging in STEP 6 will follow this same
+  convention (pass the format string + positional args directly to
+  logger.debug/info/warning, not pre-formatted strings), matching every
+  existing call site in main_window.py. The one exception in the codebase is
+  TransferOrchestrator._log, which pre-formats into a single string before
+  calling logger.<level>(line) — either style is compatible with the
+  RecordingLogger test fake used in tests/test_transfer_orchestrator.py
+  (FakeLogger.<level>(msg, *args) calls msg.format(*args) if args else msg).
+
+END OF STEP 0 REPORT.

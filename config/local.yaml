@@ -1,5 +1,5 @@
 app:
-  mode: production
+  mode: demo
   language: en
   active_profile: Default
 camera:

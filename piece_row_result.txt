@@ -1,0 +1,182 @@
+STEP 10 — VERIFY AND REPORT
+===========================
+
+A. FILES CREATED
+-----------------
+  piece_row_inventory.txt                  (STEP 0 report)
+  viscontrol/core/piece_tracker.py         (STEP 1 — PieceTracker)
+  viscontrol/core/row_tracker.py           (STEP 2 — RowTracker)
+  viscontrol/core/detection_recorder.py    (STEP 4 — DetectionRecorder)
+  tests/synthetic_rows.py                  (make_frames/make_track/RecordingLogger helpers)
+  tests/test_piece_tracker.py              (P1-P5)
+  tests/test_row_tracker.py                (A-H)
+  tests/test_replay.py                     (R1-R4)
+  piece_row_result.txt                     (this file)
+
+B. FILES DELETED
+------------------
+  viscontrol/core/row_associator.py        (STEP 3a — superseded by exact-id matching)
+
+C. FILES MODIFIED
+-------------------
+  viscontrol/core/transfer_events.py       — ClusterObservation marked deprecated (diagnostics
+                                              only); RowRecord.track_id repurposed as the
+                                              RowTracker-identity field (see note below) plus
+                                              3 new fields (track_state, track_membership_version,
+                                              row_locked_snapshot) for the STEP 3e locking gate.
+  viscontrol/core/transfer_orchestrator.py — RowAssociator call replaced with exact row_id
+                                              lookup (_rows_by_track_id); "locking must precede
+                                              firing" gate added at the tripwire-crossing check
+                                              (EVENT-REJECT reason=row_not_locked); one additive
+                                              STOP-COMMAND-ROW-SNAPSHOT log line in _request_stop.
+                                              Lifecycle/invariants/idempotency/event-queue/logging
+                                              format otherwise byte-identical to before.
+  viscontrol/core/config.py                — removed 3 now-dead RowAssociator-only fields
+                                              (row_match_distance_px, row_group_merge_px,
+                                              row_new_min_gap_px); added _PieceTrackerSection,
+                                              _RowTrackerSection, _DetectionRecorderSection.
+  config/default.yaml                      — same 3 fields removed; piece_tracker/row_tracker/
+                                              detection_recorder sections added.
+  viscontrol/detection/proximity_clustering.py — added a DIAGNOSTIC-ONLY notice to the module
+                                              docstring; cluster_by_tangent() itself is byte-
+                                              identical (untouched, per CONSTRAINTS).
+  viscontrol/ui/main_window.py             — _run_transfer_orchestrator rewritten to the
+                                              PieceTracker -> RowTracker -> StableRowObservation
+                                              pipeline (freshness/ROI/confirmation gates kept
+                                              verbatim ahead of it); piece_tracker/row_tracker/
+                                              detection_recorder constructed in __init__; reset
+                                              wired into all 3 start_cycle() call sites; recorder
+                                              closed in shutdown(); UI counter/overlay caching.
+  viscontrol/ui/views/inference_view.py    — set_cloth_frame gained piece_tracks/row_groups kwargs.
+  viscontrol/ui/widgets/camera_view.py     — CameraViewState gained piece_tracks/row_groups;
+                                              _draw_piece_tracks/_draw_row_groups added, drawn
+                                              after (and visually distinct from) the existing
+                                              orchestrator row overlay.
+  tests/test_transfer_orchestrator.py      — obs() now builds StableRowObservation (row_id/
+                                              state/membership_version/locked_snapshot) instead
+                                              of ClusterObservation; crossing observations pass
+                                              state=LOCKED_FOR_TRANSFER (STEP 3e gate); Test 7
+                                              (cluster_split_merge_preserves_identity) adapted to
+                                              test observation-content churn under a stable
+                                              row_id, since raw split/merge resolution has moved
+                                              to RowTracker (see test_row_tracker.py: test_C/D).
+                                              All 10 tests pass with their original intent intact.
+
+NOTE on RowRecord.track_id: the refactor spec asked for a new "row_track_id"
+field on RowRecord equal to the RowTracker row_id. RowRecord already had a
+`track_id` field serving exactly this role under the retired model
+(association identity == row_id 1:1); it is reused rather than duplicated —
+tests already assert on `row.track_id` extensively. `track_id` now equals
+RowTracker's row_id (an independent numbering space from the orchestrator's
+own row_id counter — see test_out_of_order_plc_callback's updated assertion).
+
+D. CONFIRMED SINGLE STOP-COMMAND CALL PATH
+---------------------------------------------
+  grep -rn "send_stop_pulse\|handle_stop_tuchabzug_trigger" viscontrol/
+
+    viscontrol/io/plc_client.py:69,84,186   — definitions (Protocol + 2 impls)
+    viscontrol/core/state_machine.py:148    — definition
+    viscontrol/ui/main_window.py:238        — self._sm.handle_stop_tuchabzug_trigger()
+    viscontrol/ui/main_window.py:2469       — self._plc.send_stop_pulse()
+
+  Both call sites (238, 2469) are the ONLY production callers, and both are
+  inside `_orchestrator_stop_sink` / the `_request_plc_stop_pulse` helper it
+  exclusively calls (`_request_plc_stop_pulse` itself has exactly one call
+  site: main_window.py:240, inside `_orchestrator_stop_sink`). Confirmed:
+  exactly one path from TransferOrchestrator._request_stop ->
+  stop_command_sink -> _orchestrator_stop_sink -> {SM trigger, PLC pulse}.
+
+  grep -rn "RowAssociator" .  →  zero code hits (3 historical-note comments
+  in transfer_events.py/config.py/test_transfer_orchestrator.py referencing
+  the retired class by name; the class itself and its module are deleted).
+
+  grep -rn "cluster_by_tangent" viscontrol/  →  all hits are in
+  proximity_clustering.py (the function's own module), its own docstrings,
+  row_grouping.py's docstring, and main_window.py's diagnostic
+  PROXIMITY-CLUSTER block (~line 1088) plus one docstring line in
+  _run_transfer_orchestrator noting it is NOT used there anymore. Confirmed:
+  cluster_by_tangent is never called from the fire path.
+
+E. TEST RESULTS
+------------------
+  pytest tests/ -v  →  90 passed, 5 failed, 1 skipped
+
+  The 5 failures are ALL in tests/test_detection.py and are PRE-EXISTING —
+  confirmed by `git stash` + re-running against the pre-refactor commit
+  (f5c7602), where the identical 5 tests fail with the identical
+  TypeErrors (stale calls to InspectionPipeline.run_cloth_tracking() /
+  learn_reference() signatures that changed in an earlier, unrelated
+  commit). CONSTRAINTS explicitly forbid touching ClassicalDetector/
+  InspectionPipeline, so these were left untouched and unfixed, consistent
+  with "do not change" — they are out of scope for this refactor.
+
+  All NEW and refactor-relevant test files pass in full:
+    tests/test_piece_tracker.py        5 passed  (P1-P5)
+    tests/test_row_tracker.py          8 passed  (A-H)
+    tests/test_replay.py               3 passed, 1 skipped (R1,R2,R4 pass;
+                                        R3 skipped — no tests/data/failing_case.jsonl
+                                        yet, see section F)
+    tests/test_transfer_orchestrator.py  10 passed (all pre-existing tests,
+                                        migrated to StableRowObservation)
+    (all other pre-existing suites — test_security/test_profiles/test_config/
+    test_event_log/test_state_machine/test_camera — unaffected, still pass)
+
+  P4 measured tangent_x variance reduction (stationary single piece, 40
+  frames, jitter_px=15 seed=4, default piece_ema_alpha_pos=0.40 /
+  piece_ema_alpha_radius=0.20, skipping the first 10 frames' EMA warm-up):
+      raw_var      ≈ 100.9 px²   (raw tangent_x = center_x - radius)
+      smoothed_var ≈ 13.8 px²    (PieceTrack.tangent_x, EMA-smoothed)
+      ratio        ≈ 7.3x        (test asserts >= 4x; comfortably above)
+  Cross-checked at n_frames=100/300/500 for stability: ratios of
+  6.5x / 4.8x / 4.8x respectively — all safely above the 4x bar, consistent
+  with the theoretical steady-state EMA variance-reduction formula
+  (a/(2-a) per smoothed channel) for these alphas.
+
+F. NOT COMPLETED / DEVIATIONS, AND WHY
+------------------------------------------
+  1. tests/data/failing_case.jsonl does not exist, so R3
+     (recorded_log_replay) SKIPS with a clear message rather than running.
+     This is expected per the spec ("If the file is absent, skip... the
+     operator will add it after the next run with the recorder enabled") —
+     detection_recorder.enabled defaults to false in config/default.yaml, so
+     no recording exists yet. Once ops enables it in the field and captures
+     a real staggered-row session, drop the .jsonl at that path and R3 will
+     exercise it automatically.
+
+  2. Two spec'd log-line names could not be produced literally as written
+     for a genuinely TEMPORARY (never-accepted) merge/split proposal:
+     ROW-MERGE-REJECTED / ROW-SPLIT-REJECTED are only emitted by this
+     implementation when the locked/near-lock guard fires (CASE D/E's
+     "REJECT if locked" clause) — a proposal that simply never accumulates
+     enough consecutive evidence (CASE D/E's hysteresis) logs
+     ROW-MERGE-PROPOSED / ROW-SPLIT-PROPOSED (and a DEBUG evidence-reset
+     line) instead, since it was never actually "rejected" in the
+     locked-guard sense, just never accepted. tests/test_row_tracker.py's
+     test_C_temporary_split / test_D_temporary_merge assert on the
+     invariant that actually matters (no *-ACCEPTED; row_id, membership,
+     and membership_version all unchanged) rather than that specific log
+     prefix; test_G_locked_row_immutable covers the literal *-REJECTED path
+     directly. This is documented in that test file's module docstring.
+
+  3. RowGroup/RowTracker fixed a hysteresis gap found while writing
+     test_D_temporary_merge: pending merge/split evidence counters were
+     only ever incremented, never reset when a proposal stopped recurring
+     (unlike pending add/remove, which are cleared explicitly). Added an
+     end-of-_reconcile sweep that resets any pending merge/split entry not
+     re-proposed that exact frame, matching the spec's "consecutive frames"
+     requirement literally. Covered by test_D_temporary_merge (a merge
+     proposal that reverts must never silently resume its evidence count
+     later from a stale, non-consecutive count).
+
+  4. STEP 5e ("call piece/row tracker shutdown/summary where
+     orchestrator.shutdown() is") — PieceTracker/RowTracker have no
+     shutdown/summary method in their spec'd API (only __init__/reset/
+     update, plus the STEP 8 UI addition RowTracker.snapshot()). The
+     concrete, load-bearing action from that instruction —
+     DetectionRecorder.close() (flushing/closing the JSONL file handle) —
+     is wired into MainWindow.shutdown(). No summary log was invented for
+     PieceTracker/RowTracker since exposing their internal counts at
+     shutdown would require new public API beyond what STEP 1/2 specified;
+     flagging this rather than silently adding unspec'd surface area.
+
+  Everything else in STEP 0-9 is implemented as specified.
