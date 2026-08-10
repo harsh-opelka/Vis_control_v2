@@ -164,7 +164,20 @@ class InferenceView(QWidget):
         self._defect_rate.setStyleSheet(
             f"color: {TEXT_PRIMARY}; font-size: {FONT_NORMAL}pt; padding-left: 12px;"
         )
-        bar.addWidget(self._defect_rate, 1)
+        bar.addWidget(self._defect_rate, 0)
+
+        # Layout-quality safety lock: live separation-ratio readout (see
+        # viscontrol/core/layout_quality.py). Green when the layout is
+        # comfortably unambiguous, red as it approaches/crosses the lock
+        # threshold — lets the operator see a load getting marginal before
+        # it actually stops. Hidden when the feature is disabled or there's
+        # no measurement yet (insufficient data).
+        self._layout_ratio_label = QLabel("")
+        self._layout_ratio_label.setStyleSheet(
+            f"color: {TEXT_SECONDARY}; font-size: {FONT_NORMAL}pt; padding-left: 12px;"
+        )
+        self._layout_ratio_label.setVisible(False)
+        bar.addWidget(self._layout_ratio_label, 1)
 
         # Start / Stop big button.
         self._start_btn = QPushButton(self.tr("START"))
@@ -246,6 +259,22 @@ class InferenceView(QWidget):
         self._state_banner = StateBanner(compact=True)
         self._state_banner.set_state(State.WAITING)
         layout.addWidget(self._state_banner, 0)
+
+        # Layout-quality safety lock banner (see
+        # viscontrol/core/layout_quality.py): shown in addition to the
+        # FAULT state banner above, with the same fault styling/color, so
+        # the operator immediately understands WHY the machine stopped and
+        # what to do — the generic "FAULT" word alone doesn't convey "the
+        # dough needs re-spacing". Hidden whenever the lock isn't active.
+        self._layout_lock_banner = QLabel("")
+        self._layout_lock_banner.setWordWrap(True)
+        self._layout_lock_banner.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._layout_lock_banner.setStyleSheet(
+            f"color: white; background-color: {ACCENT_RED}; font-size: {FONT_NORMAL}pt; "
+            "font-weight: 700; padding: 6px; border-radius: 4px;"
+        )
+        self._layout_lock_banner.setVisible(False)
+        layout.addWidget(self._layout_lock_banner, 0)
 
         cam_row = QHBoxLayout()
         cam_row.setSpacing(12)
@@ -388,6 +417,30 @@ class InferenceView(QWidget):
     def set_machine_status_label(self, label: str, color: str) -> None:
         """Update the banner with a signal-driven label (FAULT/RUNNING/STOPPED/SERVICE)."""
         self._state_banner.set_display(label, color)
+
+    def set_layout_lock_active(self, active: bool) -> None:
+        """Show/hide the layout-quality safety-lock banner (see
+        viscontrol/core/layout_quality.py). ``active`` is
+        ``self._layout_monitor.is_locked`` from the main window."""
+        if active:
+            self._layout_lock_banner.setText(
+                self.tr("Layout unclear — please re-space the dough, then acknowledge")
+            )
+        self._layout_lock_banner.setVisible(active)
+
+    def set_layout_ratio(self, ratio: float | None, threshold: float) -> None:
+        """Live separation-ratio readout next to the stat cards. ``ratio``
+        None hides the readout (feature disabled, or no measurement yet)."""
+        if ratio is None:
+            self._layout_ratio_label.setVisible(False)
+            return
+        color = SUCCESS_GREEN if ratio >= threshold else ACCENT_RED
+        text = "∞" if ratio == float("inf") else f"{ratio:.1f}"
+        self._layout_ratio_label.setText(self.tr("Layout: {ratio}").format(ratio=text))
+        self._layout_ratio_label.setStyleSheet(
+            f"color: {color}; font-size: {FONT_NORMAL}pt; padding-left: 12px; font-weight: 700;"
+        )
+        self._layout_ratio_label.setVisible(True)
 
     def set_counts(self, counts: InferenceCounts) -> None:
         self._counts = counts

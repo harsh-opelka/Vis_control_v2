@@ -77,7 +77,7 @@ column_learning:
   expected_columns: 8
 proximity_clustering:
   enabled: true
-  tolerance_px: 50
+  tolerance_px: 130
 transfer_orchestrator:
   enabled: true
   row_match_distance_px: 120.0
@@ -89,6 +89,15 @@ transfer_orchestrator:
   row_exit_margin_px: 80.0
   stop_ack_timeout_s: 5.0
   transfer_complete_timeout_s: 15.0
+layout_quality:
+  enabled: true
+  min_separation_ratio: 1.8
+  ambiguous_frames_to_trigger: 5
+  min_pieces_for_check: 6
+  min_within_gap_px: 5.0
+  error_code: 2
+  auto_resume_on_good_layout: false
+  good_frames_to_resume: 10
 profiles:
 - name: Default
   expected_area_px: 60000
@@ -110,10 +119,10 @@ profiles:
     left: 883
     right: 64
   cloth_crop:
-    top: 286
-    bottom: 752
-    left: 0
-    right: 0
+    top: 262
+    bottom: 889
+    left: 70
+    right: 43
   belt_dough_is_darker: false
   belt_min_solidity: 0.8
   belt_max_aspect_ratio: 3.0
@@ -125,7 +134,7 @@ profiles:
   solidity_tolerance: 0.85
   fused_merge_distance_factor: 1.15
   dilation_kernel_size: 5
-  transfer_bridge_width_px: 70
+  transfer_bridge_width_px: 80
   tripwire_half_width_px: 15
   tripwire_occupancy_threshold: 0.12
   tripwire_debounce_frames: 2

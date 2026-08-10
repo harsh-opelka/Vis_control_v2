@@ -24,6 +24,7 @@ import cv2
 import numpy as np
 from PySide6.QtCore import QObject, Qt, QTimer, Signal, Slot
 from PySide6.QtWidgets import (
+    QApplication,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -37,6 +38,7 @@ from PySide6.QtWidgets import (
 from viscontrol.core.config import AppConfig, save_config
 from viscontrol.core.event_log import Event, EventLog, EventType
 from viscontrol.core.events import Mode, PipelineResult, RowPhase, State, Verdict
+from viscontrol.core.layout_quality import LayoutQualityMonitor, LayoutQualityResult
 from viscontrol.core.logger import logger
 from viscontrol.core.profiles import ProductProfile
 from viscontrol.core.state_machine import StateMachine
@@ -118,7 +120,7 @@ class MainWindow(QMainWindow):
         self._opcua_server_factory = opcua_server_factory
 
         self.setWindowTitle("VisControl — OPELKA")
-        self.resize(1400, 900)
+        self.setMinimumSize(1000, 700)
         self.setStyleSheet(GLOBAL_STYLESHEET)
 
         # Core services.
@@ -227,15 +229,38 @@ class MainWindow(QMainWindow):
         # viscontrol/detection/proximity_clustering.py: PieceConfirmationTracker.
         self._confirmation_tracker = PieceConfirmationTracker()
 
+        # LAYOUT-QUALITY SAFETY LOCK (see viscontrol/core/layout_quality.py):
+        # stops the cloth and raises a fault when cluster_by_tangent's row
+        # split is too ambiguous to trust, instead of guessing. Constructed
+        # here (before _orchestrator_stop_sink below, which reads
+        # self._layout_monitor.is_locked on every stop) so the guard has a
+        # well-defined None-or-monitor attribute from the start. None when
+        # disabled — every call site below tolerates that.
+        self._layout_monitor: LayoutQualityMonitor | None = (
+            LayoutQualityMonitor(self._cfg.layout_quality, logger)
+            if self._cfg.layout_quality.enabled else None
+        )
+        # Most recent LayoutQualityResult.separation_ratio, for the
+        # InferenceView readout (see _on_frame's throttled display block).
+        self._last_layout_ratio: float | None = None
+
         # THE SINGLE SOURCE OF TRUTH for row/transfer state (replaces the
         # old ClusterTracker/DonePieceTracker fire path and the diagnostic
         # TransferEventTracker — see viscontrol/core/transfer_orchestrator.py).
         # _orchestrator_stop_sink is the ONLY production call path to
-        # StopTuchabzug in the repository.
+        # StopTuchabzug in the repository. The layout lock does not add a
+        # second path: it guards THIS sink (blocking further stops while
+        # locked) and, separately, drives its own stop via
+        # _request_plc_stop_pulse() directly (see _trigger_layout_lock).
         def _orchestrator_stop_sink(snapshot) -> None:  # noqa: ANN001
-            self._sm.handle_stop_tuchabzug_trigger()
-            self._push_signals_to_opcua()
-            self._request_plc_stop_pulse()
+            if self._layout_monitor is not None and self._layout_monitor.is_locked:
+                logger.warning(
+                    "[LAYOUT] LAYOUT-LOCK-BLOCKED-STOP frame={} row={} "
+                    "note=cloth_already_stopped_layout_fault_active",
+                    self._frame_count, snapshot.row_id,
+                )
+                return
+            self._issue_stop_pulse()
 
         self._orchestrator = TransferOrchestrator(
             cfg=self._cfg.transfer_orchestrator,
@@ -369,6 +394,22 @@ class MainWindow(QMainWindow):
         # Startup banner — timer is wired inside _build_startup_banner().
         self._banner = self._build_startup_banner()
 
+        # Size the window now that every child widget/layout (and the
+        # startup banner) is fully built, so Qt isn't left to grow the
+        # window past an early, content-blind resize() on first show().
+        # Capped to the available screen area so it can never open larger
+        # than the screen (See window_resize_inspection.txt).
+        screen = self.screen() or QApplication.primaryScreen()
+        available = screen.availableGeometry()
+        target_w = min(1400, available.width())
+        target_h = min(900, available.height())
+        self.resize(target_w, target_h)
+        # Center the window on the available screen area.
+        self.move(
+            available.x() + (available.width() - target_w) // 2,
+            available.y() + (available.height() - target_h) // 2,
+        )
+
         # Start camera immediately so every view (Capture, Wizard, InferenceView)
         # shows live feed without requiring the user to press START first.
         self._start_camera()
@@ -422,6 +463,11 @@ class MainWindow(QMainWindow):
             self._orchestrator.shutdown()
         except Exception:  # noqa: BLE001
             logger.exception("[ORCH-ERROR] orchestrator.shutdown failed")
+        if self._layout_monitor is not None:
+            try:
+                self._layout_monitor.log_session_summary()
+            except Exception:  # noqa: BLE001
+                logger.exception("[LAYOUT-ERROR] log_session_summary failed")
         try:
             self._camera.stop()
         except Exception:  # noqa: BLE001
@@ -521,6 +567,8 @@ class MainWindow(QMainWindow):
         sv.belt_detection_enabled_changed.connect(self._on_belt_detection_enabled_changed)
         sv.proximity_clustering_enabled_changed.connect(self._on_proximity_clustering_enabled_changed)
         sv.proximity_clustering_tolerance_changed.connect(self._on_proximity_clustering_tolerance_changed)
+        sv.layout_min_separation_ratio_changed.connect(self._on_layout_min_separation_ratio_changed)
+        sv.layout_ambiguous_frames_to_trigger_changed.connect(self._on_layout_ambiguous_frames_to_trigger_changed)
         sv.capture_bg_reference_requested.connect(self._on_capture_bg_reference)
         sv.open_cloth_reference_requested.connect(lambda: self._open_wizard(start_step=6))
 
@@ -606,6 +654,8 @@ class MainWindow(QMainWindow):
             self._orchestrator.start_cycle(self._frame_count)
         except Exception:  # noqa: BLE001
             logger.exception("[ORCH-ERROR] orchestrator.start_cycle failed (STOP button)")
+        if self._layout_monitor is not None:
+            self._layout_monitor.reset()
         self._belt_inspect_window_open = False
         self._belt_window_fault_latched = False
         self._clear_sticky_overlay()
@@ -1174,6 +1224,20 @@ class MainWindow(QMainWindow):
             self._inference_view.set_belt_inspect_state(self._belt_inspect_window_open)
             self._inference_view.set_cloth_row_phase(self._row_phase)
             self._update_banner_from_signals(snap_display)
+            # LAYOUT-QUALITY SAFETY LOCK display (see
+            # viscontrol/core/layout_quality.py). is_locked drives the
+            # banner; the ratio readout uses the most recent measurement
+            # (updated in _run_transfer_orchestrator, cached on self so the
+            # throttled display path — which may run on a later frame than
+            # the one that computed it — still has a value to show).
+            if self._layout_monitor is not None:
+                self._inference_view.set_layout_lock_active(self._layout_monitor.is_locked)
+                self._inference_view.set_layout_ratio(
+                    self._last_layout_ratio, self._cfg.layout_quality.min_separation_ratio,
+                )
+            else:
+                self._inference_view.set_layout_lock_active(False)
+                self._inference_view.set_layout_ratio(None, 0.0)
         _display_ms = (time.perf_counter() - _t_display) * 1000.0
 
         if self._web is not None:
@@ -1296,6 +1360,18 @@ class MainWindow(QMainWindow):
         """Live-adjustable; takes effect on the next processed frame, no
         restart needed. Diagnostic/visualization only."""
         self._cfg.proximity_clustering.tolerance_px = max(1, tolerance_px)
+        self._save_cfg()
+
+    def _on_layout_min_separation_ratio_changed(self, ratio: float) -> None:
+        """SERVICE > Diagnostics (PIN-gated). Live-adjustable — the running
+        LayoutQualityMonitor reads self._cfg.layout_quality on every
+        evaluate() call, no restart needed."""
+        self._cfg.layout_quality.min_separation_ratio = max(0.01, ratio)
+        self._save_cfg()
+
+    def _on_layout_ambiguous_frames_to_trigger_changed(self, frames: int) -> None:
+        """SERVICE > Diagnostics (PIN-gated). Live-adjustable, same as above."""
+        self._cfg.layout_quality.ambiguous_frames_to_trigger = max(1, frames)
         self._save_cfg()
 
     def _read_belt_inspect_signal(self) -> bool:
@@ -1484,6 +1560,40 @@ class MainWindow(QMainWindow):
 
         try:
             clusters = cluster_by_tangent(_confirmed_pieces, tolerance_px)
+
+            # LAYOUT-QUALITY SAFETY LOCK (see viscontrol/core/layout_quality.py).
+            # Consumes the SAME `clusters` cluster_by_tangent just produced —
+            # never re-clusters, never touches cluster_by_tangent/Hough/
+            # tolerance_px. Own try/except: a broken monitor must FAIL OPEN
+            # (no lock, no block) and must never prevent the orchestrator
+            # observation below from being submitted.
+            if self._layout_monitor is not None:
+                try:
+                    _was_locked = self._layout_monitor.is_locked
+                    _lq = self._layout_monitor.evaluate(clusters, self._frame_count)
+                    self._last_layout_ratio = _lq.separation_ratio
+                    _lq_triggered = self._layout_monitor.update(_lq)
+                    logger.debug(
+                        "[LAYOUT] LAYOUT-QUALITY frame={} pieces={} clusters={} "
+                        "within_max={:.1f} between_min={:.1f} ratio={:.2f} "
+                        "threshold={:.2f} ambiguous={} streak={}/{} reason={}",
+                        _lq.frame_id, _lq.n_pieces, _lq.n_clusters,
+                        _lq.max_gap_within_cluster, _lq.min_gap_between_clusters,
+                        _lq.separation_ratio, self._cfg.layout_quality.min_separation_ratio,
+                        _lq.is_ambiguous, self._layout_monitor.consecutive_ambiguous_frames,
+                        self._cfg.layout_quality.ambiguous_frames_to_trigger, _lq.reason,
+                    )
+                    if _lq_triggered:
+                        self._trigger_layout_lock(_lq)
+                    elif _was_locked and not self._layout_monitor.is_locked:
+                        # Only reachable when cfg.layout_quality.
+                        # auto_resume_on_good_layout is True — the monitor
+                        # cleared itself inside update() after enough
+                        # consecutive good measurements.
+                        self._on_layout_lock_auto_cleared()
+                except Exception:  # noqa: BLE001
+                    logger.exception("[LAYOUT-ERROR] evaluate failed")
+
             observations = tuple(
                 ClusterObservation(
                     front_tangent=c.front_tangent_x,
@@ -1505,6 +1615,42 @@ class MainWindow(QMainWindow):
             logger.exception(
                 "[ORCH-ERROR] _run_transfer_orchestrator failed — no fire this frame"
             )
+
+    def _trigger_layout_lock(self, q: LayoutQualityResult) -> None:
+        """Called once, from _run_transfer_orchestrator, the frame
+        LayoutQualityMonitor.update() returns True: the layout has been too
+        ambiguous to group into rows reliably for
+        ``cfg.layout_quality.ambiguous_frames_to_trigger`` consecutive
+        fresh updates in a row. Stop the cloth and raise a fault instead of
+        guessing which grouping is correct — transferring two merged rows
+        into the fryer together is far worse than halting for the operator
+        to re-space the dough.
+        """
+        # 1. Stop the cloth via the single existing stop path (same helper
+        #    _orchestrator_stop_sink uses) — no second stop path.
+        self._issue_stop_pulse()
+
+        # 2. Raise the fault via the same mechanism as the existing
+        #    fused-row fault (StateMachine.raise_belt_fault + an ext_error
+        #    write), but with the layout-specific error code so the two are
+        #    distinguishable once the PLC engineer allocates one (see
+        #    config/default.yaml: layout_quality.error_code).
+        self._sm.raise_belt_fault(f"layout_ambiguous:{q.reason}")
+        self._push_signals_to_opcua()
+        self._request_plc_set_layout_error()
+
+        # 3. Log the full measurement at ERROR.
+        logger.error(
+            "[LAYOUT] LAYOUT-LOCK-TRIGGERED frame={} ratio={:.2f} within_max={:.1f} "
+            "between_min={:.1f} gaps={} clusters={} error_code={}",
+            q.frame_id, q.separation_ratio, q.max_gap_within_cluster,
+            q.min_gap_between_clusters, q.gaps, q.n_clusters,
+            self._cfg.layout_quality.error_code,
+        )
+
+        # 4. UI banner: _update_banner_from_signals (called every display
+        #    frame in _on_frame) reads self._layout_monitor.is_locked
+        #    (already True at this point) and shows the layout-lock banner.
 
     def _apply_belt_fault_debounce(
         self, result: "PipelineResult", *, belt_roi: "np.ndarray"
@@ -2286,6 +2432,8 @@ class MainWindow(QMainWindow):
             self._orchestrator.start_cycle(self._frame_count)
         except Exception:  # noqa: BLE001
             logger.exception("[ORCH-ERROR] orchestrator.start_cycle failed (wizard completed)")
+        if self._layout_monitor is not None:
+            self._layout_monitor.reset()
 
     # ---------- OPC UA ----------
 
@@ -2375,8 +2523,38 @@ class MainWindow(QMainWindow):
         self._request_plc_clear_error()
         if self._sm.acknowledge_fault():
             self._on_fault_cleared()
+        # LAYOUT-QUALITY SAFETY LOCK (default, cfg.layout_quality.
+        # auto_resume_on_good_layout=False): operator ack is the ONLY clear
+        # path — this is the one place ext_error_quit is handled, same
+        # signal, same handler, no second ack listener.
+        if self._layout_monitor is not None and self._layout_monitor.is_locked:
+            self._layout_monitor.clear_lock("operator_ack")
+
+    def _on_layout_lock_auto_cleared(self) -> None:
+        """Called from _run_transfer_orchestrator when LayoutQualityMonitor
+        auto-clears itself (cfg.layout_quality.auto_resume_on_good_layout=
+        True, good_frames_to_resume consecutive good measurements reached —
+        see LayoutQualityMonitor.update). The monitor already logged
+        LAYOUT-LOCK-CLEARED; this mirrors the operator-ack path
+        (_on_plc_error_quit) for the PLC/SM side effects, since both are
+        "the shared fault latch is now clear" events.
+        """
+        self._request_plc_clear_error()
+        if self._sm.acknowledge_fault():
+            self._on_fault_cleared()
 
     # ---------- Production PLC command helpers ----------
+
+    def _issue_stop_pulse(self) -> None:
+        """The single place a StopTuchabzug command is actually issued.
+
+        Both the orchestrator's stop sink (_orchestrator_stop_sink) and the
+        layout-quality safety lock (_trigger_layout_lock) call this — no
+        second stop path.
+        """
+        self._sm.handle_stop_tuchabzug_trigger()
+        self._push_signals_to_opcua()
+        self._request_plc_stop_pulse()
 
     def _request_plc_stop_pulse(self) -> None:
         """Queue a stop pulse on the PLC client (production only, no-op otherwise)."""
@@ -2395,6 +2573,18 @@ class MainWindow(QMainWindow):
             self._plc.set_error(self._cfg.plc.fault_error_code)
         except Exception:  # noqa: BLE001
             logger.exception("plc.set_error failed")
+
+    def _request_plc_set_layout_error(self) -> None:
+        """Queue writing layout_quality.error_code to ext_error (production
+        only) — the layout-lock counterpart to _request_plc_set_error(),
+        writing the same ext_error node with a distinct code (see
+        config/default.yaml: layout_quality.error_code)."""
+        if self._plc is None or self._cfg.app.mode != "production":
+            return
+        try:
+            self._plc.set_error(self._cfg.layout_quality.error_code)
+        except Exception:  # noqa: BLE001
+            logger.exception("plc.set_error (layout) failed")
 
     def _request_plc_clear_error(self) -> None:
         """Queue clearing ext_error = 0 (production only)."""
@@ -2440,6 +2630,8 @@ class MainWindow(QMainWindow):
             self._orchestrator.start_cycle(self._frame_count)
         except Exception:  # noqa: BLE001
             logger.exception("[ORCH-ERROR] orchestrator.start_cycle failed")
+        if self._layout_monitor is not None:
+            self._layout_monitor.reset()
         self._clear_sticky_overlay()
         logger.debug("Tracking session reset — new cycle")
 

@@ -173,6 +173,32 @@ transfer_orchestrator:
   stop_ack_timeout_s: 5.0
   transfer_complete_timeout_s: 15.0
 
+# Layout-quality safety lock. See viscontrol/core/layout_quality.py:
+# LayoutQualityMonitor. Detects when cluster_by_tangent's row split is too
+# ambiguous to trust (a within-row tangent_x gap bigger than a between-row
+# gap — no tolerance_px can separate that) and stops the cloth + raises a
+# fault instead of guessing, rather than changing clustering/tolerance.
+layout_quality:
+  enabled: true
+  min_separation_ratio: 1.8      # between-row gap must be at least this many
+                                  # times the biggest within-row gap.
+                                  # Measured: good loads 2.5 and 3.7,
+                                  # bad load 0.79. 1.8 sits clearly between.
+  ambiguous_frames_to_trigger: 5 # consecutive FRESH updates before stopping.
+                                  # Never trigger on one noisy frame.
+  min_pieces_for_check: 6        # below this, evidence is too thin to judge
+  min_within_gap_px: 5.0         # divide-by-near-zero guard
+  error_code: 2                  # ext_error value written on layout fault.
+                                  # NOTE: 2 currently also means "stuck/fused
+                                  # row" (plc.fault_error_code). The operator
+                                  # action differs (fused = remove stuck
+                                  # dough; layout = re-space it), so a
+                                  # distinct code is preferable once the PLC
+                                  # engineer can allocate one. Changing this
+                                  # value is the only edit required.
+  auto_resume_on_good_layout: false
+  good_frames_to_resume: 10      # only used when auto_resume is true
+
 opcua:
   endpoint: "opc.tcp://0.0.0.0:4840/viscontrol/"
   namespace: "http://opelka.com/viscontrol"

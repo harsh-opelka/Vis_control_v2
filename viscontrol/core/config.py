@@ -502,6 +502,81 @@ class _TransferOrchestratorSection(BaseModel):
     )
 
 
+class _LayoutQualitySection(BaseModel):
+    """Layout-quality safety lock (see viscontrol/core/layout_quality.py:
+    LayoutQualityMonitor). Detects when cluster_by_tangent's row split is too
+    ambiguous to trust — a within-row tangent_x gap larger than a
+    between-row gap, which no tolerance_px value can separate — and stops
+    the cloth + raises a fault instead of guessing. Never re-clusters, never
+    changes cluster_by_tangent/Hough/tolerance_px; only measures the SAME
+    cluster list the production path already computed.
+    """
+
+    enabled: bool = Field(
+        True,
+        description="Master on/off. When False, the monitor is never constructed/consulted.",
+    )
+    min_separation_ratio: float = Field(
+        1.8, gt=0.0,
+        description=(
+            "The smallest between-row gap must be at least this many times "
+            "the biggest within-row gap for the layout to be considered "
+            "unambiguous. Measured from real logs: good loads 2.5 and 3.7, "
+            "a hand-staggered bad load 0.79. 1.8 sits clearly between."
+        ),
+    )
+    ambiguous_frames_to_trigger: int = Field(
+        5, ge=1,
+        description=(
+            "Consecutive FRESH ambiguous measurements required before the "
+            "lock triggers. Never trigger on a single noisy frame — this "
+            "debounce is what stops the old row-splitting flicker from "
+            "reappearing as a flickering stop."
+        ),
+    )
+    min_pieces_for_check: int = Field(
+        6, ge=1,
+        description=(
+            "Below this many total detected pieces, evidence is too thin "
+            "to judge — a partly-visible cloth at the start of a batch is "
+            "normal, not a fault."
+        ),
+    )
+    min_within_gap_px: float = Field(
+        5.0, ge=0.0,
+        description=(
+            "Divide-by-near-zero guard: a within-row gap below this is "
+            "treated as unambiguous (ratio = +inf) rather than blown up "
+            "into a meaningless huge ratio."
+        ),
+    )
+    error_code: int = Field(
+        2, ge=0,
+        description=(
+            "ext_error value written on a layout fault. NOTE: 2 currently "
+            "also means 'stuck/fused row' (see plc.fault_error_code). The "
+            "operator action differs (fused = remove stuck dough; layout = "
+            "re-space it), so a distinct code is preferable once the PLC "
+            "engineer can allocate one — changing this value is the only "
+            "edit required."
+        ),
+    )
+    auto_resume_on_good_layout: bool = Field(
+        False,
+        description=(
+            "False (default, recommended): the lock clears ONLY on operator "
+            "acknowledge (ext_error_quit) — the operator must look at the "
+            "cloth before production resumes. True: additionally auto-clear "
+            "after good_frames_to_resume consecutive good measurements; use "
+            "only if operators find the acknowledge step burdensome."
+        ),
+    )
+    good_frames_to_resume: int = Field(
+        10, ge=1,
+        description="Consecutive good measurements required to auto-clear. Only used when auto_resume_on_good_layout is True.",
+    )
+
+
 class _OpcuaSection(BaseModel):
     endpoint: str = "opc.tcp://0.0.0.0:4840/viscontrol/"
     namespace: str = "http://opelka.com/viscontrol"
@@ -557,6 +632,7 @@ class AppConfig(BaseModel):
     column_learning: _ColumnLearningSection = Field(default_factory=_ColumnLearningSection)
     proximity_clustering: _ProximityClusteringSection = Field(default_factory=_ProximityClusteringSection)
     transfer_orchestrator: _TransferOrchestratorSection = Field(default_factory=_TransferOrchestratorSection)
+    layout_quality: _LayoutQualitySection = Field(default_factory=_LayoutQualitySection)
     profiles: list[ProductProfile] = Field(default_factory=list)
     opcua: _OpcuaSection = Field(default_factory=_OpcuaSection)
     web: _WebSection = Field(default_factory=_WebSection)

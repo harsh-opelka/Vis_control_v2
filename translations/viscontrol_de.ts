@@ -73,6 +73,14 @@
         <source>Force toggle TuchabzugRunning</source>
         <translation>Tuchabzug umschalten (erzwingen)</translation>
     </message>
+    <message>
+        <source>Layout unclear — please re-space the dough, then acknowledge</source>
+        <translation>Layout unklar — bitte Teiglinge neu verteilen, dann quittieren</translation>
+    </message>
+    <message>
+        <source>Layout: {ratio}</source>
+        <translation>Layout: {ratio}</translation>
+    </message>
 </context>
 <context>
     <name>CaptureView</name>

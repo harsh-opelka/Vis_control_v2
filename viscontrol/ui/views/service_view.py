@@ -25,6 +25,7 @@ from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -93,6 +94,12 @@ class ServiceView(QWidget):
     # StopTuchabzug firing, the row state machine, or active_row tracking.
     proximity_clustering_enabled_changed = Signal(bool)
     proximity_clustering_tolerance_changed = Signal(int)
+    # Layout-quality safety lock (see viscontrol/core/layout_quality.py).
+    # Unlike proximity_clustering above, these DO drive a real production
+    # decision (stop + fault) — exposed here PIN-gated the same way
+    # tolerance_px is, not because they're diagnostic-only.
+    layout_min_separation_ratio_changed = Signal(float)
+    layout_ambiguous_frames_to_trigger_changed = Signal(int)
     # Cloth-side alternative detection methods (A/B comparison). See
     # core/config.py _DetectionSection and detection/pipeline.py run_cloth_tracking.
     detection_method_changed = Signal(str)   # "blob" | "contour_external" | "hough" | "bg_subtract"
@@ -522,6 +529,41 @@ class ServiceView(QWidget):
             self.proximity_clustering_tolerance_changed.emit
         )
         form.addRow(self.tr("Cluster tolerance"), self._proximity_tolerance_spin)
+
+        # Layout-quality safety lock (see viscontrol/core/layout_quality.py).
+        # Unlike the proximity-clustering controls above, these DO drive a
+        # real stop/fault decision — exposed here PIN-gated the same way as
+        # Cluster tolerance, not diagnostic-only.
+        self._layout_ratio_spin = QDoubleSpinBox()
+        self._layout_ratio_spin.setRange(1.0, 10.0)
+        self._layout_ratio_spin.setSingleStep(0.1)
+        self._layout_ratio_spin.setDecimals(1)
+        self._layout_ratio_spin.setToolTip(
+            self.tr(
+                "The smallest between-row tangent_x gap must be at least "
+                "this many times the biggest within-row gap, or the cloth "
+                "stops and a fault is raised instead of guessing which "
+                "grouping is correct. Measured from real logs: good loads "
+                "2.5 and 3.7, a hand-staggered bad load 0.79."
+            )
+        )
+        self._layout_ratio_spin.valueChanged.connect(
+            self.layout_min_separation_ratio_changed.emit
+        )
+        form.addRow(self.tr("Layout min separation ratio"), self._layout_ratio_spin)
+
+        self._layout_frames_spin = QSpinBox()
+        self._layout_frames_spin.setRange(1, 60)
+        self._layout_frames_spin.setToolTip(
+            self.tr(
+                "Consecutive ambiguous measurements required before the "
+                "layout lock triggers. Never triggers on a single noisy frame."
+            )
+        )
+        self._layout_frames_spin.valueChanged.connect(
+            self.layout_ambiguous_frames_to_trigger_changed.emit
+        )
+        form.addRow(self.tr("Layout ambiguous frames to trigger"), self._layout_frames_spin)
         return card
 
     def _build_frame_source_section(self) -> QWidget:
@@ -723,6 +765,12 @@ class ServiceView(QWidget):
         self._proximity_tolerance_spin.blockSignals(True)
         self._proximity_tolerance_spin.setValue(cfg.proximity_clustering.tolerance_px)
         self._proximity_tolerance_spin.blockSignals(False)
+        self._layout_ratio_spin.blockSignals(True)
+        self._layout_ratio_spin.setValue(cfg.layout_quality.min_separation_ratio)
+        self._layout_ratio_spin.blockSignals(False)
+        self._layout_frames_spin.blockSignals(True)
+        self._layout_frames_spin.setValue(cfg.layout_quality.ambiguous_frames_to_trigger)
+        self._layout_frames_spin.blockSignals(False)
         self._bg_reference_status.setText(
             self.tr("Reference captured.") if cfg.detection.bg_subtract.reference_path
             else self.tr("No reference captured yet.")
