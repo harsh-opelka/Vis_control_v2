@@ -21,7 +21,7 @@
 # to find the node ids
 from opcua import Client
 
-PLC_URL = "opc.tcp://192.168.224.100:4840"
+PLC_URL = "opc.tcp://192.168.178.120:4840"
 
 # Sections Tim mentioned in UA Expert. Add more if you see others.
 SECTIONS = ["TUA", "Einlauf", "Signal", "Global", "PV"]

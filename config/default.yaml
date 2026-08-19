@@ -188,7 +188,7 @@ layout_quality:
                                   # Never trigger on one noisy frame.
   min_pieces_for_check: 6        # below this, evidence is too thin to judge
   min_within_gap_px: 5.0         # divide-by-near-zero guard
-  error_code: 2                  # ext_error value written on layout fault.
+  error_code: 1                  # ext_error value written on layout fault.
                                   # NOTE: 2 currently also means "stuck/fused
                                   # row" (plc.fault_error_code). The operator
                                   # action differs (fused = remove stuck
