@@ -123,8 +123,10 @@ class LayoutQualityMonitor:
 
     def reset(self) -> None:
         """Call wherever the orchestrator's start_cycle() is legitimately
-        called (new TuchabzugRunning pull, STOP button, wizard completion) —
-        never on a raw PLC edge.
+        called (explicit session start via _reset_tracking_session — STOP
+        button, wizard completion, new session — or the orchestrator's own
+        idle-timeout) — never on a raw PLC edge, and never on a same-cloth
+        row restart (see TransferOrchestrator.start_cycle's docstring).
 
         Resets the debounce counters for the new cycle only. Deliberately
         does NOT touch ``is_locked``: a fresh cycle must never silently

@@ -92,7 +92,7 @@ transfer_orchestrator:
 layout_quality:
   enabled: true
   min_separation_ratio: 1.8
-  ambiguous_frames_to_trigger: 5
+  ambiguous_frames_to_trigger: 3
   min_pieces_for_check: 6
   min_within_gap_px: 5.0
   error_code: 1

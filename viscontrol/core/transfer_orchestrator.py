@@ -70,7 +70,10 @@ class TransferOrchestrator:
     refactor_result.txt.
     """
 
-    def __init__(self, cfg, stop_command_sink, now_fn=time.monotonic, logger=None) -> None:
+    def __init__(
+        self, cfg, stop_command_sink, now_fn=time.monotonic, logger=None,
+        cycle_idle_reset_ms: int = 3000,
+    ) -> None:
         self._cfg = cfg
         self._stop_command_sink = stop_command_sink
         self._now = now_fn
@@ -88,6 +91,16 @@ class TransferOrchestrator:
         self._display_counter: int = 0  # per cycle, for R1/R2/R3 numbering
         self._transfer_x: float = 0.0
         self._last_raw_cluster_count: int = 0
+
+        # One physical cloth = one cycle; a cloth stops/restarts once per
+        # row (see _process_plc_cloth_start / _process_plc_stop_ack) — those
+        # restarts must NEVER call start_cycle(). start_cycle() is reserved
+        # for an explicit session start (caller-driven) or this idle-based
+        # fallback: no fresh observation for cycle_idle_reset_ms AND no row
+        # currently owns the transfer (see _OWNING_STATES) -> assume the
+        # previous cloth is done and a new one is about to start.
+        self._cycle_idle_reset_s: float = cycle_idle_reset_ms / 1000.0
+        self._last_fresh_observation_ts: float = self._now()
 
     # ---------- public API ----------
 
@@ -165,10 +178,18 @@ class TransferOrchestrator:
                 rows_abandoned=_count(RowState.ABANDONED),
             )
 
-    def start_cycle(self, source_frame_id: int) -> None:
+    def start_cycle(self, source_frame_id: int, reason: str = "session_start") -> None:
         """Increments cycle_id, resets the associator, moves all
         non-terminal rows to ABANDONED (reason="cycle_restart"), logs
-        CYCLE-START."""
+        CYCLE-START.
+
+        One physical cloth = one cycle. This must ONLY be called for a
+        genuine new-cloth boundary: an explicit caller-driven session start
+        (reason="session_start") or the idle-based fallback in
+        _process_observation (reason="idle_timeout"). A cloth restarting
+        mid-cycle to hand off a row (PLC_CLOTH_START / PLC_STOP_ACK) must
+        NEVER reach this method — see _process_plc_cloth_start.
+        """
         with self._lock:
             self._cycle_id += 1
             self._display_counter = 0
@@ -185,9 +206,10 @@ class TransferOrchestrator:
                         action="transition", result="ok", reason="cycle_restart",
                     )
             self._last_processed_frame_id = source_frame_id
+            self._last_fresh_observation_ts = ts
             self._log(
                 "CYCLE-START", level="info", action="start_cycle", result="ok",
-                extra_cycle=self._cycle_id, extra_frame=source_frame_id,
+                reason=reason, extra_cycle=self._cycle_id, extra_frame=source_frame_id,
             )
 
     def shutdown(self) -> None:
@@ -255,6 +277,16 @@ class TransferOrchestrator:
     # ---------- OBSERVATION processing ----------
 
     def _process_observation(self, event: TransferEvent) -> None:
+        # 0. idle-based new-cloth trigger (see start_cycle docstring). Only
+        # fires when no row currently owns the transfer — an in-flight
+        # transfer must never be interrupted by an idle timeout.
+        now = self._now()
+        no_owning_row = not any(r.state in _OWNING_STATES for r in self._rows.values())
+        if no_owning_row and (now - self._last_fresh_observation_ts) > self._cycle_idle_reset_s:
+            self.start_cycle(event.source_frame_id, reason="idle_timeout")
+        if event.observations:
+            self._last_fresh_observation_ts = now
+
         self._last_raw_cluster_count = len(event.observations)
         result = self._associator.associate(
             list(event.observations), event.source_frame_id, self._transfer_x,
@@ -400,6 +432,11 @@ class TransferOrchestrator:
         self._transition(row, RowState.TRANSFER_PENDING, "auto_after_stop_ack", event)
 
     def _process_plc_cloth_start(self, event: TransferEvent) -> None:
+        """PLC rising edge (cloth restarts to hand a row off). Does EXACTLY
+        ONE thing: the row in TRANSFER_PENDING -> TRANSFERRING. Never calls
+        start_cycle(), never abandons/resets any row or tracker — this is a
+        mid-cycle event, not a new cycle (one physical cloth = one
+        orchestrator cycle; see start_cycle's docstring)."""
         candidates = [r for r in self._existing_rows_sorted() if r.state == RowState.TRANSFER_PENDING]
         if not candidates:
             self._log(
@@ -419,8 +456,8 @@ class TransferOrchestrator:
             row.snapshot = replace(row.snapshot, transfer_event_id=row.transfer_event_id)
         self._transition(row, RowState.TRANSFERRING, "plc_cloth_start", event)
         self._log(
-            "TRANSFER-START", level="info", row=row, event=event,
-            action="transfer_start", result="ok",
+            "CYCLE-CONTINUE", level="info", row=row, event=event,
+            action="cloth_restart", result="ok", reason="row_transfer_started",
         )
 
     # ---------- row creation ----------

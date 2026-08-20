@@ -267,6 +267,7 @@ class MainWindow(QMainWindow):
             stop_command_sink=_orchestrator_stop_sink,
             now_fn=time.monotonic,
             logger=logger,
+            cycle_idle_reset_ms=self._cfg.detection.cycle_idle_reset_ms,
         )
         # DEBUG LOGGING (determinism analysis) — see PLC-EDGE / FRAME-GAP
         # logs. Purely observational; never read by decision logic.
@@ -650,12 +651,11 @@ class MainWindow(QMainWindow):
         self._confirmation_tracker.reset()
         self._last_hough_frame_count = 0
         self._last_unconfirmed_pieces = []
-        try:
-            self._orchestrator.start_cycle(self._frame_count)
-        except Exception:  # noqa: BLE001
-            logger.exception("[ORCH-ERROR] orchestrator.start_cycle failed (STOP button)")
-        if self._layout_monitor is not None:
-            self._layout_monitor.reset()
+        # start_cycle() has exactly two legitimate call sites (session start
+        # / idle timeout, both owned by the orchestrator itself); this is an
+        # explicit operator session boundary, so route through the sole
+        # session-start entry point rather than calling start_cycle directly.
+        self._reset_tracking_session()
         self._belt_inspect_window_open = False
         self._belt_window_fault_latched = False
         self._clear_sticky_overlay()
@@ -767,17 +767,17 @@ class MainWindow(QMainWindow):
 
             # ---- Check 1: Cloth tripwire — gated on TuchabzugRunning (UNCHANGED) ----
             # _prev_tuchabzug_running is updated unconditionally (outside the
-            # running-gated block) so the False→True rising edge is detected on
-            # EVERY cycle, not just the first.  Previously this lived inside the
-            # if-block and was never reset when cloth stopped, causing cycle-2+
-            # tangent-stop resets to be skipped.
-            _is_rising_edge = snap.tuchabzug_running and not self._prev_tuchabzug_running
+            # running-gated block) so the False→True rising edge is tracked on
+            # every physical edge. NOTE: one physical cloth = one orchestrator
+            # cycle, and a cloth stops/restarts once PER ROW — so this rising
+            # edge must NOT reset the tracking session or start a new
+            # orchestrator cycle (that used to happen here and caused every
+            # row to be ABANDONED by the next row's restart; see
+            # cycle_inspection.txt). Session/cycle boundaries are now owned
+            # exclusively by _on_sm_change (real session start) and the
+            # orchestrator's own idle-timeout — never by this per-frame poll.
             self._prev_tuchabzug_running = snap.tuchabzug_running
             if snap.tuchabzug_running:
-                # Reset per-cycle state on the very first frame of a new cloth pull.
-                if _is_rising_edge:
-                    self._reset_tracking_session()
-
                 # FIX 1: rate-limit Hough to hough_interval_ms between runs.
                 # Stagger: if belt is also due this frame, defer Hough unless it
                 # is overdue (hasn't run in >2× the interval — run it anyway then).
@@ -2428,12 +2428,10 @@ class MainWindow(QMainWindow):
         # Geometry (roi_split_x/transfer_line_x) may have just changed —
         # any in-flight tracked rows' tangent_x is relative to the old
         # geometry, so discard them rather than risk a stale match/fire.
-        try:
-            self._orchestrator.start_cycle(self._frame_count)
-        except Exception:  # noqa: BLE001
-            logger.exception("[ORCH-ERROR] orchestrator.start_cycle failed (wizard completed)")
-        if self._layout_monitor is not None:
-            self._layout_monitor.reset()
+        # An explicit operator session boundary — route through the sole
+        # session-start entry point (see _disable_detection for the same
+        # reasoning).
+        self._reset_tracking_session()
 
     # ---------- OPC UA ----------
 
@@ -2622,12 +2620,13 @@ class MainWindow(QMainWindow):
         self._confirmation_tracker.reset()
         self._active_bridge_width_px = 0
         self._detection_zone_outer_x = None
-        # New TuchabzugRunning pull = new orchestrator cycle: any row still
-        # in-flight from the previous pull is abandoned (reason=
-        # "cycle_restart") rather than silently carried over — see
+        # Explicit operator/session start = new orchestrator cycle: any row
+        # still in-flight from the previous session is abandoned (reason=
+        # "cycle_restart") rather than silently carried over. This is one of
+        # exactly two legitimate start_cycle() call sites — see
         # viscontrol/core/transfer_orchestrator.py: TransferOrchestrator.start_cycle.
         try:
-            self._orchestrator.start_cycle(self._frame_count)
+            self._orchestrator.start_cycle(self._frame_count, reason="session_start")
         except Exception:  # noqa: BLE001
             logger.exception("[ORCH-ERROR] orchestrator.start_cycle failed")
         if self._layout_monitor is not None:
