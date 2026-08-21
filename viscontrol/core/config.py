@@ -30,6 +30,7 @@ class _AppSection(BaseModel):
     mode: Mode = "demo"
     language: Language = "en"
     active_profile: str = "Default"
+    auto_start_detection: bool = False
 
 
 class _CameraSection(BaseModel):

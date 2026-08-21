@@ -1,0 +1,89 @@
+AUTOSTART INSPECTION
+====================
+
+A. Signature / preconditions of _enable_detection()  (viscontrol/ui/main_window.py:630-632)
+--------------------------------------------------------------------------------------------
+    def _enable_detection(self) -> None:
+        """START button: enable blob-detection pipeline; camera already runs."""
+        self._detection_enabled = True
+
+- Takes no arguments (self only).
+- Body is a single line: sets self._detection_enabled = True.
+- No precondition checks of any kind — no camera-connected check, no PLC-connected
+  check, no mode check, no guard/if statement at all. It cannot raise and cannot
+  no-op; it unconditionally flips the flag.
+- The docstring itself documents the assumption baked into the design: "camera
+  already runs" — i.e. by the time this is called in the existing button-click
+  flow, the camera has already been started elsewhere (see part C).
+
+The connected signal at main_window.py:509 is:
+    iv.start_clicked.connect(self._enable_detection)
+(Qt connects the view's start_clicked signal directly to this no-arg slot — no
+adapter/lambda needed, confirming the signature takes no arguments.)
+
+B. Earliest safe point after which MainWindow and all child widgets exist (main.py)
+------------------------------------------------------------------------------------
+    window = MainWindow(cfg, _CONFIG_DIR)          # main.py:69 — construction
+    ...
+    window.show()                                   # main.py:111
+
+MainWindow.__init__ fully builds every child view/widget (inference view, capture
+view, review view, service view, wizard view, sidebar, status bar, startup banner)
+before it returns — construction is synchronous. `window.show()` on line 111 is
+therefore the point the task description calls the "earliest safe point": the
+window and all child widgets are guaranteed to exist by the time the constructor
+returns (line 69), and `.show()` (line 111) is the natural place to hang
+post-startup wiring since it comes after the widgets exist AND after the
+production-mode PLC client / web server setup blocks (main.py:73-109) have run.
+
+C. Is _enable_detection safe to call before camera/PLC finish connecting?
+----------------------------------------------------------------------------
+Yes — and there is nothing to "finish" as a precondition, because:
+
+1. Camera: MainWindow.__init__ calls self._start_camera() unconditionally near
+   the end of construction (main_window.py:416), i.e. camera start is already
+   kicked off before window.show() ever runs — it does not wait for
+   auto_start_detection:
+
+       # Start camera immediately so every view (Capture, Wizard, InferenceView)
+       # shows live feed without requiring the user to press START first.
+       self._start_camera()                          # main_window.py:414-416
+
+   _start_camera() (main_window.py:615-621):
+       def _start_camera(self) -> None:
+           if self._camera_running:
+               return
+           self._camera.apply_profile(self._active_profile_cache)
+           self._camera.start(self._frame_bridge.emit_frame)
+           self._camera_running = True
+           self._refresh_status_bar()
+
+   `self._camera_running = True` is set synchronously right after `.start()`
+   returns — there is no callback/signal that fires once the camera has
+   *actually* finished connecting; frames simply begin arriving asynchronously
+   via `self._frame_bridge.emit_frame` whenever the backend produces them.
+   _enable_detection() does not read `_camera_running`, camera connection
+   state, or frame arrival at all — it only sets `_detection_enabled`, which
+   is consulted later inside the frame-processing path (`_on_frame`). If
+   detection is enabled before the first frame arrives, nothing breaks: frame
+   processing simply starts being detection-aware from whichever frame is the
+   first to arrive.
+
+2. PLC: attach_plc_client() (main_window.py:431-437) just stores the client
+   reference and wires two callbacks (`on_tuchabzug_change`,
+   `on_error_quit_change`); it does not block, and there is no "PLC connected"
+   readiness signal exposed to MainWindow — `plc.is_connected` (referenced at
+   main_window.py:2730) is only used for status-bar display, never as a gate
+   anywhere in the detection-enable path. _enable_detection() does not touch
+   `self._plc` at all.
+
+Conclusion: _enable_detection() has no preconditions to wait on. There is also
+no existing "camera ready" / "PLC connected" signal in this codebase to hook
+into — the closest state, `_camera_running`, is already true by the time
+`window.show()` runs (set synchronously in __init__), and it does not mean the
+backend has finished connecting, only that `.start()` was called.
+Per the task's fallback instruction, since _enable_detection has no real
+preconditions and no readiness signal exists, calling it directly right after
+`window.show()` (STEP 3) is correct — no artificial delay is required. (A
+delay would only be needed if _enable_detection itself validated connection
+state, which it does not.)

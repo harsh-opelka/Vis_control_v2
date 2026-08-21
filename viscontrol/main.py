@@ -115,6 +115,18 @@ def main() -> int:
     if cfg.ui.startup_banner_seconds <= 0:
         window.hide_startup_banner()
 
+    # Auto-start detection for headless boots (e.g. systemd on the Jetson,
+    # where no operator is present to click Start). _enable_detection() has
+    # no preconditions — it only flips a flag consulted later in the frame
+    # path — and the camera is already started synchronously inside
+    # MainWindow.__init__, so no readiness signal to wait on exists; call it
+    # directly rather than guessing a delay.
+    logger.info("[AUTOSTART] auto_start_detection={}", cfg.app.auto_start_detection)
+    if cfg.app.auto_start_detection:
+        logger.info("[AUTOSTART] auto_start_detection enabled, starting detection")
+        logger.info("[AUTOSTART] triggering _enable_detection at t={}ms after window shown", 0)
+        window._enable_detection()
+
     def _on_about_to_quit() -> None:
         logger.info("VisControl shutting down")
         event_log.append(Event(

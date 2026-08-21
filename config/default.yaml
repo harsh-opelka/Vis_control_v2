@@ -6,6 +6,7 @@ app:
   mode: "demo"             # "demo" or "production"
   language: "en"           # "en" or "de"
   active_profile: "Default"
+  auto_start_detection: false   # Jetson boot (systemd, no operator present) sets this true in local.yaml
 
 camera:
   source: "auto"           # auto | basler | mock
