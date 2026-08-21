@@ -1,0 +1,371 @@
+SIZE CALIBRATION — STEP 0 INSPECTION REPORT
+=============================================
+
+A. THE EXACT HOUGH CALL
+------------------------
+File: viscontrol/detection/classical.py, method `detect_hough` (lines 381-539).
+The cv2 call itself, classical.py:494-497:
+
+    circles = cv2.HoughCircles(
+        hough_input, cv2.HOUGH_GRADIENT, dp=dp, minDist=min_dist,
+        param1=param1, param2=param2, minRadius=min_r, maxRadius=max_r,
+    )
+
+`hough_input` is the grayscale, Gaussian-blurred, (optionally) extra-downscaled,
+cloth-masked image (classical.py:439-473). Parameters as wired from config
+(pipeline.py `detect_cloth_pieces` / `run_cloth_tracking`, lines 250-261 /
+336-347):
+
+    h_cfg = detection_cfg.hough
+    detections, _binary, _det_scale = self._detector.detect_hough(
+        cropped, profile,
+        dp=h_cfg.dp, min_dist_px=h_cfg.min_dist_px,
+        param1=h_cfg.param1, param2=h_cfg.param2,
+        min_radius_px=h_cfg.min_radius_px, max_radius_px=h_cfg.max_radius_px,
+        radius_tolerance=h_cfg.radius_tolerance,
+        gate_to_cloth=h_cfg.gate_to_cloth,
+        cloth_brightness_threshold=h_cfg.cloth_brightness_threshold,
+        downscale_factor=h_cfg.downscale_factor,
+    )
+
+How min_radius_px / max_radius_px / radius_tolerance are applied
+(classical.py:457-492):
+
+    expected_radius = (extract_profile.expected_width_px + extract_profile.expected_height_px) / 4.0 * extra_scale
+    combined_scale = scale * extra_scale
+    ...
+    min_dist = (
+        float(min_dist_px * combined_scale) if min_dist_px > 0
+        else max(1.0, expected_radius * 1.6)
+    )
+    tol = max(0.01, min(0.99, radius_tolerance))
+    min_r = (
+        int(min_radius_px * combined_scale) if min_radius_px > 0
+        else max(1, int(expected_radius * (1.0 - tol)))
+    )
+    max_r = (
+        int(max_radius_px * combined_scale) if max_radius_px > 0
+        else max(min_r + 1, int(expected_radius * (1.0 + tol)))
+    )
+
+Key facts:
+  - min_radius_px/max_radius_px are in PROFILE-scale (original-resolution)
+    pixels; when > 0 they are scaled by `combined_scale` (the shared
+    max_detect_width downscale × the Hough-only downscale_factor) before
+    being passed to cv2.HoughCircles, which operates in `hough_input`'s
+    (possibly downscaled) pixel space.
+  - When min_radius_px/max_radius_px are 0 ("auto"), the band is derived
+    purely from profile.expected_width_px/expected_height_px and
+    radius_tolerance — NOT from min/max_radius_px at all.
+  - radius_tolerance only affects the AUTO band; it is ignored once
+    min_radius_px/max_radius_px are set explicitly (>0). This means writing
+    explicit min/max_radius_px (as this feature does) makes radius_tolerance
+    inert for the Hough call itself — SECTION 2's shape_filter.size_tolerance
+    (see part E) still applies separately.
+  - Every other Hough param (dp, param1, param2) and min_dist_px pass through
+    unchanged; the wide-open calibration sweep must reuse them exactly.
+
+Production config values (config/local.yaml): dp=1.2, param1=80.0,
+param2=38.0, min_dist_px=0 (auto), downscale_factor=2.0,
+gate_to_cloth=true, cloth_brightness_threshold=112, radius_tolerance=0.2.
+Active profile expected_width_px=290 -> expected_radius=145 px.
+
+
+B. DETECTION OBJECT FIELD NAMES
+---------------------------------
+File: viscontrol/detection/base.py:13-37
+
+    @dataclass
+    class Detection:
+        bbox: tuple[int, int, int, int]  # (x, y, w, h) in pixel coords
+        centroid: tuple[float, float]
+        area_px: int
+        width_px: int
+        height_px: int
+        confidence: float
+        label: str
+        circularity: float = 0.0
+        solidity: float = 0.0
+
+There is NO `center_x`/`center_y`/`radius` field. `detect_hough` (classical.py
+502-537) builds each Detection from a Hough circle as:
+
+    diameter = int(round(r_r * 2))
+    x = int(round(cx_r - r_r))
+    y = int(round(cy_r - r_r))
+    ...
+    Detection(
+        bbox=(x, y, diameter, diameter),
+        centroid=(float(cx_r), float(cy_r)),
+        area_px=int(area),
+        width_px=diameter,
+        height_px=diameter,
+        confidence=confidence,
+        label=label,
+        circularity=1.0,
+        solidity=1.0,
+    )
+
+So the real radius of a Hough detection = width_px / 2 (== height_px / 2,
+since Hough always emits a square diameter x diameter bbox), and the tangent
+x used by clustering is `centroid[0] - radius`, matching
+proximity_clustering.py's Piece.tangent_x convention (bbox left edge — see
+`x = cx_r - r_r`, i.e. bbox[0] already IS the tangent x for Hough circles).
+
+Since SizeCalibrator runs cv2.HoughCircles directly (not through
+ClassicalDetector), it works with raw (cx, cy, r) tuples from
+`circles[0]` rather than Detection objects — no need to depend on
+Detection's field names at all, but CalibrationSample.tangent_xs is defined
+as `center_x - radius` to stay consistent with this exact convention.
+
+
+C. INSTALLATION WIZARD STRUCTURE
+-----------------------------------
+File: viscontrol/ui/views/wizard_view.py, class `WizardView(QWidget)` (not a
+QWizard — a hand-rolled QStackedWidget-based flow), line 591.
+
+    STEPS = [
+        "Orientation",
+        "ROI Boundaries",
+        "Transfer Line",
+        "Belt area",
+        "Cloth area",
+        "Exposure & Gain",
+        "Calibration",
+    ]
+
+7 pages (0-indexed 0..6), built in `_build()` (line 673-700):
+
+    self._stack.addWidget(self._build_step1_orientation())
+    self._stack.addWidget(self._build_step2_roi())
+    self._stack.addWidget(self._build_step3_transfer())
+    self._stack.addWidget(self._build_step4_belt_crop())
+    self._stack.addWidget(self._build_step5_cloth_crop())
+    self._stack.addWidget(self._build_step6_exposure())
+    self._stack.addWidget(self._build_step7_calibration())
+
+The LAST page is step index 6, "Calibration", built by
+`_build_step7_calibration()` (line 1062-1265). Its current contents, in
+order, inside one QFrame("card") / QVBoxLayout:
+  1. top_row: piece-count label ("Detecting: — pieces") + "Learn Reference"
+     button (enabled only when >= 3 single pieces detected).
+  2. method_row: "Cloth detection method:" combo (blob / contour_external /
+     hough / bg_subtract) + "Active: {method}" label.
+  3. `_DetectionCanvas` — live detection overlay (grows, stretch=1).
+  4. hint label ("Not seeing all pieces? Raise Sensitivity...").
+  5. diag_frame (QFrame card, QHBoxLayout): brightness histogram +
+     "Cloth Binary Mask" thumbnail + "Belt Binary Mask" thumbnail.
+  6. cloth_ref_frame (QFrame card): "Cloth Reference (Hough gating)" —
+     brightness-threshold slider + "Save Cloth Reference" button + status
+     label. This is the closest existing analogue to the new feature: it is
+     also gated to development/calibration-only, also has an explicit
+     "measure-then-save" two-button flow, and also writes to local.yaml only
+     on an explicit button press (see part D).
+  7. "Dough darker than background" checkbox.
+  8. sens_row: Sensitivity slider (1-10) mapped to noise_threshold.
+  9. `_wiz_learn_status` label (blank by default; used for Learn Reference
+     feedback text).
+
+Frames only reach this page while `self._current_step == 6`; see part F.
+
+New "Size Calibration" section will be appended as one more QFrame("card")
+right after `cloth_ref_frame` (or after the sensitivity/status block), same
+structural pattern: title label, instruction label, Measure button +
+progress label, plain-text result label (colored per ok/warn), Apply button.
+
+
+D. HOW THE WIZARD PERSISTS TO config/local.yaml ON FINISH
+-------------------------------------------------------------
+Save primitive: `viscontrol/core/config.py:720-735`
+
+    def save_config(cfg: AppConfig, config_dir: Path, *, local_filename: str = "local.yaml") -> Path:
+        """Atomically write the full config to ``local.yaml`` and return the path."""
+        config_dir = Path(config_dir)
+        config_dir.mkdir(parents=True, exist_ok=True)
+        target = config_dir / local_filename
+        tmp = target.with_suffix(target.suffix + ".tmp")
+        data = cfg.model_dump(mode="json")
+        with tmp.open("w", encoding="utf-8") as f:
+            yaml.safe_dump(data, f, sort_keys=False, allow_unicode=True)
+        tmp.replace(target)
+        return target
+
+MainWindow never calls `save_config` directly from a wizard field handler —
+every handler goes through the wrapper `MainWindow._save_cfg()`
+(viscontrol/ui/main_window.py:2669-2675):
+
+    def _save_cfg(self) -> None:
+        if self._wizard_active:
+            return  # defer writes until Finish; cancel will revert in-memory state
+        try:
+            save_config(self._cfg, self._config_dir)
+        except OSError as e:
+            logger.error("failed to save config: {}", e)
+
+Wizard lifecycle (main_window.py):
+  - `_open_wizard` (line ~2135-2137): `self._wizard_active = True`;
+    `self._wizard_cfg_snapshot = copy.deepcopy(self._cfg)`.
+  - Every per-step "commit" handler (`_on_wizard_roi_changed`,
+    `_on_wizard_tl_changed`, `_on_wizard_exposure_changed`,
+    `_on_wizard_belt_crop_changed`, `_on_save_cloth_reference`, etc.) mutates
+    `self._cfg` in-memory (profile_store.upsert + `self._cfg.profiles =
+    store.as_list()`, or a direct `self._cfg.detection.xxx = ...` for
+    app-level fields) and THEN calls `self._save_cfg()` — which, while the
+    wizard is open, is a no-op (returns immediately) because
+    `self._wizard_active` is True. Example, `_on_wizard_roi_changed`
+    (line 2172-2183):
+
+        def _on_wizard_roi_changed(self, x: int) -> None:
+            assert x > 0, ...
+            profile = self._active_profile_cache
+            updated = profile.model_copy(update={"roi_split_x": x})
+            store = self._cfg.profile_store()
+            store.upsert(updated)
+            self._cfg.profiles = store.as_list()
+            logger.info("Wizard step 2 Next: saving roi_split_x = {}, writing to profile {}", x, profile.name)
+            self._save_cfg()
+            self._refresh_profile_cache()
+
+  - `_on_wizard_cancelled` (line ~2154-2159): sets `_wizard_active = False`
+    and restores `self._cfg = self._wizard_cfg_snapshot` — i.e. discards
+    every in-memory edit made during the wizard session. Since nothing was
+    ever written to disk (every `_save_cfg()` call during the wizard was a
+    no-op), Cancel is safely a pure in-memory revert.
+  - `_on_wizard_completed` (Finish, line 2379 onward): sets
+    `self._wizard_active = False` and `self._wizard_cfg_snapshot = None`
+    FIRST, applies the last page's settings dict to `self._cfg`, then calls
+    `self._save_cfg()` — which now actually calls `save_config(self._cfg,
+    self._config_dir)` and persists everything accumulated during the whole
+    wizard session in one atomic write.
+
+Consequence for this feature: `_on_save_cloth_reference` (an existing
+"measure once, then explicitly persist" action living on this exact page,
+step 6) follows precisely this pattern — it mutates `self._cfg.detection.hough
+.*` and calls `self._save_cfg()`, meaning its write is ALSO deferred until
+the wizard's Finish button, and reverted along with everything else on
+Cancel. Size Calibration's "Apply to config" button will follow the exact
+same established convention (mutate `self._cfg`, call `self._save_cfg()`) —
+this is consistent with "operator must be able to leave the wizard without
+applying" (nothing hits disk before Finish) and matches every other control
+already on this page. The actual bytes-on-disk write only happens at Finish,
+same as roi_split_x, transfer_line_x, cloth reference, etc. — Apply is what
+stages the change into `self._cfg`; Finish is what a real config write.
+
+
+E. CONFIG FIELDS TUNED TO PIECE SIZE
+---------------------------------------
+                                             scales with     scales with
+field                              current    piece RADIUS   piece DIAMETER   neither
+----------------------------------------------------------------------------------------
+detection.hough.min_radius_px         0       X (radius)
+  (config/local.yaml: 0 = auto;
+   config/default.yaml: 0)
+detection.hough.max_radius_px         0       X (radius)
+detection.hough.radius_tolerance    0.2       fraction (dimensionless;
+                                               only used while
+                                               min/max_radius_px == 0/auto)
+detection.shape_filter.size_tolerance 0.4     fraction, applied to diameter
+                                               (X — diameter)
+proximity_clustering.tolerance_px   150 (default.yaml) /
+                                     85  (local.yaml)                          X — this is
+                                                                                 GAP SPACING
+                                                                                 (depositor
+                                                                                 layout), not
+                                                                                 piece size —
+                                                                                 see
+                                                                                 layout_quality.py
+                                                                                 docstring and
+                                                                                 STEP 1d below.
+profiles[].expected_area_px        60000                     X (~ pi*r^2)
+profiles[].expected_width_px         290                     X (diameter)
+profiles[].expected_height_px        290                     X (diameter)
+profiles[].fused_merge_distance_factor 1.15   dimensionless multiplier on
+                                               diameter (profiles.py:167-174)
+                                               — does NOT itself need
+                                               recalibrating; it multiplies
+                                               whatever expected_width/
+                                               height_px already is, so it
+                                               auto-scales once those two
+                                               are corrected. Not written by
+                                               Apply.
+profiles[].transfer_bridge_width_px   40/80   Set by the wizard's own
+                                               Transfer Line step
+                                               (operator-drawn band width,
+                                               not derived from piece size).
+                                               Independent of piece size —
+                                               not written by Apply.
+
+Notes:
+  - min_radius_px/max_radius_px are the SINGLE most critical field: per part
+    A, an out-of-band piece produces literally zero Hough circles for that
+    piece — not a low-confidence detection, no detection at all. This is
+    exactly the "0.5x-2x -> not detected at all" failure this feature exists
+    to fix.
+  - expected_area_px/width_px/height_px feed: SECTION 2 shape_filter
+    (pipeline.py filter_dough_candidates, size gate relative to
+    expected_width_px), the min-area/max-area blob-size gates
+    (classical.py `_extract`/`_extract_external_only`, `noise_threshold *
+    expected_area_px`), _classify's fused/single/unknown thresholds
+    (classical.py:1026-1055, all ratios of width_px/height_px vs
+    expected_width_px/expected_height_px), and run_cloth_tracking's
+    detection-zone bridge_half (`profile.expected_width_px / 2.0`,
+    pipeline.py:321). All of these are DIAMETER-relative, so writing
+    expected_width_px/height_px/area_px from the measured radius fixes all
+    of them simultaneously.
+  - proximity_clustering.tolerance_px is explicitly NOT derived from radius
+    anywhere in the existing code, and layout_quality.py's docstring/tests
+    make clear gap tolerance is a property of the DEPOSITOR'S physical
+    row/column spacing, independent of piece size (a small piece on a
+    tightly-packed cloth can have a smaller gap than a large piece on a
+    loosely-packed one). This matches the task's explicit instruction not to
+    derive tolerance from radius — STEP 1d instead measures real tangent_x
+    gaps using the same within/between classification as
+    LayoutQualityMonitor.evaluate() (layout_quality.py:158-235).
+
+
+F. GRABBING FRAMES OUTSIDE THE NORMAL _on_frame LOOP
+---------------------------------------------------------
+No new camera hook is needed — an existing helper/pathway already delivers
+frames to the wizard's Calibration page at full camera frame rate.
+
+MainWindow._on_frame (main_window.py:672 onward) already forwards every
+incoming frame to whichever top-level view is active (line ~700-702):
+
+    if self._service_view.isVisible():
+        self._service_view.set_preview_frame(frame)
+    ...
+    self._wizard_view.set_preview_frame(frame)
+
+`WizardView.set_preview_frame` (wizard_view.py:1504-1535) routes by
+`self._current_step`; when step == 6 (Calibration, the last page):
+
+    elif step == 6:
+        belt = frame[:, :self._current_roi_split_x]
+        cloth = frame[:, self._current_roi_split_x:]
+        if cloth.size > 0:
+            self._pending_cloth_frame = cloth
+        if belt.size > 0:
+            self._pending_belt_frame = belt
+        if not self._det_throttle_timer.isActive():
+            self._det_throttle_timer.start()
+
+So `self._pending_cloth_frame` is already refreshed on every camera frame
+whenever the operator is on the Calibration page — it is the FULL
+(uncropped) cloth ROI, not yet reduced by `profile.cloth_crop`. The existing
+`_run_detection_preview` (wizard_view.py:1276 onward) shows exactly how to go
+from this to a detector-ready image: apply `InspectionPipeline.apply_crop`
+with a `CropRegion` built from `self._current_cloth_crop`
+(wizard_view.py:1302-1306), matching what `run_cloth_tracking` does in
+production (pipeline.py:308).
+
+For the "Measure" button, SizeCalibrator.add_frame() will be called once per
+NEW arriving frame (not per Qt paint/timer tick) — i.e. the Measure flow
+will set a `self._calibrating = True` / frame counter and, inside
+`set_preview_frame`'s step==6 branch, call `self._size_calibrator.add_frame(
+gray_cropped_cloth, frame_id)` for up to `capture_frames` frames, then stop
+and call `compute()`. No PySide6 camera signal needs to be hooked directly —
+this reuses the same frame-delivery path `_pending_cloth_frame` already
+uses, just cropped + grayscaled to match the production Hough input exactly
+(gray, cv2.GaussianBlur'd — SizeCalibrator does its own blur internally, see
+STEP 1 of the implementation, so the wizard only needs to hand it the
+cropped BGR/gray ROI, not a fully preprocessed image).

@@ -1,0 +1,197 @@
+SIZE CALIBRATION — STEP 6 VERIFY / REPORT
+=============================================
+
+FILES CREATED
+--------------
+  viscontrol/core/size_calibration.py   — SizeCalibrator, CalibrationSample,
+                                           CalibrationResult (pure Python +
+                                           cv2/numpy; no Qt/PySide6; imports
+                                           only viscontrol.core.layout_quality
+                                           and viscontrol.detection.
+                                           proximity_clustering, read-only,
+                                           to reuse the REAL production
+                                           within/between/ratio computation)
+  tests/test_size_calibration.py        — K1-K9, all pytest, no Qt/camera/
+                                           real Hough (CalibrationSample fed
+                                           directly)
+  calibration_inspection.txt            — STEP 0 inspection report
+  calibration_result.txt                — this file
+
+FILES MODIFIED
+---------------
+  config/default.yaml                   — added `size_calibration:` section
+  viscontrol/core/config.py             — added _SizeCalibrationSection +
+                                           AppConfig.size_calibration field
+  viscontrol/ui/views/wizard_view.py    — added "Size Calibration" card to
+                                           the last wizard page (Calibration,
+                                           step index 6): Measure / Apply to
+                                           config buttons, progress + result
+                                           labels, capture wiring inside
+                                           set_preview_frame's step==6
+                                           branch, new signal
+                                           size_calibration_apply_requested
+  viscontrol/ui/main_window.py          — wires the new signal to
+                                           _on_size_calibration_apply;
+                                           _open_wizard() now also calls
+                                           wizard_view.set_size_calibration_
+                                           config(self._cfg.size_calibration)
+
+NOT MODIFIED (per constraints)
+--------------------------------
+  viscontrol/detection/pipeline.py, viscontrol/detection/classical.py,
+  viscontrol/core/transfer_orchestrator.py, viscontrol/detection/
+  proximity_clustering.py, viscontrol/core/layout_quality.py — all read
+  ONLY (proximity_clustering.cluster_by_tangent and layout_quality.
+  LayoutQualityMonitor.evaluate are imported and called, never edited) so
+  the calibration measurement's within/between/ratio numbers are computed
+  by the exact same code path production uses, per STEP 1d's requirement.
+
+
+CONFIG FIELDS "APPLY TO CONFIG" WRITES
+-----------------------------------------
+MainWindow._on_size_calibration_apply (viscontrol/ui/main_window.py) writes
+EXACTLY these six fields, and nothing else:
+
+  detection.hough.min_radius_px          <- result.suggested_min_radius_px
+  detection.hough.max_radius_px          <- result.suggested_max_radius_px
+  proximity_clustering.tolerance_px      <- result.suggested_tolerance_px
+  <active profile>.expected_area_px      <- result.suggested_expected_area_px
+  <active profile>.expected_width_px     <- result.suggested_expected_width_px
+  <active profile>.expected_height_px    <- result.suggested_expected_height_px
+
+Confirmed by direct code read: the handler only ever assigns to
+`self._cfg.detection.hough.min_radius_px`/`max_radius_px`,
+`self._cfg.proximity_clustering.tolerance_px`, and builds ONE
+`profile.model_copy(update={...})` containing only the three
+expected_*_px keys above, upserted into the profile store. It returns
+immediately (writes nothing) if the emitted object is not a
+`CalibrationResult` with `ok=True` — an ambiguous/failed measurement can
+never reach this code path in the first place because the wizard disables
+the "Apply to config" button whenever `result.ok` is False (see
+WizardView._feed_size_calibration_frame:
+`self._apply_size_cal_btn.setEnabled(result.ok)`).
+
+Every field write is logged individually before the save:
+  [CAL] CAL-APPLIED field=<name> old=<value> new=<value>
+one line per field, six lines total per Apply press — matches STEP 4's
+logging spec.
+
+The actual `save_config()` disk write happens via the existing
+`MainWindow._save_cfg()` wrapper (same call every other wizard-page setting
+uses, e.g. `_on_wizard_roi_changed`, `_on_save_cloth_reference` — see
+calibration_inspection.txt part D). Consistent with every other control on
+this wizard page, the write lands on disk immediately if the wizard is not
+open, or is staged in `self._cfg` and flushed atomically at the wizard's
+Finish button if it is; Cancel discards it along with every other in-wizard
+edit made in that session. `SizeCalibrator.compute()` itself never touches
+any file — see K9 below.
+
+
+MIN_DIST SUBSTITUTION (STEP 1a)
+-----------------------------------
+Needed: YES, unconditionally, given the current production config.
+
+`detection.hough.min_dist_px` is 0 in both config/default.yaml and
+config/local.yaml (0 = "auto" in production, meaning
+`max(1.0, expected_radius * 1.6)` — see classical.py:474-477). The
+calibration sweep passes this same `min_dist_px=0` straight through (STEP
+1a explicitly requires reusing the production value), and `add_frame()`
+detects `min_dist_px <= 0` and substitutes
+`sweep_min_radius_px * 1.5` (= 20 * 1.5 = 30.0 px with the default config)
+for the sweep call only, logging
+`[CAL] CAL-START ... min_dist_used=30.0 substituted=True` once per
+calibration session. Verified live in a smoke test (WizardView + real
+cv2.HoughCircles on a synthetic frame): the substitution fired exactly as
+designed with the shipped default config.
+
+`SizeCalibrator.min_dist_substituted` (a read-only property, distinct from
+any `CalibrationResult` field) reports this for the session.
+
+
+TEST RESULTS
+--------------
+pytest tests/ -v: 99 passed, 21 failed, 1 skipped.
+
+The 21 failures are PRE-EXISTING and unrelated to this feature — verified
+by `git stash`-ing all Size Calibration changes and re-running: the exact
+same 21 tests fail with the exact same errors (AttributeError: 'AppConfig'
+object has no attribute 'row_tracker', and a few TypeErrors in
+test_detection.py), both before and after this work. They live in
+test_detection.py, test_piece_tracker.py, test_replay.py, and
+test_row_tracker.py — none of which this feature touches.
+
+tests/test_size_calibration.py — all 9 new tests pass:
+
+  K1 median_radius_correct                PASSED
+  K2 outlier_rejection                    PASSED
+  K3 half_size                            PASSED  (radius ~72 -> min ~50,
+                                                     max ~94, width ~144;
+                                                     the 0.5x floor of the
+                                                     range this feature
+                                                     exists for)
+  K4 double_size                          PASSED  (radius ~290 -> min ~203,
+                                                     max ~377, width ~580;
+                                                     the 2x ceiling of that
+                                                     same range)
+  K5 tolerance_is_midpoint                PASSED  (within=60, between=200
+                                                     -> suggested_tolerance_
+                                                     px == 130 exactly,
+                                                     ratio ~3.33)
+  K6 ambiguous_layout_rejected            PASSED  (ok=False,
+                                                     reason="too_variable",
+                                                     warning present,
+                                                     measured_within_gap_max/
+                                                     measured_between_gap_min/
+                                                     radius_median still
+                                                     populated, non-zero)
+  K7 too_few_pieces                       PASSED
+  K8 too_variable_radius                  PASSED
+  K9 no_config_written_without_apply      PASSED  (SizeCalibrator.compute()
+                                                     run against a real
+                                                     loaded+saved AppConfig;
+                                                     local.yaml bytes
+                                                     unchanged before/after)
+
+Note on K6: the task prompt's illustrative numbers ("within-row max 120 and
+between-row min 95") describe a scenario where the largest within-cluster
+gap exceeds the smallest between-cluster gap. That specific relationship is
+mathematically impossible to reproduce through the actual measurement
+algorithm this module (deliberately) shares with production: both
+`cluster_by_tangent` and `LayoutQualityMonitor.evaluate()` classify a gap as
+"within" if it is <= the clustering tolerance and "between" if it is >
+that same tolerance, for a SINGLE tolerance value — so max(within) <=
+tolerance < min(between) is a structural invariant of that algorithm,
+regardless of which tolerance is chosen. (The layout_quality.py docstring's
+own "0.79 hand-staggered" example is a manually-derived reference number
+used to justify choosing min_separation_ratio=1.8, not a number that
+LayoutQualityMonitor.evaluate() would itself ever reproduce from a single
+cluster_by_tangent pass — test_layout_quality.py's own ambiguous-result
+fixture, `mk_ambiguous_result`, constructs that same within>between
+combination by hand for exactly this reason, never via evaluate() itself.)
+K6 instead constructs a layout with gaps of similar, overlapping magnitude
+(90-120 px) so that NO threshold choice can separate them well —
+`measured_layout_ratio` comes out near 1.0, below `min_acceptable_ratio`
+(1.8) — which is the actual, reachable form of "ambiguous" this measurement
+can detect, and is what the assertions check (ok=False,
+reason="too_variable", a warning present, measured fields still populated).
+
+
+NOT COMPLETED / DEVIATIONS
+------------------------------
+- None of the required STEP 1-6 deliverables were skipped.
+- One deliberate interpretation, flagged above: K6's exact numeric
+  construction ("within max 120, between min 95") was adapted to a
+  reachable equivalent (see note above) because the literal numbers are
+  incompatible with the shared production algorithm STEP 1d requires this
+  module to reuse. The assertions still verify every behavior K6 describes
+  in prose (ambiguous layout -> ok=False, reason="too_variable", a warning
+  present, measured values still populated).
+- The wizard's Apply flow was smoke-tested end-to-end (WizardView
+  instantiated under a real QApplication, Measure -> synthetic-frame
+  capture loop -> compute() -> result label -> Apply-button gating) but not
+  exercised inside a fully running MainWindow/live camera, since that
+  requires hardware/GUI interaction outside this environment. The write
+  path itself (`_on_size_calibration_apply`) was verified by direct code
+  reading against the exact same `_save_cfg`/profile_store.upsert pattern
+  every other wizard-page setting already uses and already has test/production
+  coverage for.

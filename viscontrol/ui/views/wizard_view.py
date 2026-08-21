@@ -34,11 +34,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from viscontrol.core.config import _DetectionSection
+from viscontrol.core.config import _DetectionSection, _SizeCalibrationSection
+from viscontrol.core.logger import logger
 from viscontrol.core.profiles import CropRegion, ProductProfile
+from viscontrol.core.size_calibration import CalibrationResult, SizeCalibrator
 from viscontrol.detection.classical import ClassicalDetector as _ClassicalDetector
 from viscontrol.detection.pipeline import InspectionPipeline
 from viscontrol.ui.theme import (
+    ACCENT_RED,
     FONT_LARGE,
     FONT_NORMAL,
     FONT_SMALL,
@@ -614,6 +617,11 @@ class WizardView(QWidget):
     # SECTION 4: transfer bridge width (px, profile field). MainWindow persists
     # it to the active profile's transfer_bridge_width_px.
     transfer_bridge_width_changed = Signal(int)
+    # DEVELOPMENT-ONLY Size Calibration (see viscontrol/core/size_calibration.py).
+    # Emits the CalibrationResult the operator confirmed with "Apply to
+    # config"; MainWindow._on_size_calibration_apply writes ONLY the fields
+    # named in that handler to config/local.yaml. Never emitted automatically.
+    size_calibration_apply_requested = Signal(object)  # CalibrationResult
 
     STEPS = [
         "Orientation",
@@ -655,6 +663,17 @@ class WizardView(QWidget):
         # Cloth Reference mask (Hough gating) — mirrors MainWindow._cloth_reference_mask
         # for the saved-status indicator only; pushed in via set_cloth_reference().
         self._cloth_reference_mask: np.ndarray | None = None
+
+        # DEVELOPMENT-ONLY Size Calibration (see viscontrol/core/size_calibration.py).
+        # ``_size_calibrator`` is (re)built by set_size_calibration_config(),
+        # called by MainWindow on wizard open — mirrors the set_detection_settings
+        # pattern above. Measuring never writes to config; only the explicit
+        # "Apply to config" button emits size_calibration_apply_requested.
+        self._size_calibration_cfg: "_SizeCalibrationSection | None" = None
+        self._size_calibrator: SizeCalibrator | None = None
+        self._calibrating_size: bool = False
+        self._calib_frame_count: int = 0
+        self._last_calib_result: CalibrationResult | None = None
 
         # Throttle calibration preview: store latest cloth and belt frames and
         # fire at most once per 500 ms (2 fps).  Detection can be slow on
@@ -1214,6 +1233,62 @@ class WizardView(QWidget):
             )
         )
 
+        # ── Size Calibration (development/testing tool) ────────────────────
+        # Dough piece size can vary ~0.5x-2x between batches; several
+        # detection parameters (most critically detection.hough radius
+        # limits) are tuned to the CURRENT size and fail outside it. This
+        # measures the actual size from a stationary cloth and proposes
+        # config values — nothing is written until "Apply to config" is
+        # pressed. See viscontrol/core/size_calibration.py: SizeCalibrator.
+        size_cal_frame = QFrame()
+        size_cal_frame.setObjectName("card")
+        size_cal_layout = QVBoxLayout(size_cal_frame)
+        size_cal_layout.setContentsMargins(12, 8, 12, 8)
+        size_cal_layout.setSpacing(6)
+
+        size_cal_title = QLabel(self.tr("Size Calibration (development / testing tool)"))
+        size_cal_title.setStyleSheet(
+            f"color: {TEXT_PRIMARY}; font-size: {FONT_SMALL}pt; font-weight: 600;"
+        )
+        size_cal_layout.addWidget(size_cal_title)
+
+        size_cal_hint = QLabel(
+            self.tr(
+                "Place a stationary cloth of dough under the camera, then press "
+                "Measure. The cloth must not be moving."
+            )
+        )
+        size_cal_hint.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: {FONT_SMALL}pt;")
+        size_cal_hint.setWordWrap(True)
+        size_cal_layout.addWidget(size_cal_hint)
+
+        size_cal_btn_row = QHBoxLayout()
+        self._measure_size_btn = QPushButton(self.tr("Measure"))
+        self._measure_size_btn.setObjectName("secondary")
+        self._measure_size_btn.clicked.connect(self._on_measure_size_clicked)
+        size_cal_btn_row.addWidget(self._measure_size_btn)
+        self._measure_progress_lbl = QLabel("")
+        self._measure_progress_lbl.setStyleSheet(
+            f"color: {TEXT_SECONDARY}; font-size: {FONT_SMALL}pt;"
+        )
+        size_cal_btn_row.addWidget(self._measure_progress_lbl)
+        size_cal_btn_row.addStretch(1)
+        self._apply_size_cal_btn = QPushButton(self.tr("Apply to config"))
+        self._apply_size_cal_btn.setObjectName("primary")
+        self._apply_size_cal_btn.setEnabled(False)
+        self._apply_size_cal_btn.clicked.connect(self._on_apply_size_calibration_clicked)
+        size_cal_btn_row.addWidget(self._apply_size_cal_btn)
+        size_cal_layout.addLayout(size_cal_btn_row)
+
+        self._size_cal_result_lbl = QLabel("")
+        self._size_cal_result_lbl.setStyleSheet(
+            f"color: {TEXT_PRIMARY}; font-size: {FONT_SMALL}pt;"
+        )
+        self._size_cal_result_lbl.setWordWrap(True)
+        size_cal_layout.addWidget(self._size_cal_result_lbl)
+
+        layout.addWidget(size_cal_frame)
+
         # Detection polarity: dark dough on bright cloth vs bright dough on dark belt.
         self._dough_darker_check = QCheckBox(
             self.tr("Dough darker than background (Teig dunkler als Hintergrund)")
@@ -1528,6 +1603,8 @@ class WizardView(QWidget):
             cloth = frame[:, self._current_roi_split_x:]
             if cloth.size > 0:
                 self._pending_cloth_frame = cloth
+                if self._calibrating_size:
+                    self._feed_size_calibration_frame(cloth)
             if belt.size > 0:
                 self._pending_belt_frame = belt
             # Fire throttle timer at most once per 500 ms — detection is slow.
@@ -1544,6 +1621,13 @@ class WizardView(QWidget):
         self._calib_count_lbl.setText(self.tr("Detecting: — pieces"))
         self._learn_btn.setEnabled(False)
         self._learn_btn.setText(self.tr("Learn Reference"))
+        self._calibrating_size = False
+        self._calib_frame_count = 0
+        self._last_calib_result = None
+        self._measure_size_btn.setEnabled(True)
+        self._apply_size_cal_btn.setEnabled(False)
+        self._measure_progress_lbl.setText("")
+        self._size_cal_result_lbl.setText("")
 
     def go_to_step(self, step: int) -> None:
         """Jump directly to a specific step (used by 'Adjust crops' shortcut)."""
@@ -1684,6 +1768,100 @@ class WizardView(QWidget):
                 self._calib_mask_lbl.setPixmap(QPixmap.fromImage(qimg))
         except Exception:
             pass
+
+    # ── Size Calibration (development/testing tool) ────────────────────────
+
+    def set_size_calibration_config(self, cfg: "_SizeCalibrationSection") -> None:
+        """Mirror ``AppConfig.size_calibration`` and (re)build the
+        ``SizeCalibrator``. Called by MainWindow on wizard open — same
+        pattern as :meth:`set_detection_settings`."""
+        self._size_calibration_cfg = cfg
+        self._size_calibrator = SizeCalibrator(cfg, logger)
+
+    def _on_measure_size_clicked(self) -> None:
+        """Start (or restart) a Measure capture. Purely a local UI/measurement
+        action — nothing is written to config here or at any point during
+        capture; see _on_apply_size_calibration_clicked for the only place
+        that happens, gated on an explicit operator click."""
+        if self._size_calibrator is None or self._size_calibration_cfg is None:
+            return
+        self._size_calibrator.reset()
+        self._calibrating_size = True
+        self._calib_frame_count = 0
+        self._last_calib_result = None
+        self._apply_size_cal_btn.setEnabled(False)
+        self._measure_size_btn.setEnabled(False)
+        self._size_cal_result_lbl.setText("")
+        total = self._size_calibration_cfg.capture_frames
+        self._measure_progress_lbl.setText(
+            self.tr("Measuring… 0/{total}").format(total=total)
+        )
+
+    def _feed_size_calibration_frame(self, cloth_frame: np.ndarray) -> None:
+        """Called once per incoming camera frame while a Measure capture is
+        in progress (see set_preview_frame's step==6 branch). ``cloth_frame``
+        is the FULL (uncropped) cloth ROI, cropped here by the operator's
+        current cloth_crop — the same crop the production Hough call sees
+        (InspectionPipeline.apply_crop / run_cloth_tracking)."""
+        if (
+            not self._calibrating_size
+            or self._size_calibrator is None
+            or self._size_calibration_cfg is None
+        ):
+            return
+        crop_region = CropRegion(
+            top=self._current_cloth_crop[0], bottom=self._current_cloth_crop[1],
+            left=self._current_cloth_crop[2], right=self._current_cloth_crop[3],
+        )
+        cropped, _ = InspectionPipeline.apply_crop(cloth_frame, crop_region)
+        if cropped.size == 0:
+            return
+
+        h_cfg = self._detection_cfg.hough
+        used = self._size_calibrator.add_frame(
+            cropped, self._calib_frame_count,
+            dp=h_cfg.dp, param1=h_cfg.param1, param2=h_cfg.param2,
+        )
+        if not used:
+            return
+        self._calib_frame_count += 1
+        total = self._size_calibration_cfg.capture_frames
+        self._measure_progress_lbl.setText(
+            self.tr("Measuring… {n}/{total}").format(n=self._calib_frame_count, total=total)
+        )
+        if self._calib_frame_count >= total:
+            self._calibrating_size = False
+            self._measure_size_btn.setEnabled(True)
+            result = self._size_calibrator.compute()
+            self._last_calib_result = result
+            self._size_cal_result_lbl.setText(self._format_calib_result(result))
+            self._apply_size_cal_btn.setEnabled(result.ok)
+
+    @staticmethod
+    def _format_calib_result(result: CalibrationResult) -> str:
+        lines = [
+            f"Found {result.pieces_per_frame_median:g} pieces per frame (median)",
+            f"Piece radius: {result.radius_median:.0f} px  "
+            f"(range {result.radius_p10:.0f}-{result.radius_p90:.0f})",
+            f"Suggested radius limits: {result.suggested_min_radius_px} - "
+            f"{result.suggested_max_radius_px} px",
+        ]
+        if not result.ok:
+            lines.append(f"NOT APPLIED — reason: {result.reason}")
+        for w in result.warnings:
+            lines.append(f"WARNING: {w}")
+        color = TEXT_PRIMARY if result.ok else ACCENT_RED
+        body = "<br>".join(lines)
+        return f"<span style='color:{color};'>{body}</span>"
+
+    def _on_apply_size_calibration_clicked(self) -> None:
+        if self._last_calib_result is None or not self._last_calib_result.ok:
+            return
+        self.size_calibration_apply_requested.emit(self._last_calib_result)
+        self._size_cal_result_lbl.setText(
+            self._size_cal_result_lbl.text()
+            + "<br><b>Applied. Restart VisControl for changes to take effect.</b>"
+        )
 
     def _on_calib_method_changed(self) -> None:
         method = self._calib_method_combo.currentData()

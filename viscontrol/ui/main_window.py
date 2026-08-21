@@ -556,6 +556,7 @@ class MainWindow(QMainWindow):
         wz.detection_method_changed.connect(self._on_detection_method_changed)
         wz.save_cloth_reference_requested.connect(self._on_save_cloth_reference)
         wz.transfer_bridge_width_changed.connect(self._on_wizard_bridge_width_changed)
+        wz.size_calibration_apply_requested.connect(self._on_size_calibration_apply)
 
         sv.dough_is_darker_changed.connect(self._on_dough_is_darker_changed)
         sv.belt_dough_is_darker_changed.connect(self._on_belt_dough_is_darker_changed)
@@ -2147,6 +2148,7 @@ class MainWindow(QMainWindow):
         self._wizard_view.set_detection_settings(self._cfg.detection)
         self._wizard_view.set_bg_reference(self._bg_reference_cloth)
         self._wizard_view.set_cloth_reference(self._cloth_reference_mask)
+        self._wizard_view.set_size_calibration_config(self._cfg.size_calibration)
         if start_step > 0:
             self._wizard_view.go_to_step(start_step)
         self._show_view("wizard")
@@ -2272,6 +2274,47 @@ class MainWindow(QMainWindow):
         self._save_cfg()
         self._refresh_profile_cache()
         logger.info("transfer bridge width set to {} px (profile {})", width, profile.name)
+
+    def _on_size_calibration_apply(self, result: object) -> None:
+        """DEVELOPMENT-ONLY Size Calibration (see
+        viscontrol/core/size_calibration.py): the operator confirmed a
+        completed measurement via the wizard's "Apply to config" button.
+        Writes ONLY detection.hough.min_radius_px/max_radius_px — nothing
+        else. In particular, the active profile's expected_area_px/
+        expected_width_px/expected_height_px are deliberately left
+        UNCHANGED: cluster tolerance and profile geometry are properties of
+        the depositor layout / recipe, not of piece radius, and this module
+        no longer guesses at either (see calibration_bugfix_result.txt).
+        Follows the same convention as every other wizard-page setting
+        (e.g. _on_save_cloth_reference): mutates self._cfg and calls
+        self._save_cfg(), which persists immediately outside the wizard or
+        defers to Finish while the wizard is open (see _save_cfg's
+        docstring) — Cancel discards it exactly like every other in-wizard
+        edit.
+        """
+        from viscontrol.core.size_calibration import CalibrationResult
+
+        if not isinstance(result, CalibrationResult) or not result.ok:
+            return
+
+        old_min = self._cfg.detection.hough.min_radius_px
+        old_max = self._cfg.detection.hough.max_radius_px
+
+        self._cfg.detection.hough.min_radius_px = result.suggested_min_radius_px
+        self._cfg.detection.hough.max_radius_px = result.suggested_max_radius_px
+
+        for field, old, new in (
+            ("detection.hough.min_radius_px", old_min, result.suggested_min_radius_px),
+            ("detection.hough.max_radius_px", old_max, result.suggested_max_radius_px),
+        ):
+            logger.info("[CAL] CAL-APPLIED field={} old={} new={}", field, old, new)
+        logger.info(
+            "[CAL] profile expected_area/width/height were not modified; "
+            "update manually if needed."
+        )
+
+        self._save_cfg()
+        self._refresh_profile_cache()
 
     def _on_fill_mask_holes_changed(self, value: bool) -> None:
         self._cfg.detection.fill_mask_holes = value

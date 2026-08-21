@@ -577,6 +577,65 @@ class _LayoutQualitySection(BaseModel):
     )
 
 
+class _SizeCalibrationSection(BaseModel):
+    """Development-only piece-size measurement tool (see
+    viscontrol/core/size_calibration.py: SizeCalibrator). Setup-time only —
+    run from the installation wizard's Calibration page to measure the
+    actual dough piece radius (which can vary ~0.5x-2x between batches) and
+    suggest corrected detection.hough radius limits / profile geometry.
+    Never read by the production detection pipeline itself.
+    """
+
+    enabled: bool = Field(
+        True,
+        description="Master on/off for the wizard's Size Calibration section.",
+    )
+    capture_frames: int = Field(30, ge=1, description="Frames captured per Measure press.")
+    sweep_min_radius_px: int = Field(
+        20, ge=1,
+        description="Wide-open Hough minRadius used ONLY for calibration measurement.",
+    )
+    sweep_max_radius_px: int = Field(
+        400, ge=1,
+        description="Wide-open Hough maxRadius used ONLY for calibration measurement.",
+    )
+    outlier_reject_frac: float = Field(
+        0.35, gt=0.0, lt=1.0,
+        description=(
+            "Radii outside median * (1 +/- this) are discarded before "
+            "recomputing median/p10/p90/stddev — robust to reflections and "
+            "machine-part circles far from the true piece size."
+        ),
+    )
+    radius_margin: float = Field(
+        0.30, gt=0.0, lt=1.0,
+        description=(
+            "+/- fraction around the measured median radius used to derive "
+            "suggested_min_radius_px / suggested_max_radius_px. Must absorb "
+            "Hough's own radius jitter plus real piece-to-piece variation."
+        ),
+    )
+    min_frames: int = Field(10, ge=1, description="Below this many captured frames, ok=False.")
+    min_pieces: int = Field(
+        4, ge=1, description="Below this many pieces/frame (median), ok=False."
+    )
+    max_radius_cv: float = Field(
+        0.25, gt=0.0,
+        description="stddev/median above this (post outlier-rejection) => ok=False, too_variable.",
+    )
+    max_plausible_pieces_per_frame: int = Field(
+        40, ge=1,
+        description=(
+            "Pass-2 sanity cap (see SizeCalibrator.add_frame's two-pass "
+            "duplicate-circle rejection): if a frame still returns more "
+            "detections than this after minDist is scaled to the "
+            "pass-1 rough radius estimate, the whole frame is discarded "
+            "(not stored, not counted) rather than letting an implausible "
+            "count corrupt the radius median."
+        ),
+    )
+
+
 class _OpcuaSection(BaseModel):
     endpoint: str = "opc.tcp://0.0.0.0:4840/viscontrol/"
     namespace: str = "http://opelka.com/viscontrol"
@@ -633,6 +692,7 @@ class AppConfig(BaseModel):
     proximity_clustering: _ProximityClusteringSection = Field(default_factory=_ProximityClusteringSection)
     transfer_orchestrator: _TransferOrchestratorSection = Field(default_factory=_TransferOrchestratorSection)
     layout_quality: _LayoutQualitySection = Field(default_factory=_LayoutQualitySection)
+    size_calibration: _SizeCalibrationSection = Field(default_factory=_SizeCalibrationSection)
     profiles: list[ProductProfile] = Field(default_factory=list)
     opcua: _OpcuaSection = Field(default_factory=_OpcuaSection)
     web: _WebSection = Field(default_factory=_WebSection)

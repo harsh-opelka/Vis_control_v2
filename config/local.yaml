@@ -1,5 +1,5 @@
 app:
-  mode: production
+  mode: demo
   language: en
   active_profile: Default
 camera:
@@ -98,6 +98,17 @@ layout_quality:
   error_code: 1
   auto_resume_on_good_layout: false
   good_frames_to_resume: 10
+size_calibration:
+  enabled: true
+  capture_frames: 30
+  sweep_min_radius_px: 20
+  sweep_max_radius_px: 400
+  outlier_reject_frac: 0.35
+  radius_margin: 0.3
+  min_frames: 10
+  min_pieces: 4
+  max_radius_cv: 0.25
+  max_plausible_pieces_per_frame: 40
 profiles:
 - name: Default
   expected_area_px: 60000

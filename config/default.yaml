@@ -199,6 +199,22 @@ layout_quality:
   auto_resume_on_good_layout: false
   good_frames_to_resume: 10      # only used when auto_resume is true
 
+# Development-only piece-size measurement tool. See
+# viscontrol/core/size_calibration.py: SizeCalibrator. Setup-time only, run
+# from the installation wizard's Calibration page — never read by the
+# production detection pipeline itself.
+size_calibration:
+  enabled: true
+  capture_frames: 30
+  sweep_min_radius_px: 20      # wide open for measurement only
+  sweep_max_radius_px: 400
+  outlier_reject_frac: 0.35
+  radius_margin: 0.30          # +/-30% around measured median
+  min_frames: 10
+  min_pieces: 4
+  max_radius_cv: 0.25          # stddev/median above this = too variable
+  max_plausible_pieces_per_frame: 40  # pass-2 sanity cap; frame discarded above this
+
 opcua:
   endpoint: "opc.tcp://0.0.0.0:4840/viscontrol/"
   namespace: "http://opelka.com/viscontrol"
