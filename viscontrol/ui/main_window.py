@@ -419,7 +419,7 @@ class MainWindow(QMainWindow):
         # startup banner) is fully built, so Qt isn't left to grow the
         # window past an early, content-blind resize() on first show().
         # Capped to the available screen area so it can never open larger
-        # than the screen (See window_resize_inspection.txt).
+        # than the screen.
         screen = self.screen() or QApplication.primaryScreen()
         available = screen.availableGeometry()
         target_w = min(1400, available.width())
@@ -800,8 +800,7 @@ class MainWindow(QMainWindow):
             # cycle, and a cloth stops/restarts once PER ROW — so this rising
             # edge must NOT reset the tracking session or start a new
             # orchestrator cycle (that used to happen here and caused every
-            # row to be ABANDONED by the next row's restart; see
-            # cycle_inspection.txt). Session/cycle boundaries are now owned
+            # row to be ABANDONED by the next row's restart). Session/cycle boundaries are now owned
             # exclusively by _on_sm_change (real session start) and the
             # orchestrator's own idle-timeout — never by this per-frame poll.
             self._prev_tuchabzug_running = snap.tuchabzug_running
@@ -1553,7 +1552,7 @@ class MainWindow(QMainWindow):
         """
         if not self._cfg.transfer_orchestrator.enabled:
             # Fail-safe: no stop is ever issued. There is no old path to
-            # fall back to (see refactor_result.txt).
+            # fall back to.
             return
 
         transfer_x = float(profile.transfer_line_x - profile.roi_split_x)
@@ -2359,7 +2358,7 @@ class MainWindow(QMainWindow):
         expected_width_px/expected_height_px are deliberately left
         UNCHANGED: cluster tolerance and profile geometry are properties of
         the depositor layout / recipe, not of piece radius, and this module
-        no longer guesses at either (see calibration_bugfix_result.txt).
+        no longer guesses at either.
         Follows the same convention as every other wizard-page setting
         (e.g. _on_save_cloth_reference): mutates self._cfg and calls
         self._save_cfg(), which persists immediately outside the wizard or

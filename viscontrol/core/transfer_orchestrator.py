@@ -66,8 +66,7 @@ class TransferOrchestrator:
     spec: TransferEvent carries no transfer_x field, so the current
     transfer-line x (in the same cloth-local coordinate space as
     ClusterObservation.front_tangent/back_tangent) is tracked as orchestrator
-    state, updated by the caller once per frame before drain(). See
-    refactor_result.txt.
+    state, updated by the caller once per frame before drain().
     """
 
     def __init__(

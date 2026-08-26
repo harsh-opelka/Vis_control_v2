@@ -9,7 +9,7 @@ to return canned circle arrays — this keeps the two-pass logic under test
 deterministic without depending on real Hough behavior on a synthetic image.
 
 Tolerance/layout-gap measurement (formerly K5/K6) has been removed from this
-module entirely — see calibration_bugfix_result.txt. Cluster tolerance is a
+module entirely. Cluster tolerance is a
 property of depositor spacing, not piece size, and this module no longer
 measures or suggests it.
 """

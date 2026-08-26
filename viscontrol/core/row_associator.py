@@ -7,7 +7,7 @@ consumes AssociationResult.
 
 The matching/grouping algorithm below is ported exactly from the retired
 TransferEventTracker (interval distance, upstream filter, greedy
-group-merge sweep sorted farthest-upstream-first) — see refactor_inventory.txt.
+group-merge sweep sorted farthest-upstream-first).
 
 No Qt imports. No OpenCV imports.
 """

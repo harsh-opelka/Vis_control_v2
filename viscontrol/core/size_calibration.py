@@ -145,8 +145,7 @@ class SizeCalibrator:
         ``detect_hough``) — only the radius bounds and ``minDist`` differ,
         since this measures piece size with the size constraint lifted.
 
-        ``minDist`` is NOT taken from the production config here (see
-        calibration_bugfix_inspection.txt part B): a fixed value tied to
+        ``minDist`` is NOT taken from the production config here: a fixed value tied to
         ``sweep_min_radius_px`` (the wide-open search FLOOR, unrelated to
         the actual piece size) massively under-constrains circle separation
         for any real piece bigger than that floor, producing dozens of
