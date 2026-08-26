@@ -14,6 +14,7 @@ the UI thread only ever sees clean data.
 from __future__ import annotations
 
 import copy
+import threading
 import time
 from collections.abc import Callable
 from datetime import datetime
@@ -44,6 +45,7 @@ from viscontrol.core.profiles import ProductProfile
 from viscontrol.core.state_machine import StateMachine
 from viscontrol.core.transfer_events import ClusterObservation
 from viscontrol.core.transfer_events import EventType as TransferEventType
+from viscontrol.core.training_data_collector import TrainingDataCollector
 from viscontrol.core.transfer_orchestrator import TransferOrchestrator
 from viscontrol.detection.calibration import learn_reference
 from viscontrol.detection.classical import ClassicalDetector
@@ -243,6 +245,24 @@ class MainWindow(QMainWindow):
         # Most recent LayoutQualityResult.separation_ratio, for the
         # InferenceView readout (see _on_frame's throttled display block).
         self._last_layout_ratio: float | None = None
+
+        # TRAINING-DATA COLLECTION (additive, observer-only — see
+        # viscontrol/core/training_data_collector.py). None (and every call
+        # site tolerates that) unless explicitly enabled per deployment;
+        # never touches storage.defect_image_dir / the Einlaufband
+        # error-image path above.
+        self._training_collector: TrainingDataCollector | None = (
+            TrainingDataCollector(self._cfg.training_data, logger)
+            if self._cfg.training_data.enabled else None
+        )
+        self._traindata_maintenance_running = threading.Event()
+        self._traindata_timer: QTimer | None = None
+        if self._training_collector is not None:
+            self._traindata_timer = QTimer(self)
+            self._traindata_timer.timeout.connect(self._on_traindata_maintenance_tick)
+            self._traindata_timer.start(
+                self._cfg.training_data.maintenance_interval_minutes * 60 * 1000
+            )
 
         # THE SINGLE SOURCE OF TRUTH for row/transfer state (replaces the
         # old ClusterTracker/DonePieceTracker fire path and the diagnostic
@@ -464,6 +484,13 @@ class MainWindow(QMainWindow):
             self._orchestrator.shutdown()
         except Exception:  # noqa: BLE001
             logger.exception("[ORCH-ERROR] orchestrator.shutdown failed")
+        if self._traindata_timer is not None:
+            self._traindata_timer.stop()
+        if self._training_collector is not None:
+            try:
+                logger.info("[TRAINDATA] SESSION-END collector_enabled=True")
+            except Exception:  # noqa: BLE001
+                logger.exception("[TRAINDATA-ERROR] shutdown logging failed")
         if self._layout_monitor is not None:
             try:
                 self._layout_monitor.log_session_summary()
@@ -869,6 +896,30 @@ class MainWindow(QMainWindow):
                     self._track_row_phase(r, profile)
                     self._run_transfer_orchestrator(r, profile)
                     _t_rowgroup_ms = (time.perf_counter() - _t_r0) * 1000.0
+
+                    # TRAINING-DATA COLLECTION (additive, observer-only — see
+                    # viscontrol/core/training_data_collector.py). Runs only on
+                    # this fresh-Hough "row event" frame, never on cached-reuse
+                    # frames. Never touches detection/orchestrator/PLC state and
+                    # must never be able to affect them, hence the blanket
+                    # try/except: a training-data failure is logged and dropped,
+                    # not raised. Does NOT touch storage.defect_image_dir or
+                    # _save_defect_image (the existing Einlaufband error-image
+                    # path) — separate output tree, separate config section.
+                    if self._training_collector is not None:
+                        try:
+                            _td_decision = self._training_collector.decide(
+                                frame_id=self._frame_count,
+                                is_ambiguous=self._orchestrator.last_observation_had_ambiguous,
+                                layout_fault_active=(
+                                    self._layout_monitor is not None
+                                    and self._layout_monitor.is_locked
+                                ),
+                            )
+                            if _td_decision.should_save:
+                                self._training_collector.save(cloth, _td_decision, self._frame_count)
+                        except Exception:  # noqa: BLE001
+                            logger.exception("[TRAINDATA-ERROR] collector failed")
 
                     # --- DIAGNOSTIC: row-profile bump/valley log (two-rows-at-once
                     # investigation). Read-only: does not feed any decision.
@@ -1746,6 +1797,30 @@ class MainWindow(QMainWindow):
             state_after=State.WAITING.value,
         ))
         self._push_signals_to_opcua()
+
+    def _on_traindata_maintenance_tick(self) -> None:
+        """QTimer.timeout handler for training_data.maintenance_interval_minutes.
+
+        Runs TrainingDataCollector.run_maintenance() (size scan + oldest-
+        date-folder cleanup) on a background daemon thread so a large
+        training_data tree can never block the GUI thread. If a previous
+        run is still in flight (very large tree / slow disk) this tick is
+        skipped rather than stacking overlapping cleanup threads.
+        """
+        if self._training_collector is None:
+            return
+        if self._traindata_maintenance_running.is_set():
+            logger.debug("[TRAINDATA] maintenance tick skipped — previous run still active")
+            return
+
+        def _run() -> None:
+            self._traindata_maintenance_running.set()
+            try:
+                self._training_collector.run_maintenance()
+            finally:
+                self._traindata_maintenance_running.clear()
+
+        threading.Thread(target=_run, name="TrainDataMaintenance", daemon=True).start()
 
     def _save_defect_image(self, image: np.ndarray, result: PipelineResult) -> Path | None:
         defect_dir = Path(self._cfg.storage.defect_image_dir)

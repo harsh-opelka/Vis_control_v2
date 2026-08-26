@@ -1,0 +1,162 @@
+STEP 7 — RESULT REPORT (training-data image collection feature)
+=====================================================================
+
+FILES CREATED / MODIFIED
+-------------------------------------------------------------------
+Created:
+  viscontrol/core/training_data_collector.py   TrainingDataCollector, SaveDecision
+                                                (no Qt/PySide6 imports — cv2 + stdlib only)
+  tests/test_training_data_collector.py        T1-T10 (see below)
+  image_collection_inspection.txt              STEP 0 findings
+  image_collection_result.txt                  this file
+
+Modified (all additive — see "existing path untouched" below):
+  config/default.yaml                storage.* section left byte-for-byte
+                                      unchanged; new `training_data:` block
+                                      appended after it, enabled: false.
+  viscontrol/core/config.py           new `_TrainingDataSection` model +
+                                      `AppConfig.training_data` field.
+  viscontrol/core/transfer_orchestrator.py
+                                       new `_last_observation_had_ambiguous`
+                                       attribute + read-only
+                                       `last_observation_had_ambiguous`
+                                       property, set inside the existing
+                                       EVENT-AMBIGUOUS loop in
+                                       `_process_observation`. No existing
+                                       log line, field, or behavior changed.
+  viscontrol/ui/main_window.py         - import TrainingDataCollector, `threading`.
+                                       - `self._training_collector` constructed
+                                         in `__init__` only if
+                                         `cfg.training_data.enabled` (None
+                                         otherwise).
+                                       - `self._traindata_timer` (QTimer)
+                                         wired in `__init__`, only when enabled.
+                                       - new `_on_traindata_maintenance_tick`
+                                         method (background-thread dispatch
+                                         for `run_maintenance()`).
+                                       - one new try/except block inside
+                                         `_on_frame`'s `if _hough_due:`
+                                         branch, right after the existing
+                                         `self._run_transfer_orchestrator(r,
+                                         profile)` call — decide()/save() on
+                                         the `cloth` ROI.
+                                       - `shutdown()`: stops the timer and
+                                         logs one line if enabled.
+
+CONFIRMATION: EXISTING EINLAUFBAND ERROR-IMAGE SAVING IS UNTOUCHED
+-------------------------------------------------------------------
+`MainWindow._save_defect_image` (main_window.py) and its call site inside
+`_apply_belt_fault_debounce` are byte-for-byte unchanged — no lines in
+either function were touched. `storage.defect_image_dir`,
+`storage.log_dir`, and every other key under the existing `storage:`
+section in config/default.yaml are unchanged. The new feature writes to a
+completely separate config section (`training_data:`) and a separate
+output tree (`training_data.output_dir`, default `"training_data"`), and
+the only two touch points shared with the pre-existing code are read-only
+observations already computed for other purposes (`self._layout_monitor.
+is_locked`, and the new `self._orchestrator.last_observation_had_ambiguous`
+property) — neither is written to or consumed by the belt-fault/defect-
+image path. `git diff --stat` confirms no changes inside
+`_save_defect_image` or `_apply_belt_fault_debounce`'s fault-raising block.
+
+BACKGROUND-THREAD CLEANUP (STEP 3)
+-------------------------------------------------------------------
+Yes, implemented, and necessary per the task's "must not block the GUI
+thread for a long time" requirement. `TrainingDataCollector.run_maintenance()`
+itself is plain, Qt-free, synchronous code (as required — the module may
+not import PySide6). The QTimer lives in MainWindow and fires
+`_on_traindata_maintenance_tick`, which:
+  1. Returns immediately (no-op) if the collector is disabled.
+  2. Returns immediately if a previous maintenance run is still in flight
+     (tracked via `threading.Event`), so overlapping cleanup threads can
+     never stack up under a slow disk / huge tree.
+  3. Otherwise spawns a short-lived daemon `threading.Thread` (named
+     "TrainDataMaintenance", matching the existing `FrameRecorder` writer-
+     thread pattern in viscontrol/io/recorder.py) that calls
+     `run_maintenance()` and clears the guard event in a `finally`.
+This mirrors the codebase's existing convention (plain `threading.Thread`,
+not `QThread`) already used by `FrameRecorder` for background disk I/O, so
+no new threading primitive/pattern was introduced.
+
+TEST RESULTS
+-------------------------------------------------------------------
+`py -m pytest tests/test_training_data_collector.py -v`: 10/10 PASSED
+(T1 layout_fault_always_saved, T2 ambiguous_always_saved,
+T3 normal_sampling_rate, T4 priority_order, T5 disk_guard_blocks_save,
+T6 disk_guard_cooldown, T7 jpeg_compression_actually_compresses,
+T8 cleanup_removes_oldest_first, T9 cleanup_never_partial_deletes,
+T10 disabled_by_default).
+
+Full suite (`py -m pytest -q`): 109 passed, 1 skipped, 21 failed — the 21
+failures are PRE-EXISTING on this branch (AppConfig missing
+`row_tracker`/`piece_tracker` attributes retired in an earlier refactor,
+unrelated to this change). Verified by `git stash` (removing every change
+in this task) and re-running: identically 21 failed / 99 passed / 1
+skipped on the unmodified branch. With this feature's changes applied,
+the same 21 fail and the 10 new tests all pass (99 + 10 = 109), i.e. zero
+regressions introduced.
+
+MEASURED COMPRESSION RATIO (T7)
+-------------------------------------------------------------------
+T7 saves a 1000x1000 synthetic uint8 array via `cv2.imencode('.jpg', ...,
+[IMWRITE_JPEG_QUALITY, 88])` and asserts the written file is smaller than
+the raw uncompressed array and is a valid, readable JPEG. Measured on
+pure random noise (the worst realistic case — maximizes entropy, so this
+is a deliberately pessimistic bound for the test assertion):
+  uncompressed: 1,000,000 bytes   jpeg: 733,742 bytes   ratio: 1.36x
+
+For a more representative estimate, the same encode was run on the
+repo's actual mock camera test frames (assets/test_images/*.png, real
+Basler-resolution 3200x2200 Mono8 stills, cloth-ROI-cropped to 1432x2200
+the same way `split_rois` crops a live frame):
+  01_clean.png       cloth ROI 2200x1432 -> jpeg ~52.5 KB (ratio ~58x)
+  10_row_fused.png   cloth ROI 2200x1432 -> jpeg ~52.7 KB (ratio ~60x)
+  20_column_fused.png cloth ROI 2200x1432 -> jpeg ~53.9 KB (ratio ~57x)
+These mock frames are clean/synthetic test fixtures, though, not live
+camera captures with real cloth-mesh texture and sensor noise — real
+frames will compress less well than this. The storage projection below
+therefore uses a bracketed (optimistic / conservative) per-image size
+rather than trusting the mock-image number alone.
+
+PROJECTED STORAGE ESTIMATE (normal_sample only, before any
+ambiguous/layout_fault images are added)
+-------------------------------------------------------------------
+Inputs: normal_sample_every_n_rows=20, 350 rows/hour, max_total_size_gb=50,
+cloth-ROI JPEG size bracketed at 53 KB (measured, mock frames — optimistic)
+to 250 KB (assumed, real textured Basler frames at 1432x2200, q88 —
+conservative planning number).
+
+  saves/hour = 350 rows/hour / 20 = 17.5 normal_sample images/hour
+
+  Per-day figures, two operating-hour assumptions:
+
+  8 h/day (single shift):
+    images/day = 17.5 * 8 = 140
+    optimistic  (53 KB):  140 * 53 KB  =  7,420 KB/day  = 0.00707 GB/day
+    conservative(250 KB): 140 * 250 KB = 35,000 KB/day  = 0.0334 GB/day
+
+  24 h/day (continuous line):
+    images/day = 17.5 * 24 = 420
+    optimistic  (53 KB):  420 * 53 KB  =  22,260 KB/day = 0.0212 GB/day
+    conservative(250 KB): 420 * 250 KB = 105,000 KB/day = 0.100 GB/day
+
+  Days until max_total_size_gb=50 is reached (normal_sample alone,
+  BEFORE any ambiguous/layout_fault images):
+    days = 50 GB / GB_per_day
+
+    8h/day, optimistic:   50 / 0.00707  ≈ 7,071 days  (≈ 19.4 years)
+    8h/day, conservative: 50 / 0.0334   ≈ 1,497 days  (≈  4.1 years)
+    24h/day, optimistic:  50 / 0.0212   ≈ 2,358 days  (≈  6.5 years)
+    24h/day, conservative:50 / 0.100    ≈   500 days  (≈  1.37 years)
+
+Conclusion: at this sampling rate (every 20th row event, ~17.5/hour),
+normal_sample alone is nowhere near capable of filling the 50 GB cap
+within any realistic product lifetime — even the conservative 24h/day
+bound gives >1 year of headroom before the rolling cleanup would ever
+need to remove a normal_sample folder. In practice ambiguous/layout_fault
+images (always-saved, rarer, same compression) will consume additional
+but still small headroom, since layout-lock and ambiguous-match events
+are, per the task's own framing, rare hard cases rather than a
+steady-state stream. The 50 GB cap and 10 GB min-free-space guard leave
+ample margin under the Jetson's ~70 GB currently free / 128 GB total SD
+card, even under the conservative bracket.

@@ -662,6 +662,23 @@ class _StorageSection(BaseModel):
     csv_log_keep_days: int = Field(90, ge=1)
 
 
+class _TrainingDataSection(BaseModel):
+    """Curated image collection for future YOLO/CV training — additive,
+    alongside (never replacing) storage.defect_image_dir error-image saving.
+    See viscontrol/core/training_data_collector.py: TrainingDataCollector.
+    Default OFF: must be explicitly enabled per Jetson deployment.
+    """
+
+    enabled: bool = False
+    output_dir: str = "training_data"
+    jpeg_quality: int = Field(88, ge=1, le=100)
+    normal_sample_every_n_rows: int = Field(20, ge=1)
+    min_free_space_gb: float = Field(10, ge=0)
+    low_disk_warning_cooldown_s: float = Field(300, ge=0)
+    max_total_size_gb: float = Field(50, gt=0)
+    maintenance_interval_minutes: int = Field(60, ge=1)
+
+
 class _PlcSection(BaseModel):
     """Production PLC OPC UA client settings (only used when mode='production')."""
 
@@ -699,6 +716,7 @@ class AppConfig(BaseModel):
     web: _WebSection = Field(default_factory=_WebSection)
     ui: _UiSection = Field(default_factory=_UiSection)
     storage: _StorageSection = Field(default_factory=_StorageSection)
+    training_data: _TrainingDataSection = Field(default_factory=_TrainingDataSection)
     plc: _PlcSection = Field(default_factory=_PlcSection)
 
     @field_validator("profiles")

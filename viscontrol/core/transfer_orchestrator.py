@@ -91,6 +91,13 @@ class TransferOrchestrator:
         self._display_counter: int = 0  # per cycle, for R1/R2/R3 numbering
         self._transfer_x: float = 0.0
         self._last_raw_cluster_count: int = 0
+        # Set at the top of _process_observation and flipped True inside its
+        # ambiguous-match loop (EVENT-AMBIGUOUS). Read-only observer state —
+        # not used by any association/lifecycle decision; exists solely so
+        # callers (e.g. the training-data collector) can tell whether the
+        # most recently drained OBSERVATION produced an ambiguous match,
+        # without re-deriving it from logs.
+        self._last_observation_had_ambiguous: bool = False
 
         # One physical cloth = one cycle; a cloth stops/restarts once per
         # row (see _process_plc_cloth_start / _process_plc_stop_ack) — those
@@ -156,6 +163,13 @@ class TransferOrchestrator:
                     self._logger.exception(
                         "[ORCH] UNCAUGHT-ERROR processing event {}", event
                     )
+
+    @property
+    def last_observation_had_ambiguous(self) -> bool:
+        """True if the most recently processed OBSERVATION event (inside
+        drain()) produced at least one ambiguous match (EVENT-AMBIGUOUS)."""
+        with self._lock:
+            return self._last_observation_had_ambiguous
 
     def snapshot(self) -> OrchestratorSnapshot:
         """Returns deep copies. UI reads this and nothing else."""
@@ -277,6 +291,7 @@ class TransferOrchestrator:
     # ---------- OBSERVATION processing ----------
 
     def _process_observation(self, event: TransferEvent) -> None:
+        self._last_observation_had_ambiguous = False
         # 0. idle-based new-cloth trigger (see start_cycle docstring). Only
         # fires when no row currently owns the transfer — an in-flight
         # transfer must never be interrupted by an idle timeout.
@@ -302,6 +317,7 @@ class TransferOrchestrator:
 
         # 3. ambiguous matches.
         for obs_index, candidate_row_ids, distances, chosen in result.ambiguous:
+            self._last_observation_had_ambiguous = True
             self._log(
                 "EVENT-AMBIGUOUS", level="warning", event=event,
                 reason=f"obs={obs_index} candidates={candidate_row_ids} "

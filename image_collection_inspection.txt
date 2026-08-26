@@ -1,0 +1,170 @@
+STEP 0 — INSPECTION REPORT (training-data image collection feature)
+=====================================================================
+
+A. Existing error-image save function (Einlaufband / belt faults)
+-------------------------------------------------------------------
+The LIVE path is `MainWindow._save_defect_image`, called from
+`_apply_belt_fault_debounce` once a belt fault has been confirmed for
+`belt_fault_debounce_frames` consecutive frames (main_window.py:1698,
+inside the `if fault_verdict:` -> `if self._belt_fault_debounce_count >=
+debounce_frames:` -> `if self._sm.raise_belt_fault(...)` block):
+
+    main_window.py:1698
+        img_path = self._save_defect_image(belt_roi, result)
+
+The save function itself, main_window.py:1750-1760:
+
+    def _save_defect_image(self, image: np.ndarray, result: PipelineResult) -> Path | None:
+        defect_dir = Path(self._cfg.storage.defect_image_dir)
+        defect_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y-%m-%d-%H-%M-%S-%f")
+        path = defect_dir / f"{stamp}-{result.verdict.value}.jpg"
+        try:
+            cv2.imwrite(str(path), image)
+            return path
+        except Exception:  # noqa: BLE001
+            logger.exception("failed to write defect image {}", path)
+            return None
+
+Trigger: a confirmed belt fault verdict (FAULT_ROW_FUSED, or legacy
+FAULT_UNKNOWN when `inspection.unknown_is_fault=True`) after debounce.
+Format: `.jpg` via bare `cv2.imwrite(path, image)` — no explicit
+IMWRITE_JPEG_QUALITY flag, so OpenCV's default JPEG quality (~95) is used.
+Naming: `{YYYY-MM-DD-HH-MM-SS-ffffff}-{verdict}.jpg`, flat (no date
+subfolders) directly under `storage.defect_image_dir`.
+Location: written under `self._cfg.storage.defect_image_dir`
+(config/default.yaml storage.defect_image_dir = "logs/defects").
+
+Note: there is a second, currently-UNUSED helper of the same name/purpose
+in viscontrol/io/storage.py (`save_defect_image` free function +
+`prune_defect_images`) — grepped and confirmed it has no call sites
+anywhere in the codebase except its own module. The pattern to follow for
+consistency is the LIVE one above (MainWindow._save_defect_image), not
+the dormant storage.py helper. Neither is touched by this feature.
+
+B. Where a fresh detection frame + Hough results are both available
+-------------------------------------------------------------------
+Inside `_on_frame` (main_window.py:673), under the `if snap.tuchabzug_running:`
+block, Hough only actually runs when rate-limited/staggered gating allows it
+(`_hough_due`, main_window.py:787-792). The frame where a fresh Hough pass
+just ran and produced its results is marked by the local flag
+`_hough_ran_this_frame = True` (main_window.py:807), set right after:
+
+    main_window.py:799-802
+        r = self._pipeline.run_cloth_tracking(
+            frame, profile, self._cfg.detection,
+            bg_reference_cloth=self._bg_reference_cloth,
+        )
+
+This IS the "row event" frame referred to in the task (a frame where a
+fresh Hough detection actually ran). Immediately after, still inside the
+`if _hough_due:` branch:
+
+    main_window.py:868-871
+        _t_r0 = time.perf_counter()
+        self._track_row_phase(r, profile)
+        self._run_transfer_orchestrator(r, profile)
+        _t_rowgroup_ms = (time.perf_counter() - _t_r0) * 1000.0
+
+`_run_transfer_orchestrator(r, profile)` (defined at main_window.py:1492)
+is the single point where: the fresh frame (`frame`, still in scope from
+`_on_frame`), the fresh Hough detections (`r.detections`), the clusters
+(`clusters = cluster_by_tangent(...)`, line 1563), and the layout-quality
+evaluation (`_lq`, line 1574) are ALL available together. This is the
+integration point for the new training-data save call — added at the end
+of `_run_transfer_orchestrator`, after `clusters`/`_lq` are computed, so it
+can read layout-lock state and the ambiguous-match outcome without
+re-deriving anything.
+
+"Row event" identification for `decide()`'s `frame_id` argument: use
+`self._frame_count` at the point of this call (matches every other log
+statement in this method, e.g. `source_frame_id=self._frame_count` in
+`make_event(...)`, main_window.py:1610) — NOT plain `_on_frame` frame_count,
+since that increments every camera frame regardless of whether Hough ran.
+Because the training-data save call is placed inside the `if _hough_due:`
+branch (via `_run_transfer_orchestrator`, which is itself only called from
+that branch), the "sample every Nth row event" requirement in STEP 1 is
+satisfied automatically: `_run_transfer_orchestrator` (and therefore the
+new save hook) only executes on frames where a fresh Hough detection ran,
+never on skipped/cached-reuse frames (main_window.py:890-892 `else:` reuses
+cached results and does NOT call `_run_transfer_orchestrator`).
+
+Ambiguous-event flag: EVENT-AMBIGUOUS is logged from
+`TransferOrchestrator._process_observation` (transfer_orchestrator.py:303-309),
+triggered by `result.ambiguous` entries returned from `self._associator.associate(...)`
+(transfer_orchestrator.py:291-294) — called during `self._orchestrator.drain()`
+(main_window.py:1614), i.e. AFTER `submit()`/`drain()` at the end of
+`_run_transfer_orchestrator`. There is currently NO public attribute or
+return value exposing whether an ambiguous match occurred on the most
+recent `drain()` call — `submit()`/`drain()` return `None`. To honor "find
+the actual flag/return value... do not guess", a minimal additive change is
+required: add `self._last_observation_had_ambiguous: bool` to
+`TransferOrchestrator.__init__`, set it to `False` at the top of
+`_process_observation` and `True` inside the existing ambiguous loop
+(transfer_orchestrator.py:304), and expose it via a new read-only property
+`last_observation_had_ambiguous`. This is purely additive (new attribute +
+property; the existing EVENT-AMBIGUOUS log call and all other behavior is
+unchanged) and is what `MainWindow` reads for `is_ambiguous=` immediately
+after `self._orchestrator.drain()` (main_window.py:1614) inside
+`_run_transfer_orchestrator`.
+
+layout_fault_active source: `self._layout_monitor is not None and
+self._layout_monitor.is_locked` — same expression already used at
+main_window.py:256 and :1235, confirmed live/correct.
+
+C. Image data type/format at that point
+-------------------------------------------------------------------
+`frame` (the parameter of `_on_frame`, still in scope inside
+`_run_transfer_orchestrator` via closure over `self`... actually
+`_run_transfer_orchestrator` does not receive `frame` as a parameter, only
+`r` and `profile` — see below) originates from the Basler/mock camera with
+`camera.pixel_format = "Mono8"` (config/default.yaml:14, camera.py:240
+`camera.PixelFormat.SetValue(pixel_format)`). Confirmed grayscale
+elsewhere in the codebase: wizard_view.py:219/263 —
+`gray = frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)`
+— i.e. the live frame is already `ndim == 2` (single-channel grayscale),
+dtype `uint8`. `InspectionPipeline.split_rois` (pipeline.py:102-116)
+accepts `ndim in (2, 3)` and slices columns only, preserving dtype/ndim, so
+`belt`/`cloth` (and by extension any full-frame view) are also 2-D
+`uint8` arrays. Resolution is NOT fixed in config — it is whatever the
+connected Basler camera streams (or whatever the mock/test images are),
+so no fixed WxH constant exists to quote.
+
+Practical note for STEP 4 integration: `_run_transfer_orchestrator(self, r,
+profile)` does not currently take `frame` as a parameter — only `r`
+(the pipeline result) and `profile`. `frame` IS available in the enclosing
+`_on_frame` scope at the call site (main_window.py:870, right before
+`self._run_transfer_orchestrator(r, profile)` is called with `frame` still
+holding the just-grabbed grayscale image). Two options: (1) pass `frame`
+into `_run_transfer_orchestrator` as an extra parameter, or (2) do the
+training-data decide()/save() call in `_on_frame` right after the
+`_run_transfer_orchestrator(r, profile)` line instead of inside it. Per
+the task's instruction to keep this a "pure side-effect observer" with
+minimal footprint, and since `frame` is already in scope at the
+`_on_frame` call site without needing a signature change, this
+implementation hooks in `_on_frame` immediately after
+`self._run_transfer_orchestrator(r, profile)` (main_window.py:870),
+reading `self._orchestrator.last_observation_had_ambiguous` (new property,
+see part B) for `is_ambiguous`, `self._layout_monitor.is_locked` for
+`layout_fault_active`, and passing the raw grayscale `frame` (or
+`cloth`, the cloth-side ROI where Hough actually looked — `cloth` is
+chosen instead of the full `frame` since it's the same crop
+`run_cloth_tracking` operated on and is smaller/more relevant for
+training) as the image. Both `frame` and `cloth` are 2-D uint8 grayscale
+numpy arrays; `cv2.imencode('.jpg', image, [cv2.IMWRITE_JPEG_QUALITY, q])`
+handles single-channel arrays natively, no color conversion needed.
+
+D. Existing disk-space or file-count checking
+-------------------------------------------------------------------
+`viscontrol/ui/widgets/status_bar.py:59-61`:
+
+    usage = shutil.disk_usage(Path.cwd())
+    free_gb = usage.free / (1024 ** 3)
+    self._disk.setText(f"Disk: {free_gb:.1f} GB free")
+
+This is a UI status-bar readout only (no gating/blocking behavior) — it
+confirms `shutil.disk_usage()` is the established pattern in this codebase
+for free-space checks, which STEP 2's disk guard follows. No existing
+file-count checking or storage-cap/rolling-cleanup logic exists anywhere
+else in the codebase (`prune_defect_images` in storage.py prunes by file
+age/keep_days, not total size, and is unused/dormant as noted in part A).

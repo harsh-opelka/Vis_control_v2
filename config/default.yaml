@@ -249,3 +249,19 @@ storage:
   app_log_rotation_mb: 10
   app_log_keep_files: 7
   csv_log_keep_days: 90
+
+# Curated training-data image collection for future YOLO/CV model training.
+# ADDITIVE — runs alongside (never replaces) storage.defect_image_dir
+# error-image saving above. See viscontrol/core/training_data_collector.py.
+# Default OFF: enable explicitly per Jetson deployment, not globally.
+training_data:
+  enabled: false
+  output_dir: "training_data"
+  jpeg_quality: 88
+  normal_sample_every_n_rows: 5
+  min_free_space_gb: 10
+  low_disk_warning_cooldown_s: 300
+  max_total_size_gb: 50        # stays well under the 70GB free / 128GB
+                               # total, leaving headroom for the OS,
+                               # existing error images, and logs
+  maintenance_interval_minutes: 60
