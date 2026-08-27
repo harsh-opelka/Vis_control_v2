@@ -81,6 +81,10 @@ class RowRecord:
     last_seen_frame: int
     confirmed_upstream_frames: int
     missed_frames: int
+    piece_count: int = 0  # last known piece count from RowAssociator matches;
+                          # read by the training-data row-lifecycle capture
+                          # (see viscontrol/core/training_data_collector.py) —
+                          # not used by any association/lifecycle decision
     prev_front_tangent: float = 0.0  # snapshotted before each match, for tripwire crossing
     stop_event_id: str | None = None
     transfer_event_id: str | None = None

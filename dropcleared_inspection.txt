@@ -1,0 +1,106 @@
+STEP 0 — INSPECTION REPORT (drop "cleared" stage capture)
+=====================================================================
+
+DOES ANYTHING ELSE DEPEND ON on_row_cleared RUNNING?
+-------------------------------------------------------------------
+grepped the whole repo for `on_row_cleared`, `RowCaptureEvent`, and the
+sample-decision cache fields. The only references outside
+training_data_collector.py itself are:
+  - viscontrol/ui/main_window.py:310/316 — the single call site (inside
+    the `_on_row_terminal_capture` closure), and its own error-log string.
+  - viscontrol/core/config.py:684 — a stale doc-comment string mentioning
+    "on_row_tripwire/on_row_cleared" on the `capture_every_n_rows` config
+    field's description (needs updating in STEP 1, not code logic).
+  - tests/test_training_data_collector.py — test call sites only.
+No other production module (transfer_orchestrator.py, transfer_events.py,
+row_associator.py, etc.) reads anything TrainingDataCollector produces —
+it is a pure, one-way side-effect observer, confirmed by its own class
+docstring ("Pure side-effect observer"). Nothing downstream depends on
+`on_row_cleared` having run.
+
+MAIN_WINDOW.PY CALL SITE (main_window.py:305-317, quoted in full):
+
+    def _on_row_terminal_capture(row) -> None:  # noqa: ANN001
+        if self._training_collector is None:
+            return
+        try:
+            outcome = "transferred" if row.state == RowState.TRANSFERRED else "abandoned"
+            self._training_collector.on_row_cleared(
+                row.row_id, row.cycle_id, self._capture_cloth_image(),
+                self._row_piece_data(row), outcome,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "[TRAINDATA-ERROR] on_row_cleared capture failed row={}", row.row_id,
+            )
+
+Wired in via `on_row_terminal=_on_row_terminal_capture` at
+main_window.py:326, passed to `TransferOrchestrator(...)`. The
+orchestrator's `on_row_terminal` CONSTRUCTOR PARAMETER itself
+(transfer_orchestrator.py) is out of this task's file scope (only
+training_data_collector.py and main_window.py were named) and is left
+exactly as-is — passing nothing for it defaults to `None`, and the
+orchestrator's `_notify()` helper already no-ops on `None`, so this is
+sufficient to fully disable the call path with zero orchestrator
+changes needed. This mirrors exactly how `on_row_confirmed` was handled
+in the previous "drop confirmed" task (same precedent, same file-scope
+boundary).
+
+THE ROW-COUNTER / DEDUP LOGIC — DOES REMOVING "cleared" BREAK IT?
+-------------------------------------------------------------------
+Quoted from training_data_collector.py as it stands now (BEFORE this
+task's changes):
+
+    def _should_capture_row(self, row_id: int) -> bool:
+        """Save-every-Nth-row filter — applies only to row-lifecycle
+        capture (never ambiguous/layout_fault/fault). Computed once per
+        row_id, on whichever of on_row_tripwire/on_row_cleared arrives
+        first; the second call for the same row_id reuses the cached
+        decision, so both stages of one row always agree (never one
+        saving while the other skips). Bounded FIFO eviction, same
+        convention as _mark_if_new above.
+        """
+        cached = self._row_sample_decisions.get(row_id)
+        if cached is not None:
+            return cached
+
+        self._rows_seen_count += 1
+        every_n = max(1, self._cfg.capture_every_n_rows)
+        decision = self._rows_seen_count % every_n == 0
+
+        self._row_sample_decisions[row_id] = decision
+        self._row_sample_eviction_order.append(row_id)
+        bound = max(1, self._cfg.max_tracked_row_ids)
+        while len(self._row_sample_eviction_order) > bound:
+            oldest = self._row_sample_eviction_order.popleft()
+            self._row_sample_decisions.pop(oldest, None)
+        return decision
+
+`self._row_sample_decisions` (+ its eviction deque) exists FOR EXACTLY
+ONE REASON: to let two independent call paths (tripwire and cleared) for
+the SAME row_id agree on one save/skip decision without incrementing
+`_rows_seen_count` twice. Once `on_row_cleared` is removed, `on_row_tripwire`
+is the ONLY entry point into `_capture()` — and `_capture()` already gates
+every call through `_mark_if_new(row_id, stage)` FIRST
+(training_data_collector.py:232-237), which returns `False` (and returns
+early, BEFORE `_should_capture_row` is ever reached) on any genuine
+duplicate call for the same `(row_id, "tripwire")` pair. So with only one
+stage left, `_should_capture_row` can never legitimately be invoked twice
+for the same row_id — the per-row-id cache becomes provably dead weight,
+not just unused-but-harmless: every code path that could have exercised
+the "second call reuses the cached decision" branch is gone once
+`on_row_cleared` no longer exists. Removing it is safe AND required by
+this task's own "do not leave dead both-stages-agree logic" constraint.
+
+REPLACEMENT DESIGN (implemented in STEP 1): `_should_capture_row` no
+longer needs a row_id-keyed cache at all — it becomes a straight,
+unconditional increment-and-modulo check, called once per genuine (i.e.
+past `_mark_if_new`) tripwire capture. `self._row_sample_decisions` and
+`self._row_sample_eviction_order` are deleted entirely, not just
+unwired — there is no future call path that could ever populate or read
+them once `on_row_cleared` is gone.
+
+CONCLUSION: removing `on_row_cleared` is a clean, fully isolated deletion.
+Nothing else in the codebase depends on it running, and the row-counter's
+per-row-id cache can be simplified (not just left dangling) once it is
+gone.

@@ -1,0 +1,166 @@
+STEP 0 — INSPECTION REPORT (drop "confirmed" stage + add "fault" category)
+=====================================================================
+
+A. Exact call site(s) of on_row_confirmed in main_window.py
+-------------------------------------------------------------------
+There is exactly ONE call site, inside the closure `_on_row_confirmed_capture`
+defined in MainWindow.__init__ (main_window.py:292-303):
+
+    def _on_row_confirmed_capture(row) -> None:  # noqa: ANN001
+        if self._training_collector is None:
+            return
+        try:
+            self._training_collector.on_row_confirmed(
+                row.row_id, row.cycle_id, self._capture_cloth_image(),
+                self._row_piece_data(row),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "[TRAINDATA-ERROR] on_row_confirmed capture failed row={}", row.row_id,
+            )
+
+This closure is itself wired into the orchestrator constructor at
+main_window.py:332-341:
+
+    self._orchestrator = TransferOrchestrator(
+        cfg=self._cfg.transfer_orchestrator,
+        stop_command_sink=_orchestrator_stop_sink,
+        now_fn=time.monotonic,
+        logger=logger,
+        cycle_idle_reset_ms=self._cfg.detection.cycle_idle_reset_ms,
+        on_row_confirmed=_on_row_confirmed_capture,
+        on_row_tripwire=_on_row_tripwire_capture,
+        on_row_terminal=_on_row_terminal_capture,
+    )
+
+So there are two things to remove in main_window.py: the
+`_on_row_confirmed_capture` closure definition (292-303) and the
+`on_row_confirmed=_on_row_confirmed_capture,` keyword argument (338) —
+`on_row_tripwire=` and `on_row_terminal=` stay exactly as they are.
+
+Note: `TransferOrchestrator.__init__`'s `on_row_confirmed` parameter
+itself (viscontrol/core/transfer_orchestrator.py) and the
+`self._notify(self._on_row_confirmed, row)` call inside
+`_process_observation`'s DETECTED->ACTIVE step are NOT part of this
+task's file list (training_data_collector.py / main_window.py only) and
+are left as-is — passing `on_row_confirmed=None` (the parameter's default)
+from main_window.py is sufficient to fully disable that call path with
+zero orchestrator changes, since `_notify()` already no-ops on `None`.
+
+B. The exact existing Einlaufband fault-save function
+-------------------------------------------------------------------
+Full signature and body, main_window.py:1910-1920 (quoted in full — read
+only, NOT modified by this task):
+
+    def _save_defect_image(self, image: np.ndarray, result: PipelineResult) -> Path | None:
+        defect_dir = Path(self._cfg.storage.defect_image_dir)
+        defect_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y-%m-%d-%H-%M-%S-%f")
+        path = defect_dir / f"{stamp}-{result.verdict.value}.jpg"
+        try:
+            cv2.imwrite(str(path), image)
+            return path
+        except Exception:  # noqa: BLE001
+            logger.exception("failed to write defect image {}", path)
+            return None
+
+Image saved: the raw `belt_roi` ndarray passed in by the caller (grayscale,
+same Mono8 uint8 crop as everywhere else in this codebase).
+
+Trigger / call site — main_window.py:1764-1825, inside
+`_apply_belt_fault_debounce`, specifically:
+
+    if fault_verdict:
+        ...
+        if self._belt_fault_debounce_count >= debounce_frames:
+            ...
+            self._belt_fault_armed = False
+            self._belt_fault_debounce_count = 0
+            if self._sm.raise_belt_fault(result.fault_reason or result.verdict.value):
+                self._counts.inspected += 1
+                self._counts.defects += 1
+                self._inference_view.add_recent_defect(result.verdict.value)
+                img_path = self._save_defect_image(belt_roi, result)          # <-- line 1806
+                self._event_log.append(Event(
+                    event_type=EventType.FAULT_RAISED,
+                    profile_name=self._cfg.app.active_profile,
+                    fault_reason=result.fault_reason or result.verdict.value,
+                    image_filename=str(img_path) if img_path else "",
+                    state_before=State.TRACKING.value,
+                    state_after=State.FAULT.value,
+                ))
+                self._inference_view.set_counts(self._counts)
+                self._push_signals_to_opcua()
+                self._request_plc_set_error()
+                logger.info(...)
+
+So the trigger is: `belt_fault_debounce_frames` consecutive fault-verdict
+frames (result.verdict.is_fault True, i.e. Verdict.FAULT_ROW_FUSED or
+legacy FAULT_UNKNOWN — see events.py:46-68) AND
+`self._sm.raise_belt_fault(...)` returning True (state machine actually
+transitions to FAULT, not already there).
+
+Data available at this exact call site (main_window.py:1806, right
+where `img_path = self._save_defect_image(belt_roi, result)` runs) —
+real field names only, from viscontrol/core/events.py:
+  - `result.verdict` — a `Verdict` str-Enum (events.py:46-68): OK,
+    FAULT_ROW_FUSED, FAULT_UNKNOWN, INFO_COLUMN_FUSED,
+    INFO_INCOMPLETE_ROW, INFO_UNKNOWN_NONFAULT. `.value` gives the string.
+  - `result.fault_reason: str = ""` (events.py:104) — free-text reason,
+    empty string if none.
+  - `result.detections`, `result.inference_ms`, `result.annotated_image`,
+    `result.crop_rect` — also on `PipelineResult` (events.py:100-105) but
+    not obviously relevant metadata for a fault sidecar.
+  - `self._cfg.plc.fault_error_code` (config.py `_PlcSection`,
+    config/default.yaml `plc.fault_error_code: 2`) — the ONLY numeric
+    "error code" concept anywhere near this call site: a single fixed
+    config value written to the PLC's `ext_error` on ANY belt fault (not
+    per-verdict-type — see main_window.py:2769-2774
+    `_request_plc_set_error`: "Queue writing fault_error_code to
+    ext_error"). This is what "error_code" in
+    `on_einlaufband_fault(image, error_code, ...)` should be — it is the
+    real, already-computed value used for the actual PLC fault signal,
+    not invented.
+  - `datetime.now()` — a timestamp is trivially available (same as every
+    other call site in this file), for the sidecar's ISO8601 field.
+  - There is NO row_id/cycle_id available here — belt-side inspection
+    (Einlaufband) is entirely decoupled from cloth-side row tracking
+    (confirmed already in row_capture_inspection.txt part C). No fused
+    boolean flag is available either as a real field (Verdict is an
+    Enum string, not a bool) — `metadata` passed to
+    `on_einlaufband_fault` will include `verdict` (the enum's `.value`
+    string) and `fault_reason`, both real, and nothing invented for
+    row-style fields that don't apply here.
+
+C. Does on_row_tripwire / on_row_cleared depend on on_row_confirmed state?
+-------------------------------------------------------------------
+No. Read viscontrol/core/training_data_collector.py in full:
+  - `_mark_if_new(row_id, stage)` (lines 235-251) tracks
+    `self._captured_stages: dict[int, set[str]]` — a per-row_id SET of
+    stage strings already captured. Each stage ("confirmed", "tripwire",
+    "cleared") is added/checked independently; there is no ordering
+    requirement, no cross-stage state, and no field on `RowCaptureEvent`
+    or `RowPieceData` that "confirmed" populates for later stages to
+    read. `on_row_tripwire`/`on_row_cleared` build their own
+    `RowCaptureEvent` fresh from the `piece_data`/`outcome` arguments
+    passed in by the CALLER (MainWindow) each time — nothing is threaded
+    through from a prior `on_row_confirmed` call inside the collector.
+  - The only shared structure touched by all three is the eviction deque
+    (`self._row_id_eviction_order`), which only cares about row_id
+    (first-seen-wins for eviction ordering), never about which specific
+    stage was seen first. Removing "confirmed" from `_STAGES` and
+    deleting `on_row_confirmed` leaves `_mark_if_new` fully generic
+    (it never hardcodes stage names) — no change needed there beyond
+    the docstring/`_STAGES` tuple.
+  - On the MainWindow side, `_capture_cloth_image()` and
+    `_row_piece_data(row)` (main_window.py:1882-1908) are stateless
+    helpers re-derived fresh on every call from `self._latest_frame` /
+    the `row` argument — `on_row_tripwire_capture`/`on_row_terminal_capture`
+    call them independently and do not read anything
+    `_on_row_confirmed_capture` would have set.
+
+CONCLUSION: removing `on_row_confirmed` (both the collector method and
+the MainWindow call site/closure) is a clean, fully isolated deletion —
+`on_row_tripwire` and `on_row_cleared` need zero changes to keep working
+exactly as before, and the existing "every row gets at least 'cleared'"
+guarantee is untouched (it never depended on "confirmed" firing first).

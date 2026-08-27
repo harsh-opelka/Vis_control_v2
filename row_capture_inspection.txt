@@ -1,0 +1,283 @@
+STEP 0 — INSPECTION REPORT (row-lifecycle training-data capture)
+=====================================================================
+
+A. The three row-state transitions, exact call sites
+-------------------------------------------------------------------
+All three live in viscontrol/core/transfer_orchestrator.py, inside
+_process_observation() (called once per row-event frame, from drain()).
+
+1. DETECTED -> ACTIVE ("row confirmed")
+   transfer_orchestrator.py:350-357 (step "6." of _process_observation):
+     # 6. DETECTED -> ACTIVE.
+     for row in self._existing_rows_sorted():
+         if row.state == RowState.DETECTED:
+             if (
+                 row.confirmed_upstream_frames >= self._cfg.row_arm_min_frames
+                 and row.front_tangent > self._transfer_x
+             ):
+                 self._transition(row, RowState.ACTIVE, "confirmed_upstream", event)
+   This is the ONLY call site that produces this transition (checked
+   _ALLOWED_TRANSITIONS: (DETECTED, ACTIVE) appears once, at line 36, and
+   the only place RowState.ACTIVE is ever passed as new_state is this
+   line 357).
+
+2. ACTIVE -> STOP_REQUESTED ("tripwire crossed")
+   transfer_orchestrator.py:359-367 (step "7."):
+     # 7. tripwire crossing for ACTIVE rows only.
+     for row in self._existing_rows_sorted():
+         if row.state == RowState.ACTIVE:
+             crossed = (
+                 row.prev_front_tangent > self._transfer_x
+                 and row.front_tangent <= self._transfer_x
+             )
+             if crossed:
+                 self._request_stop(row, event)
+   The actual transition happens inside _request_stop() (line 508-547),
+   specifically at line 542:
+     self._transition(row, RowState.STOP_REQUESTED, "tripwire_crossing", event)
+   followed immediately (line 547) by the ONLY existing production stop
+   command call:
+     self._stop_command_sink(row.snapshot)
+
+   AMBIGUITY (flagged per instructions, not guessed):
+   _request_stop() has THREE early-return guards before the transition
+   (line 508-533): (1) idempotency — row.stop_event_id already set,
+   (2) row.state is not ACTIVE, (3) another row already owns the
+   transfer (_OWNING_STATES check). In the third case specifically, a row
+   CAN geometrically cross the tripwire (crossed=True at step 7) yet
+   never reach STOP_REQUESTED and never get a stop command — it "passed
+   through" the transfer line without being stopped, because another row
+   was still mid-transfer. Separately (not from this guard, but from the
+   rest of the lifecycle), a row can also leave ACTIVE via the terminal
+   ABANDONED transition (missed_frames_timeout, transfer_orchestrator.py:
+   387-400) WITHOUT ever crossing at all (e.g. detection loses the piece
+   before it reaches the line).
+
+   RESOLUTION: the task's own STEP 1 point 4 and its STEP 5 test T5
+   ("row_without_tripwire_still_gets_cleared_capture ... Assert it still
+   gets 2 images (confirmed + cleared), not silently zero") already
+   settle this: the "tripwire" photo is tied EXACTLY to the
+   ACTIVE -> STOP_REQUESTED transition succeeding (i.e., a stop command
+   was actually issued for that row) — not to "the row's front_tangent
+   geometrically crossed transfer_x." A row that crosses but is blocked
+   by the ownership guard, or that never crosses at all, simply does not
+   get an on_row_tripwire() call; it still gets on_row_confirmed() (if it
+   reached ACTIVE) and on_row_cleared() (when it terminates), i.e. 2 of 3
+   photos, never 0. This is unambiguous from the full prompt (STEP 1 +
+   T5), so no user clarification was requested — proceeding on this
+   basis. Documented here for the record rather than silently assumed.
+
+   SEPARATE, SMALLER EDGE CASE (also flagged, not silently patched): a
+   row that is ABANDONED before ever reaching ACTIVE (never confirmed —
+   e.g. a one-frame noise blob that disappears before
+   confirmed_upstream_frames reaches row_arm_min_frames) will get only
+   1 of 3 photos ("cleared" only), because it never had a "confirmed"
+   event to fire either. This is expected/inherent — such a row never
+   passed through "confirmed" in the first place, so 2-of-3 doesn't
+   apply to it; it is not the same case STEP 1/T5 describe (which is
+   specifically "confirmed but never crossed the tripwire").
+
+3. Terminal transition: TRANSFERRED or ABANDONED ("row cleared")
+   TRANSFERRED — transfer_orchestrator.py:369-384 (step "8."):
+     for row in self._existing_rows_sorted():
+         if row.state == RowState.TRANSFERRING:
+             ...
+             if exited or timed_out:
+                 reason = "transfer_timeout" if timed_out and not exited else "exit_margin"
+                 if self._transition(row, RowState.TRANSFERRED, reason, event):
+                     ...
+   ABANDONED — THREE call sites, not one:
+     a) transfer_orchestrator.py:387-400 (missed_frames_timeout, from
+        DETECTED or ACTIVE):
+          if self._transition(row, RowState.ABANDONED, "missed_frames_timeout", event):
+     b) transfer_orchestrator.py:401-411 (stop_ack_timeout, from
+        STOP_REQUESTED — PLC never acknowledged the stop):
+          if self._transition(row, RowState.ABANDONED, "stop_ack_timeout", event):
+     c) transfer_orchestrator.py:206-220, inside start_cycle() —
+        cycle_restart. THIS ONE DOES NOT GO THROUGH _transition() AT ALL;
+        it sets state directly:
+          for row in self._existing_rows_sorted():
+              if row.state not in _TERMINAL_STATES:
+                  old_state = row.state
+                  row.state = RowState.ABANDONED
+                  row.history.append((ts, old_state, RowState.ABANDONED, "cycle_restart"))
+                  self._log(...)
+   So the single common choke point for (TRANSFERRED + 2 of the 3
+   ABANDONED paths) is _transition() itself (transfer_orchestrator.py:
+   551-576) whenever new_state is a terminal state — EXCEPT the
+   cycle_restart path in start_cycle(), which bypasses _transition()
+   entirely and needs its own explicit hook call for full coverage.
+
+B. Does MainWindow already observe these transitions?
+-------------------------------------------------------------------
+Partially, for exactly ONE of the three — checked the real call chain,
+did not assume:
+
+- ACTIVE -> STOP_REQUESTED ("tripwire"): YES, already observable. MainWindow
+  wires stop_command_sink=_orchestrator_stop_sink (main_window.py:275-287)
+  into TransferOrchestrator's constructor; this closure is called
+  synchronously at transfer_orchestrator.py:547, exactly once per
+  successful STOP_REQUESTED transition. However it receives a
+  TransferSnapshot (row_id, cycle_id, track_id, stop_event_id,
+  transfer_event_id, created_at, created_from_frame_id — see part C) —
+  it does NOT receive the RowRecord itself, so front_tangent/back_tangent/
+  piece_count aren't directly available from this callback's argument.
+
+- DETECTED -> ACTIVE ("confirmed"): NO existing hook. MainWindow currently
+  only reads row state via self._orchestrator.snapshot() (OrchestratorSnapshot,
+  called at main_window.py:1196 for the throttled diagnostic display block) —
+  a poll, not a per-transition callback. Diffing consecutive snapshot() calls
+  frame-to-frame was considered and rejected: DETECTED->ACTIVE (step 6) and
+  ACTIVE->STOP_REQUESTED (step 7) both run inside the SAME
+  _process_observation() call, in that order — a row that reaches
+  row_arm_min_frames confirmation AND already satisfies the crossing
+  condition in the same frame would go DETECTED->ACTIVE->STOP_REQUESTED
+  within one drain() call. Diffing snapshot() only after drain() would see
+  only the final STOP_REQUESTED state and silently skip the "confirmed"
+  photo entirely. A synchronous callback fired exactly at the transition
+  (like the existing stop_command_sink) does not have this gap.
+  CONCLUSION: a new hook is needed.
+
+- Terminal (TRANSFERRED/ABANDONED) ("cleared"): NO existing hook, same
+  reasoning as above. New hook needed, at BOTH _transition() (covers
+  TRANSFERRED, missed_frames_timeout-ABANDONED, stop_ack_timeout-ABANDONED)
+  AND the cycle_restart loop inside start_cycle() (the one path that
+  bypasses _transition() — see part A.3.c above).
+
+DESIGN CHOSEN (mirrors the existing, already-proven stop_command_sink
+pattern exactly — a single optional callback injected via
+TransferOrchestrator.__init__, invoked synchronously at the exact
+transition, receiving the RowRecord): add three new optional constructor
+parameters, on_row_confirmed / on_row_tripwire / on_row_terminal, each
+Callable[[RowRecord], None] | None = None (backward compatible — every
+existing caller/test that constructs TransferOrchestrator without these
+kwargs is unaffected). on_row_tripwire is invoked alongside (not
+replacing) the existing stop_command_sink call at line 547 — the real
+PLC stop path is completely untouched. on_row_confirmed is invoked at
+line 357. on_row_terminal is invoked from inside _transition() (when
+new_state is terminal) and from start_cycle()'s cycle_restart loop.
+Exceptions from any of these three callbacks are already caught by
+drain()'s existing per-event try/except (transfer_orchestrator.py:
+154-164) or start_cycle()'s caller context — same safety net that already
+protects stop_command_sink today (that callback itself has no local
+try/except either, and drain() catches it) — but the MainWindow-side
+callback bodies still get their own explicit try/except per this task's
+instructions, for clear logging and defense in depth.
+
+C. What row data is available at each point — REAL field names only
+-------------------------------------------------------------------
+RowRecord (viscontrol/core/transfer_events.py:72-93) fields:
+  row_id, cycle_id, track_id, display_number, state, front_tangent,
+  back_tangent, first_seen_frame, last_seen_frame,
+  confirmed_upstream_frames, missed_frames, prev_front_tangent,
+  stop_event_id, transfer_event_id, snapshot, created_at,
+  stop_requested_at, stopped_at, transfer_started_at, transferred_at,
+  history.
+
+TransferSnapshot (transfer_events.py:56-68, what stop_command_sink
+receives) fields: cycle_id, row_id, track_id, stop_event_id,
+transfer_event_id, created_at, created_from_frame_id.
+
+IMPORTANT GAPS — confirmed by reading, not assumed:
+  - RowRecord has NO piece_count field and NO per-piece tangent_x list.
+    The only "position" data retained per row is the AGGREGATE
+    front_tangent/back_tangent pair (leading/trailing edge of the whole
+    cluster) — individual piece tangent_x values exist only transiently
+    in viscontrol/detection/proximity_clustering.py's ClusteredPiece
+    objects (inside MainWindow's `clusters` local variable in
+    _run_transfer_orchestrator), and are reduced to
+    ClusterObservation(front_tangent, back_tangent, piece_count, ...)
+    before ever reaching the orchestrator — the per-piece list does not
+    propagate past that point.
+  - piece_count DOES exist, but only transiently: RowAssociator.associate()
+    computes it (row_associator.py:26 "matches: dict # {row_id:
+    (front_tangent, back_tangent, piece_count)}", row_associator.py:110-111
+    "piece_count = sum(o.piece_count for o in matched_obs); matches[row_id]
+    = (front, back, piece_count)") and _process_observation applies it at
+    step "4. apply matches" (transfer_orchestrator.py:326-339) — but ONLY
+    front/back are written onto the RowRecord there
+    (row.front_tangent = front; row.back_tangent = back); piece_count is
+    read and then discarded, never stored on the row.
+  - There is NO "fused"/"row_fused"/"column_fused" flag anywhere in
+    RowRecord, TransferEvent, ClusterObservation, or row_associator.py
+    (grepped all three files for "fused" — zero matches). The only
+    "fused" concept in the entire codebase is Verdict.FAULT_ROW_FUSED
+    (viscontrol/core/events.py:55), a BELT-SIDE inspection verdict
+    (Einlaufband fault classification) that is completely decoupled from
+    cloth-side row_id/cycle_id — there is no code path that maps a belt
+    fault verdict to a specific cloth row. So "fused" is genuinely
+    unknown at ALL THREE cloth-side hook points, not just "not yet known
+    at this stage" as the RowCaptureEvent docstring speculated — it is
+    never known via this data model. Implemented as always None (null),
+    per the "use null rather than guessing" constraint — never
+    hardcoded to False/True.
+
+DECISIONS MADE TO USE ONLY REAL FIELDS (no invented data):
+  - piece_count: added as a NEW field on RowRecord (transfer_events.py),
+    populated at the same step-4 "apply matches" point where
+    front/back already are (row.piece_count = piece_count). This is a
+    minimal, additive field mirroring the existing front_tangent/
+    back_tangent pattern — it does not change any transition/decision
+    logic, only makes an already-computed real value durably readable at
+    all three hook points (previously it was computed then discarded).
+    New rows get piece_count from _create_row's own (front, back,
+    piece_count, source_indices) tuple (row_associator.py:162,
+    transfer_orchestrator.py:416-417) — also a real, already-computed
+    value, not invented.
+  - tangent_xs (RowCaptureEvent field): per the gap above, real
+    per-piece tangent_x values are not available at the row/orchestrator
+    level. Implemented as the tuple (front_tangent, back_tangent) — the
+    only real "positions" data that exists per row — NOT a fabricated
+    per-piece list. This is documented in the field's JSON/dataclass
+    comment so nobody mistakes it for individual piece coordinates.
+  - fused: always None (see above).
+  - outcome: derived from row.state at the terminal hook — "transferred"
+    if RowState.TRANSFERRED, "abandoned" if RowState.ABANDONED (the only
+    two members of _TERMINAL_STATES, transfer_orchestrator.py:53) — a
+    real, direct mapping, not a guess.
+
+D. Image availability at the three hook points
+-------------------------------------------------------------------
+Same grayscale-frame facts as the previous inspection
+(image_collection_inspection.txt, now deleted per the separate cleanup
+task, but re-verified fresh here): camera.pixel_format="Mono8"
+(config/default.yaml), so frames are 2-D uint8 numpy arrays; resolution
+is whatever the connected camera streams (not fixed in config).
+
+NEW consideration specific to this change: the three new hook points fire
+from CALLBACKS defined in MainWindow.__init__ (closures over self), not
+from code running inside _on_frame's own local scope — so they cannot
+close over _on_frame's local `frame`/`cloth` variables directly. Checked
+what IS available on `self` at arbitrary callback-fire time:
+  - self._latest_frame (main_window.py:134, assigned at main_window.py:723
+    every _on_frame call) — the full raw grayscale frame — already exists
+    and is safe to read from a callback, since all three hook points fire
+    synchronously within the same _on_frame call that just set it (no
+    threads, no queues between _on_frame and drain() — confirmed the
+    whole chain _on_frame -> _run_transfer_orchestrator -> submit()/
+    drain() -> _process_event -> _process_observation -> the three
+    transition points is single-threaded, GUI-thread-only, see drain()'s
+    own docstring "MUST be called only from the GUI thread inside
+    _on_frame").
+  - The cloth ROI itself (`cloth` in _on_frame) is NOT stored on `self`
+    anywhere today. However, main_window.py already has an established,
+    reusable pattern for re-deriving it on demand from self._latest_frame
+    outside _on_frame's scope — used at main_window.py:2405-2407 and
+    2444-2445:
+      profile = self._active_profile_cache
+      _belt, cloth = self._pipeline.split_rois(self._latest_frame, profile)
+    This exact pattern (wrapped in try/except ValueError, matching those
+    call sites) is what the three new callbacks use to get the cloth ROI
+    image, rather than inventing a new `self._latest_cloth_roi` cache.
+  - start_cycle(reason="session_start") (the one ABANDONED path that
+    bypasses _transition()) is called from _reset_tracking_session()
+    (main_window.py:2722, 2746) — e.g. right when detection starts.
+    self._latest_frame may still be None at that exact moment (camera
+    frame not yet received). The on_row_terminal callback handles this
+    by skipping the capture (checks self._latest_frame is not None first,
+    same guard already used elsewhere in this file, e.g. main_window.py:
+    2400, 2438) — never crashes, never fabricates an image.
+
+CONCLUSION: proceeding to STEP 1. The ambiguity in part A.2 is resolved
+per the task's own STEP 1/T5 (documented above); no AskUserQuestion was
+needed since the prompt already settles it downstream.

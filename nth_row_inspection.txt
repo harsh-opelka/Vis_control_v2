@@ -1,0 +1,98 @@
+STEP 0 — INSPECTION REPORT ("save every Nth row" filter)
+=====================================================================
+
+A. Does a session-wide, never-resetting row counter already exist?
+-------------------------------------------------------------------
+Yes — but it's on the orchestrator side, not currently exposed to or
+used by TrainingDataCollector. Quoted from
+viscontrol/core/transfer_orchestrator.py:
+
+    transfer_orchestrator.py:94
+        self._next_row_id: int = 1  # NEVER reset within a process run
+
+    transfer_orchestrator.py:493-495 (_create_row, the only place a new
+    row_id is ever assigned):
+        row_id = self._next_row_id
+        self._next_row_id += 1
+
+`row_id` (and `track_id`, which is set equal to `row_id` at creation —
+"association identity == row identity in this model", line 500) is
+therefore ALREADY a stable, ever-incrementing, whole-process-run counter
+— confirmed by checking every place `_next_row_id` could theoretically be
+reset: `start_cycle()` (transfer_orchestrator.py:204-236, the
+cycle-restart method — the only place `cycle_id` changes) does NOT touch
+`_next_row_id` at all. It only does:
+
+    transfer_orchestrator.py:217-218
+        self._cycle_id += 1
+        self._display_counter = 0
+
+So what DOES reset per cycle is `cycle_id` (increments every
+cycle_restart/session_start/idle_timeout) and `display_number`/
+`_display_counter` (the R1/R2/R3 UI numbering, reset to 0 every cycle —
+see transfer_orchestrator.py:501 `display_number=self._display_counter`).
+`row_id` itself is untouched by any cycle-reset code path anywhere in the
+file (grepped the whole module for `_next_row_id` — only the two lines
+quoted above touch it).
+
+This slightly contradicts this task's stated premise ("row_id, which may
+reset per cycle") — in this codebase, row_id specifically does NOT reset
+per cycle; `cycle_id` and `display_number` do. `row_id` alone would in
+fact already be usable as an ever-incrementing per-row ordinal for a
+modulo-N filter.
+
+B. Proposed implementation — self-contained in TrainingDataCollector
+-------------------------------------------------------------------
+Even though `row_id` already never resets (part A), this task's STEP 1
+explicitly and unconditionally specifies building the counter inside
+TrainingDataCollector itself (`self._rows_seen_count`, incremented once
+per unique row_id the COLLECTOR observes, with its own dedup set), rather
+than reading/relying on the orchestrator's `row_id` value directly. That
+instruction is followed as given, for these reasons (beyond just "the
+task said so"):
+  - Self-containment: TrainingDataCollector (per its own module docstring)
+    is designed to be a standalone, Qt-free, orchestrator-independent
+    module, importable and testable with zero orchestrator dependency —
+    every existing test in tests/test_training_data_collector.py
+    constructs a bare `TrainingDataCollector` and calls
+    `on_row_tripwire`/`on_row_cleared` directly with plain ints for
+    row_id/cycle_id, never touching a real `TransferOrchestrator`. Relying
+    on `row_id`'s numeric VALUE (e.g. "does row_id % N == 0") would
+    silently assume row_id starts at 1 and is contiguous — true today,
+    but an incidental implementation detail of `_create_row`, not a
+    contract TrainingDataCollector should depend on.
+  - Robustness to future orchestrator changes: if `_next_row_id` were ever
+    reset (e.g. a future refactor of `start_cycle()`) or row_ids were ever
+    assigned non-contiguously, a filter based on `self._rows_seen_count`
+    (counting distinct rows THIS collector has actually observed) keeps
+    working identically, whereas a `row_id % N` check would silently
+    change behavior with zero code change in this file.
+  - It naturally reuses the exact same bounded per-row-id tracking pattern
+    already in this file (`_captured_stages` / `_row_id_eviction_order` in
+    `_mark_if_new`), so the new counter's own per-row dedup set can follow
+    the same bounded-FIFO-eviction convention rather than introducing a
+    second, differently-shaped unbounded structure.
+
+Plan (implemented in STEP 1):
+  - `self._rows_seen_count: int = 0` in `__init__`.
+  - `self._counted_row_ids: dict[int, bool] = {}` (row_id -> the frozen
+    should_capture_this_row decision) + `self._counted_row_id_eviction_order:
+    deque[int] = deque()`, bounded to `cfg.max_tracked_row_ids` exactly
+    like the existing `_captured_stages`/`_row_id_eviction_order` pair —
+    a SEPARATE bounded structure from the per-stage dedup guard (that one
+    tracks "which stages has this row_id already saved," this one tracks
+    "did this row_id count toward rows_seen, and what was the sampling
+    verdict") — kept distinct because they answer different questions and
+    are read/written at different points in `_capture()`.
+  - On the first `on_row_tripwire`/`on_row_cleared` call for a given
+    row_id (whichever comes first): increment `self._rows_seen_count`,
+    compute `should_capture_this_row = (self._rows_seen_count %
+    cfg.capture_every_n_rows == 0)`, store it keyed by row_id. On the
+    second call for the same row_id (the other of tripwire/cleared): reuse
+    the stored decision — never recompute, so both stages of one row
+    always agree.
+  - Applies ONLY inside `_capture()` (the shared body of
+    `on_row_tripwire`/`on_row_cleared`) — `decide()`/`save()` (ambiguous /
+    layout_fault) and `on_einlaufband_fault` (fault) are separate methods
+    that never call `_capture()` and never read `self._rows_seen_count` /
+    `self._counted_row_ids` — verified by grep (see nth_row_result.txt).

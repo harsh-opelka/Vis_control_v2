@@ -254,14 +254,24 @@ storage:
 # ADDITIVE — runs alongside (never replaces) storage.defect_image_dir
 # error-image saving above. See viscontrol/core/training_data_collector.py.
 # Default OFF: enable explicitly per Jetson deployment, not globally.
+# Capture is row-lifecycle-driven (on_row_tripwire — 1 image per selected
+# row_id, subject to capture_every_n_rows below) plus the always-on
+# ambiguous/layout_fault/fault hard-case paths (never filtered by
+# capture_every_n_rows) — NOT a frame-counter sample rate.
 training_data:
-  enabled: false
+  enabled: True
   output_dir: "training_data"
   jpeg_quality: 88
-  normal_sample_every_n_rows: 5
   min_free_space_gb: 10
   low_disk_warning_cooldown_s: 300
   max_total_size_gb: 50        # stays well under the 70GB free / 128GB
                                # total, leaving headroom for the OS,
                                # existing error images, and logs
   maintenance_interval_minutes: 60
+  max_tracked_row_ids: 500     # dedup-guard bound: distinct row_ids kept in
+                               # memory to prevent duplicate per-stage saves;
+                               # oldest evicted once exceeded (long-run safe)
+  capture_every_n_rows: 5      # save every Nth row's tripwire image; applies
+                               # ONLY to row-lifecycle capture — the
+                               # ambiguous/layout_fault/fault paths always
+                               # save every occurrence, unconditionally

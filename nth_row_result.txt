@@ -1,0 +1,132 @@
+STEP 4 — RESULT REPORT ("save every Nth row" filter)
+=====================================================================
+
+ROW COUNTER IMPLEMENTATION
+-------------------------------------------------------------------
+Implemented self-contained inside TrainingDataCollector, per STEP 0 part B
+and STEP 1, even though STEP 0 part A found that `transfer_orchestrator.py`'s
+`row_id` already never resets within a process run (`self._next_row_id: int
+= 1  # NEVER reset within a process run`, transfer_orchestrator.py:94 — only
+`cycle_id`/`display_number` reset on cycle_restart, confirmed by reading
+`start_cycle()` in full). The collector does NOT read or depend on
+`row_id`'s numeric value at all:
+
+  - `self._rows_seen_count: int = 0` (__init__) — incremented exactly
+    once per DISTINCT row_id the collector itself observes (not derived
+    from row_id's value).
+  - `self._row_sample_decisions: dict[int, bool]` + a bounded FIFO
+    `self._row_sample_eviction_order: deque[int]` (same eviction
+    convention as the existing `_captured_stages`/`_row_id_eviction_order`
+    dedup guard, bounded to `cfg.max_tracked_row_ids`) — caches the frozen
+    should-save decision per row_id.
+  - New `_should_capture_row(row_id)` method: on the first call for a
+    row_id (from whichever of `on_row_tripwire`/`on_row_cleared` arrives
+    first), increments `_rows_seen_count`, computes
+    `rows_seen_count % capture_every_n_rows == 0`, caches it. Every
+    subsequent call for the same row_id (the other stage) reads the
+    cached value — never recomputes — so both stages of one row always
+    agree, by construction (not by coincidence).
+  - Wired into `_capture()` (the shared body both `on_row_tripwire` and
+    `on_row_cleared` call) immediately after the existing per-stage dedup
+    check (`_mark_if_new`): if the row wasn't selected, logs
+    `[TRAINDATA] ROW-SKIPPED-BY-SAMPLE row={} rows_seen={} every_n={}`
+    and returns before building the `RowCaptureEvent` or writing anything
+    — no image, no sidecar, for either stage.
+
+
+CONFIRMATION: AMBIGUOUS/FAULT PATHS UNAFFECTED
+-------------------------------------------------------------------
+`grep -n "_should_capture_row\|_rows_seen_count\|_row_sample_decisions"
+viscontrol/core/training_data_collector.py` shows every reference
+confined to: the module docstring, `__init__`, `_capture()` (the
+row-lifecycle-only shared method), and `_should_capture_row()` itself.
+Neither `decide()`/`save()` (ambiguous/layout_fault) nor
+`on_einlaufband_fault()` (fault) call `_capture()`, reference
+`self._rows_seen_count`, or call `_should_capture_row` anywhere — they
+are separate methods with their own independent code paths, exactly as
+before this change. `cfg.capture_every_n_rows` is read in exactly one
+place in the whole file (`_should_capture_row`). Verified directly by
+test T19 (`test_ambiguous_and_fault_bypass_filter`): with
+`capture_every_n_rows=5`, after advancing the row counter to a
+non-multiple-of-5 position (3 rows seen, none selected — zero
+row-lifecycle files exist), both `decide()`/`save()` (ambiguous) and
+`on_einlaufband_fault()` (fault) are called and both still write their
+files immediately, proving the filter never touches them.
+
+
+CONFIG
+-------------------------------------------------------------------
+`capture_every_n_rows: int = Field(5, ge=1, ...)` added to
+`_TrainingDataSection` in viscontrol/core/config.py, and
+`capture_every_n_rows: 5` added to `training_data:` in
+config/default.yaml, with a comment noting it applies only to
+row-lifecycle capture. Verified read fresh from config, not hardcoded:
+`py -c "from viscontrol.core.config import load_config; print(load_config('config').training_data)"`
+prints `... capture_every_n_rows=5` as part of the loaded, merged
+config object (default.yaml + local.yaml deep-merge), the same object
+passed into `TrainingDataCollector(cfg, logger)` at construction in
+main_window.py — no separate code path or hardcoded literal reads this
+value.
+
+
+TEST RESULTS
+-------------------------------------------------------------------
+tests/test_training_data_collector.py -v: 19/19 PASSED (13 pre-existing
++ 4 new: test_every_nth_row_saved, test_both_stages_agree,
+test_config_value_changes_behavior, test_ambiguous_and_fault_bypass_filter
+— T16-T19). All 13 previously-existing tests pass completely unchanged
+in their assertions (the test fixture's `_Cfg.capture_every_n_rows`
+default was set to `1`, i.e. "no filtering," specifically so tests
+written before this filter existed keep working without modification —
+this is a test-fixture-only default, independent of the real pydantic
+config default of 5).
+
+Full suite (`py -m pytest -q`):
+  BEFORE this task: 23 failed, 112 passed, 1 skipped (same 23
+    pre-existing failures carried over from the previous task — 21
+    row_tracker/piece_tracker/replay/detection AttributeErrors plus 2
+    environmental test_camera.py failures from a physical Basler camera
+    attached to this machine, both confirmed unrelated to any code here).
+  AFTER this task: 23 failed, 116 passed, 1 skipped.
+
+IDENTICAL 23 failing test IDs in both runs — zero new failures, zero
+regressions. +4 passed matches exactly the 4 new tests added.
+
+
+WORKED EXAMPLE — projected storage with the filter
+-------------------------------------------------------------------
+Inputs: capture_every_n_rows=5, 350 rows/hour, 320 KB/image (measured),
+2 images per SELECTED row (tripwire + cleared).
+
+  selected rows/hour = 350 / 5                      = 70 rows/hour
+  images/hour         = 70 rows/hour * 2 images/row  = 140 images/hour
+  KB/hour              = 140 * 320 KB                 = 44,800 KB/hour
+  MB/hour               = 44,800 / 1024                = 43.75 MB/hour
+
+  24 h/day (worst case, continuous operation):
+    images/day = 140 * 24                              = 3,360 images/day
+    MB/day     = 43.75 * 24                             = 1,050 MB/day
+    GB/day     = 1,050 / 1024                            = 1.025 GB/day
+
+  Days until a 256 GB drive fills (worst case, 24h/day, filter alone —
+  same as before, ambiguous/fault add a small additional but unfiltered
+  and comparatively rare amount on top):
+    days = 256 GB / 1.025 GB/day                        ≈ 249.7 days
+                                                          (≈ 8.2 months)
+
+Comparison — WITHOUT the filter (capture_every_n_rows=1, i.e. every row,
+the previous behavior before this task):
+  images/hour = 350 rows/hour * 2 images/row           = 700 images/hour
+  KB/hour     = 700 * 320 KB                            = 224,000 KB/hour
+  GB/day      = (224,000 * 24 / 1024) / 1024            ≈ 5.127 GB/day
+  days until 256 GB fills                                ≈ 49.9 days
+                                                          (≈ 1.6 months)
+
+So capture_every_n_rows=5 stretches the same 256 GB drive from roughly
+50 days to roughly 250 days of continuous 24h/day operation before the
+row-lifecycle captures alone would fill it — a ~5x reduction, matching
+the 5x sampling ratio, exactly as expected. (The rolling cleanup at
+`max_total_size_gb` still enforces a hard cap regardless of this
+projection, and ambiguous/layout_fault/fault captures are additional and
+unfiltered but are, per their own design, rare hard-case events rather
+than a steady-state per-row stream.)

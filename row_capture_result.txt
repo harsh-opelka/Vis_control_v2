@@ -1,0 +1,209 @@
+STEP 6 — RESULT REPORT (row-lifecycle training-data capture)
+=====================================================================
+
+ANSWER TO STEP 0 PART A'S AMBIGUITY
+-------------------------------------------------------------------
+Question: for a row that geometrically crosses the tripwire but is
+blocked from actually stopping (another row already owns the transfer),
+or that never crosses at all (abandoned first), do we still want a
+"tripwire" photo, or only for rows that actually get stopped?
+
+Resolution: settled by the task's own downstream instructions rather
+than guessed — STEP 1 point 4 ("If a row never reaches 'tripwire' ...
+still call on_row_cleared ... so every row gets at least 2 of the 3
+photos") and test T5's name/description both presuppose that "tripwire"
+= "a stop command was actually issued," not "the row's front_tangent
+geometrically crossed transfer_x." Implemented exactly that: the
+on_row_tripwire callback fires from inside
+TransferOrchestrator._request_stop(), immediately after
+self._stop_command_sink(row.snapshot) — i.e. only when a real stop
+command was issued. A row blocked by the ownership guard, or one
+abandoned before ever crossing, simply never gets an on_row_tripwire()
+call; it still gets on_row_confirmed() (if it reached ACTIVE) and
+on_row_cleared() (at termination) — 2 of 3, never silently 0. Full
+reasoning and code quotes are in row_capture_inspection.txt part A.
+No user clarification was requested since the prompt already settled it.
+
+Separately flagged (not asked about, documented for the record): a row
+abandoned before ever reaching ACTIVE (never "confirmed") gets only 1
+of 3 photos ("cleared" only) — this is inherent, not a bug, since it
+never passed through "confirmed" either; STEP 1/T5's "2 of 3" guarantee
+is specifically about rows that WERE confirmed but never crossed.
+
+
+FILES MODIFIED
+-------------------------------------------------------------------
+viscontrol/core/training_data_collector.py  — rewritten:
+  - Removed: normal_sample_every_n_rows-driven branch in decide()
+    (decide() now only ever returns should_save=True for layout_fault/
+    ambiguous — the "hard case" path, unchanged behavior for those two).
+  - Added: RowPieceData, RowCaptureEvent dataclasses; on_row_confirmed /
+    on_row_tripwire / on_row_cleared public methods; per-row dedup guard
+    (_captured_stages dict + _row_id_eviction_order deque, bounded to
+    cfg.max_tracked_row_ids, FIFO eviction); _save_row_capture() (JPEG +
+    JSON sidecar, same disk guard as the hard-case save() path, factored
+    into a shared _disk_ok() helper).
+  - run_maintenance()/cleanup logic UNCHANGED (already generic over any
+    category-subfolder name, so "confirmed"/"tripwire"/"cleared" work
+    with zero changes there).
+
+viscontrol/core/transfer_events.py — added RowRecord.piece_count: int = 0
+  (populated from the same real, already-computed piece_count
+  RowAssociator produces — see row_capture_inspection.txt part C; not a
+  new/invented value, just made durable where it was previously
+  read-then-discarded).
+
+viscontrol/core/transfer_orchestrator.py:
+  - TransferOrchestrator.__init__: three new optional constructor params
+    (on_row_confirmed, on_row_tripwire, on_row_terminal — all
+    Callable[[RowRecord], None] | None = None, backward compatible;
+    verified via grep that every existing construction site — main_window.py
+    and 4 test files — uses keyword args only, so this is a non-breaking
+    addition).
+  - New _notify() helper: safely invokes an optional callback, catching
+    and logging any exception (defense in depth on top of drain()'s
+    existing per-event try/except, which already protects
+    stop_command_sink today).
+  - _process_observation step 4 ("apply matches"): now also sets
+    row.piece_count = piece_count (previously computed then discarded).
+  - _process_observation step 6 (DETECTED->ACTIVE): calls
+    self._notify(self._on_row_confirmed, row) right after a successful
+    transition.
+  - _request_stop(): calls self._notify(self._on_row_tripwire, row)
+    immediately after the existing self._stop_command_sink(row.snapshot)
+    call — the real stop-command call itself is untouched, this is a
+    new line added alongside it, not a replacement.
+  - _transition(): calls self._notify(self._on_row_terminal, row)
+    whenever new_state is a terminal state (TRANSFERRED or ABANDONED) —
+    covers the missed_frames_timeout and stop_ack_timeout ABANDONED
+    paths and the TRANSFERRED path (all three already funnel through
+    this one method).
+  - start_cycle()'s cycle_restart loop (the one ABANDONED path that
+    bypasses _transition() entirely): calls
+    self._notify(self._on_row_terminal, row) directly, for full coverage
+    of every terminal transition, not just the three that go through
+    _transition().
+  - _create_row(): now also sets piece_count=piece_count on the new
+    RowRecord (from the same real (front, back, piece_count,
+    source_indices) tuple already produced by RowAssociator).
+
+viscontrol/core/config.py — _TrainingDataSection: removed
+  normal_sample_every_n_rows; added max_tracked_row_ids: int = Field(500, ge=1).
+
+config/default.yaml — training_data section: removed
+  normal_sample_every_n_rows: 1 line; added max_tracked_row_ids: 500 with
+  a comment; updated the section's top comment to describe row-lifecycle
+  capture instead of a sample rate. NOTE: enabled: True was already set
+  in the working tree before this task started (an uncommitted local
+  edit, confirmed via `git diff HEAD` showing it predates this session's
+  changes) — left untouched, since changing `enabled` was not part of
+  this task.
+
+viscontrol/ui/main_window.py:
+  - New imports: RowPieceData (from training_data_collector), RowRecord
+    and RowState (from transfer_events).
+  - __init__: three new closures (_on_row_confirmed_capture,
+    _on_row_tripwire_capture, _on_row_terminal_capture), each a no-op
+    when self._training_collector is None, each wrapped in its own
+    try/except, passed to TransferOrchestrator(...) as the three new
+    kwargs.
+  - New _capture_cloth_image() helper: re-derives the cloth ROI from
+    self._latest_frame + self._active_profile_cache via
+    self._pipeline.split_rois(...) — the same pattern already used
+    elsewhere in this file outside _on_frame's scope (see
+    _on_capture_bg_reference, main_window.py ~2405-2407) — needed
+    because the three new closures are defined in __init__ and cannot
+    close over _on_frame's local `cloth` variable. Returns None (never
+    raises) if no frame has arrived yet.
+  - New _row_piece_data(row) helper: builds RowPieceData from
+    row.piece_count and (row.front_tangent, row.back_tangent) — fused
+    always None (see below). Never invents a value.
+  - _on_frame's old frame-counter capture call site: the frame-counter
+    SAMPLING branch is gone (removed from decide() itself), but the
+    call site calling decide()/save() for the ambiguous/layout_fault
+    hard-case path is KEPT, per STEP 2's explicit "keep unchanged"
+    instruction — only its comment was updated to reflect that normal
+    per-row sampling moved elsewhere.
+
+tests/test_training_data_collector.py — rewritten per STEP 5: T1/T2
+  unchanged; T3 (normal_sampling_rate) and T4 (priority_order) removed;
+  new T3-T7 (three_images_per_row, duplicate_stage_call_deduped,
+  row_without_tripwire_still_gets_cleared_capture,
+  metadata_sidecar_correct_fields, dedup_guard_bounded); old T5-T10
+  kept, renumbered T8-T13 (two of them — cleanup tests — use a
+  "confirmed" folder name instead of the retired "normal_sample", purely
+  cosmetic, the cleanup logic itself is category-name-agnostic).
+
+Created: row_capture_inspection.txt (STEP 0), row_capture_result.txt (this file).
+
+
+CONFIRMATION: EINLAUFBAND ERROR-IMAGE PATH UNTOUCHED
+-------------------------------------------------------------------
+`git diff` on viscontrol/ui/main_window.py shows the body of
+_save_defect_image() and its call site inside
+_apply_belt_fault_debounce() are byte-for-byte unchanged — the only
+diff lines anywhere near them are comments in the (separate)
+training-data block above _save_defect_image's definition, and the
+addition of the two new unrelated helper methods (_capture_cloth_image,
+_row_piece_data) immediately before it. storage.defect_image_dir and
+every other key under config's `storage:` section are untouched.
+
+
+TEST RESULTS
+-------------------------------------------------------------------
+tests/test_training_data_collector.py -v: 13/13 PASSED (T1-T13 above).
+
+Full suite (`py -m pytest -q`):
+  BEFORE this task's changes (verified via `git stash` — i.e. the exact
+  code this task started from): 23 failed, 107 passed, 1 skipped.
+  AFTER this task's changes: 23 failed, 110 passed, 1 skipped.
+
+IMPORTANT — this does NOT match the previous session's baseline of "21
+failed, 109 passed, 1 skipped" reported at the end of the prior cleanup
+task, and this discrepancy is reported in full rather than silently
+proceeding, per the task's STOP-and-report instruction:
+
+Two NEW-looking failures appeared: test_camera.py::
+test_make_camera_auto_falls_back_to_mock_when_basler_unavailable and
+test_make_camera_basler_explicit_raises_when_unavailable. Investigated
+immediately rather than assumed:
+  - Both fail with `_genicam.RuntimeException: Failed to open device
+    '...' for XML file download. Error: 'The device cannot be operated
+    on an USB 2.0 port. The device requires an USB 3.0 compatible port.'`
+    — a real Basler camera is now physically connected to this machine
+    (on a USB2 port), which these two tests' mocked "no Basler present"
+    assumptions don't account for.
+  - Corroborating evidence this is environmental, not code: `git diff`
+    on config/local.yaml (untouched by this task) shows
+    camera_exposure_us changed from 7585 to 13182 and a training_data
+    section was written with the OLD normal_sample_every_n_rows field —
+    both are runtime artifacts save_config() writes when the app is
+    actually run, confirming the app was launched against a real camera
+    between the previous session and this one.
+  - PROOF this is unrelated to this task's code: ran
+    `git stash` (reverting every change made in this task back to
+    the exact pre-task code), then `py -m pytest -q`: same result,
+    23 failed / 107 passed / 1 skipped, with the identical 23 failing
+    test IDs (the 21 pre-existing row_tracker/piece_tracker/replay/
+    detection AttributeErrors, plus these same 2 camera failures).
+    `git stash pop` restored this task's changes afterward.
+  - CONCLUSION: the 2 extra failures are a pre-existing environmental
+    condition (a physical camera now attached to the test machine) that
+    predates and is fully independent of every change made in this task.
+    This task's actual, attributable comparison is:
+      before (this task's starting point): 23 failed, 107 passed, 1 skipped
+      after  (this task's changes applied): 23 failed, 110 passed, 1 skipped
+    IDENTICAL 23 failing test IDs in both runs (confirmed byte-for-byte:
+    same test_detection.py/test_piece_tracker.py/test_replay.py/
+    test_row_tracker.py/test_camera.py failures, same error messages).
+    +3 passed exactly matches the net +3 tests added to
+    test_training_data_collector.py (13 now vs 10 before: T3/T4 removed,
+    T3-T7 added net +3). Zero regressions introduced by this task; the
+    camera-hardware failures are outside this task's scope (test_camera.py
+    was not touched, and fixing a hardware-availability assumption in
+    that test file was not requested here).
+
+No rollback was performed, since the actual per-file diff proves zero
+code-caused regressions; per-task attributable results are a clean match
+modulo the pre-existing environmental delta, documented above in full
+rather than hidden.

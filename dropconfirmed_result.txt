@@ -1,0 +1,168 @@
+STEP 4 — RESULT REPORT (drop "confirmed" stage + add "fault" category)
+=====================================================================
+
+CONFIRMATION: "confirmed" STAGE/FOLDER FULLY REMOVED
+-------------------------------------------------------------------
+viscontrol/core/training_data_collector.py:
+  - `on_row_confirmed` method deleted entirely.
+  - `_STAGES` tuple: `("confirmed", "tripwire", "cleared")` ->
+    `("tripwire", "cleared")`.
+  - `RowCaptureEvent.stage` docstring/comment: `"confirmed" | "tripwire" |
+    "cleared"` -> `"tripwire" | "cleared"`.
+  - Module docstring and `on_row_cleared`'s docstring updated to drop
+    every "confirmed"/"3 images"/"2 of 3" reference (now "2 images" /
+    "tripwire" + "cleared").
+  - Dedup guard (`_mark_if_new` / `_captured_stages` / eviction deque):
+    unchanged code — confirmed in STEP 0 part C that it was already
+    stage-name-agnostic (a per-row_id `set[str]`), so no tracking logic
+    needed to change, only the `_STAGES` tuple above.
+  - `grep -n "confirmed" viscontrol/core/training_data_collector.py`
+    (post-change) returns only prose mentions of the historical removal
+    itself (the module docstring noting "the previous 'confirmed' ...
+    stage has been removed entirely — see dropconfirmed_inspection.txt"
+    and a section-header comment pointing at the same file) — zero hits
+    of "confirmed" used as an actual stage value, tuple entry, method
+    name, or folder name anywhere in the code.
+
+viscontrol/ui/main_window.py:
+  - `_on_row_confirmed_capture` closure (main_window.py:292-303 in the
+    pre-change file) deleted entirely.
+  - `on_row_confirmed=_on_row_confirmed_capture,` keyword argument to
+    `TransferOrchestrator(...)` removed; `on_row_tripwire=` and
+    `on_row_terminal=` kwargs left completely unchanged.
+  - Two comments that named `on_row_confirmed` updated to no longer
+    mention it (main_window.py, the `_on_frame` hard-case comment block,
+    and the row-lifecycle-callbacks comment above the closures).
+  - `grep -n "on_row_confirmed" viscontrol/ui/main_window.py` (post-change)
+    returns zero hits.
+  - `TransferOrchestrator.__init__`'s `on_row_confirmed` PARAMETER itself
+    (transfer_orchestrator.py) is intentionally left as-is — passing
+    nothing for it now defaults to `None`, and `_notify()` already
+    no-ops on `None`, so the DETECTED->ACTIVE orchestrator-side hook is
+    fully inert with zero orchestrator changes needed (confirmed in
+    dropconfirmed_inspection.txt part A — out of this task's stated file
+    list, and not required for correctness).
+
+No "confirmed" folder is ever created any more: `_save_row_capture`
+writes to `self._output_dir / event.stage / date_str`, and `event.stage`
+can now only ever be "tripwire" or "cleared" (the only two values any
+caller passes in — `on_row_confirmed` no longer exists to produce a
+third). Verified directly by test T3 (`test_two_images_per_row`), which
+asserts `not (Path(cfg.output_dir) / "confirmed").exists()`.
+
+Every row still gets at least "cleared" even if it never reaches
+"tripwire" (STEP 1's explicit "unchanged" requirement) — verified by T5
+(`test_row_without_tripwire_still_gets_cleared_capture`), unchanged in
+spirit from the previous version, just without the now-removed
+"confirmed" call before it.
+
+
+CONFIRMATION: EXISTING EINLAUFBAND FAULT-SAVE FUNCTION UNCHANGED
+-------------------------------------------------------------------
+`_save_defect_image` (main_window.py) — full `git diff` on this file
+shows ZERO `+`/`-` lines inside the function body itself. Quoted
+in full, exactly as it reads now (byte-for-byte identical to
+dropconfirmed_inspection.txt part B's quote, itself taken before any
+change in this task):
+
+    def _save_defect_image(self, image: np.ndarray, result: PipelineResult) -> Path | None:
+        defect_dir = Path(self._cfg.storage.defect_image_dir)
+        defect_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y-%m-%d-%H-%M-%S-%f")
+        path = defect_dir / f"{stamp}-{result.verdict.value}.jpg"
+        try:
+            cv2.imwrite(str(path), image)
+            return path
+        except Exception:  # noqa: BLE001
+            logger.exception("failed to write defect image {}", path)
+            return None
+
+Its call site inside `_apply_belt_fault_debounce` is also unchanged at
+the line that matters: `img_path = self._save_defect_image(belt_roi, result)`
+is untouched — the new training-data block was inserted as new lines
+AFTER it (via a single `git diff` hunk @@ -1746,6 +1790,26 @@ that shows
+only ADDED lines, no removed/modified ones), and every statement that
+already consumed `img_path` (the `Event(...)` append,
+`self._inference_view.set_counts(...)`, `self._push_signals_to_opcua()`,
+`self._request_plc_set_error()`, the final `logger.info(...)`) is
+identical, in the same order, reading the exact same `img_path` value
+computed by the exact same unmodified call. Return value, timing
+(same call, same place in the frame), and file location
+(`self._cfg.storage.defect_image_dir`, untouched config key) are all
+byte-for-byte unchanged.
+
+
+CONFIRMATION: THE NEW "fault" CATEGORY WRITE IS ADDITIVE-ONLY AND ISOLATED
+-------------------------------------------------------------------
+- Added as new lines immediately after the existing
+  `img_path = self._save_defect_image(belt_roi, result)` call, still
+  inside the same `if self._sm.raise_belt_fault(...):` block, still
+  before the `Event(...)` append — purely additive, no existing
+  statement moved, removed, or reordered.
+- Gated on `if self._training_collector is not None:` (same guard used
+  everywhere else in this codebase for this feature — a no-op when
+  `training_data.enabled=False`, the default).
+- Wrapped in its own `try/except Exception: logger.exception(...)` —
+  isolated from, and unable to affect, anything before or after it
+  (the existing save already ran and already returned `img_path`
+  before this block is even reached; nothing downstream reads any
+  result from `on_einlaufband_fault`).
+- `on_einlaufband_fault` itself (training_data_collector.py) also has
+  its own outer `try/except Exception` around its entire body, so even
+  a bug inside the collector can not raise past `_apply_belt_fault_debounce`'s
+  wrapping try/except either — two independent layers of isolation.
+- Verified by T15 (`test_fault_capture_failure_does_not_break_existing_save`):
+  forces `on_einlaufband_fault` to raise, and asserts the (simulated)
+  existing fault-save file still exists afterward — i.e. the isolation
+  pattern main_window.py implements is exception-safe.
+- Sidecar fields, per STEP 2's spec, using ONLY real/trivially-available
+  data (no invented values): `category` ("fault", literal), `error_code`
+  (`self._cfg.plc.fault_error_code` — the same real config value already
+  written to the PLC's ext_error by `_request_plc_set_error()`),
+  `timestamp` (ISO8601, `datetime.now().isoformat()`), plus passed-through
+  `metadata={"verdict": result.verdict.value, "fault_reason":
+  result.fault_reason or None}` — both real `PipelineResult` fields
+  (events.py:100,104), `fault_reason` explicitly `None` when the empty
+  string default is present (never fabricated). Verified by T14
+  (`test_fault_saves_to_training_data`): asserts the sidecar's 3 required
+  fields plus the passed-through `verdict`, and that no
+  `storage.defect_image_dir`-style path (`tmp_path / "logs"`) is ever
+  touched or created by this call — fully independent output tree.
+
+
+FILES MODIFIED
+-------------------------------------------------------------------
+  viscontrol/core/training_data_collector.py — removed on_row_confirmed;
+    added on_einlaufband_fault; updated _STAGES/docstrings.
+  viscontrol/ui/main_window.py — removed _on_row_confirmed_capture closure
+    + its kwarg; added the additive on_einlaufband_fault call inside
+    _apply_belt_fault_debounce; updated two comments.
+  tests/test_training_data_collector.py — T3 replaced (3-image ->
+    2-image assertion, confirms no "confirmed" folder); T4/T5/T7 updated
+    to use on_row_tripwire instead of the removed on_row_confirmed; T6,
+    T8-T13 unchanged in substance (T11/T12 use a "tripwire" folder name
+    now instead of the retired "confirmed", cosmetic only); two new
+    tests added, T14 (test_fault_saves_to_training_data) and T15
+    (test_fault_capture_failure_does_not_break_existing_save).
+  Created: dropconfirmed_inspection.txt (STEP 0), dropconfirmed_result.txt
+    (this file).
+
+
+TEST RESULTS
+-------------------------------------------------------------------
+tests/test_training_data_collector.py -v: 15/15 PASSED.
+
+Full suite (`py -m pytest -q`):
+  BEFORE this task: 23 failed, 110 passed, 1 skipped (the same 23
+    pre-existing failures documented at the end of the previous task —
+    21 row_tracker/piece_tracker/replay/detection AttributeErrors plus 2
+    environmental test_camera.py failures from a physical Basler camera
+    now attached to this machine on a USB2 port, confirmed unrelated to
+    any code in this repository).
+  AFTER this task: 23 failed, 112 passed, 1 skipped.
+
+IDENTICAL 23 failing test IDs in both runs (test_camera.py x2,
+test_detection.py x5, test_piece_tracker.py x5, test_replay.py x3,
+test_row_tracker.py x8) — zero new failures, zero regressions. +2 passed
+matches exactly the net +2 tests added to test_training_data_collector.py
+(15 now vs 13 before: T3/T4/T5/T7 updated in place, T14/T15 newly added).

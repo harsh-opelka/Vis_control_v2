@@ -1,0 +1,142 @@
+STEP 3 — RESULT REPORT (drop "cleared" stage capture)
+=====================================================================
+
+CONFIRMATION: "cleared" REMOVED CLEANLY
+-------------------------------------------------------------------
+viscontrol/core/training_data_collector.py:
+  - `on_row_cleared` method deleted entirely.
+  - `_STAGES` tuple: `("tripwire", "cleared")` -> `("tripwire",)`.
+  - `RowCaptureEvent.stage` comment: `"tripwire" | "cleared"` -> `"tripwire"`.
+  - `RowCaptureEvent.outcome` field removed entirely (see "no orphaned
+    logic" section below — this went beyond STEP 1's literal bullet list
+    but was required by the "no dead code" constraint).
+  - `_capture()`'s `outcome` parameter removed; `on_row_tripwire`'s call
+    to `_capture()` no longer passes it.
+  - `_save_row_capture`'s JSON sidecar no longer includes an `"outcome"`
+    key at all (previously always `None` for tripwire — now removed
+    rather than kept as a permanently-null field).
+  - Module docstring and the row-lifecycle section header comment
+    updated to describe a single-stage model ("1 explicit stage per
+    row_id").
+
+viscontrol/ui/main_window.py:
+  - `_on_row_terminal_capture` closure deleted entirely (was
+    main_window.py:305-317 pre-change).
+  - `on_row_terminal=_on_row_terminal_capture,` keyword argument to
+    `TransferOrchestrator(...)` removed; `on_row_tripwire=` kwarg left
+    completely unchanged.
+  - `RowState` import removed from the `transfer_events` import line —
+    it was only used by the deleted closure's
+    `row.state == RowState.TRANSFERRED` check; grepped the whole file
+    afterward to confirm zero remaining uses before removing the import
+    (an unused import would itself have been leftover dead code).
+  - Two comments naming `on_row_cleared`/`on_row_terminal` updated to
+    describe the single-callback wiring.
+
+`grep -n "on_row_cleared" --include="*.py"` (post-change, whole repo):
+zero hits anywhere in production code — only prose/comment mentions of
+the historical removal remain (this file, training_data_collector.py's
+own docstrings, and this report), which reference dropconfirmed/
+dropcleared_inspection.txt as history, not live code.
+
+The orchestrator-side `on_row_terminal` CONSTRUCTOR PARAMETER itself
+(viscontrol/core/transfer_orchestrator.py) was intentionally left
+untouched, per this task's file scope (only training_data_collector.py
+and main_window.py were named) — passing nothing for it now defaults to
+`None`, and `_notify()` already no-ops on `None`, exactly mirroring how
+`on_row_confirmed` was left in place (unwired, harmless) in the earlier
+"drop confirmed" task. No orchestrator behavior changed.
+
+
+CONFIRMATION: NO ORPHANED DEDUP/SAMPLING LOGIC LEFT OVER
+-------------------------------------------------------------------
+Per dropcleared_inspection.txt: the "both stages must agree" cache
+(`self._row_sample_decisions` + `self._row_sample_eviction_order`)
+existed for exactly one reason — letting two independent call paths
+(tripwire and cleared) agree on one save/skip decision for the same
+row_id without double-incrementing `_rows_seen_count`. With
+`on_row_cleared` gone, `on_row_tripwire` is the only entry point into
+`_capture()`, and `_mark_if_new` (checked first, before the sampling
+filter is ever reached) already guarantees a given `(row_id, "tripwire")`
+pair can never legitimately reach the sampling check twice. So:
+  - `self._row_sample_decisions` and `self._row_sample_eviction_order`
+    (both the `__init__` state and their only reader/writer,
+    `_should_capture_row`) were deleted entirely — not just left unused.
+  - `_should_capture_row` was simplified from a row_id-keyed
+    cache-or-compute method to a plain, unconditional
+    increment-and-modulo check (`row_id` parameter removed from its
+    signature too, since nothing in the simplified body needs it — its
+    one call site in `_capture()` updated to match).
+  - `RowCaptureEvent.outcome` removed (see above) — it existed solely to
+    carry `on_row_cleared`'s outcome argument through to the sidecar;
+    with that method gone it would have been permanently `None` forever,
+    which is dead schema, not "kept for future stability" the way
+    `fused` legitimately still is (fused's docstring explains real,
+    ongoing unavailability; outcome's reason for being None would have
+    been "the caller that set it no longer exists").
+  - `_mark_if_new`/`self._captured_stages`/`self._row_id_eviction_order`
+    were left completely untouched — confirmed these are a SEPARATE
+    concern (per-stage duplicate-call protection, still fully needed
+    with one stage) from the removed "both stages agree" sampling cache,
+    per dropcleared_inspection.txt's analysis. Not part of what this
+    task's constraint meant by "dead code from the removed both-stages
+    logic."
+  - `grep -n "_row_sample_decisions\|_row_sample_eviction_order\|on_row_cleared"
+    viscontrol/core/training_data_collector.py` (post-change): zero
+    hits anywhere in the file.
+
+
+FILES MODIFIED
+-------------------------------------------------------------------
+  viscontrol/core/training_data_collector.py — removed on_row_cleared,
+    RowCaptureEvent.outcome, the per-row sample-decision cache; simplified
+    _should_capture_row; updated docstrings/_STAGES/section headers.
+  viscontrol/ui/main_window.py — removed _on_row_terminal_capture closure
+    + its kwarg + the now-unused RowState import; updated two comments.
+  viscontrol/core/config.py — updated a stale doc-string mentioning
+    on_row_cleared on the capture_every_n_rows field.
+  config/default.yaml — updated two stale comments (top-of-section and
+    capture_every_n_rows) describing the old 2-stage/"tripwire+cleared"
+    model.
+  tests/test_training_data_collector.py — T3 renamed/updated
+    (test_two_images_per_row -> test_one_image_per_row, asserts 1 image,
+    confirms neither "confirmed" nor "cleared" folders exist); T6's
+    outcome assertion changed from `is None` to `not in data`; T16/T18/T19
+    (every_nth_row_saved / config_value_changes_behavior /
+    ambiguous_and_fault_bypass_filter) updated to call only
+    on_row_tripwire and expect 1 image per selected row instead of 2;
+    T5 (row_without_tripwire_still_gets_cleared_capture) and T17
+    (both_stages_agree) REMOVED entirely — both tested behavior that no
+    longer exists once there is only one stage (no "still gets cleared"
+    fallback to fall back to; no second stage to "agree" with) — keeping
+    either would itself have been leftover test logic for removed
+    behavior, which the task's own "no dead code" constraint rules out.
+  Created: dropcleared_inspection.txt (STEP 0), dropcleared_result.txt
+    (this file).
+
+
+TEST RESULTS
+-------------------------------------------------------------------
+tests/test_training_data_collector.py -v: 17/17 PASSED (19 previously,
+minus the 2 removed tests whose behavior no longer exists).
+
+Full suite (`py -m pytest -q`):
+  BEFORE this task (per the end of the previous task): 23 failed,
+    116 passed, 1 skipped (140 total).
+  AFTER this task: 21 failed, 116 passed, 1 skipped (138 total).
+
+138 = 140 − 2, exactly accounting for the 2 tests removed from
+test_training_data_collector.py (19 -> 17) — nothing else changed in
+test collection count. The failure count also dropped, from 23 to 21:
+the 2 test_camera.py failures present in the previous task's baseline
+(test_make_camera_auto_falls_back_to_mock_when_basler_unavailable /
+test_make_camera_basler_explicit_raises_when_unavailable — previously
+confirmed environmental, caused by a physical Basler camera attached to
+this machine on a USB2 port) are GONE in this run; the remaining 21
+failures are exactly the pre-existing row_tracker/piece_tracker/replay/
+detection AttributeError failures, unchanged. This machine's camera
+environment evidently changed between sessions (camera disconnected or
+port situation resolved) — unrelated to, and not caused by, any change
+in this task (test_camera.py was not touched). No new or unexpected
+failure appeared anywhere; every failure in this run's list was already
+present and unrelated to training data before this task started.

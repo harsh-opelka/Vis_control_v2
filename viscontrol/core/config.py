@@ -672,11 +672,20 @@ class _TrainingDataSection(BaseModel):
     enabled: bool = False
     output_dir: str = "training_data"
     jpeg_quality: int = Field(88, ge=1, le=100)
-    normal_sample_every_n_rows: int = Field(20, ge=1)
     min_free_space_gb: float = Field(10, ge=0)
     low_disk_warning_cooldown_s: float = Field(300, ge=0)
     max_total_size_gb: float = Field(50, gt=0)
     maintenance_interval_minutes: int = Field(60, ge=1)
+    max_tracked_row_ids: int = Field(500, ge=1)
+    capture_every_n_rows: int = Field(
+        5, ge=1,
+        description=(
+            "Save-every-Nth-row sample filter for row-lifecycle capture "
+            "(on_row_tripwire) ONLY — ambiguous/layout_fault and "
+            "Einlaufband-fault captures always save unconditionally and "
+            "ignore this value entirely."
+        ),
+    )
 
 
 class _PlcSection(BaseModel):

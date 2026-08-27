@@ -43,9 +43,9 @@ from viscontrol.core.layout_quality import LayoutQualityMonitor, LayoutQualityRe
 from viscontrol.core.logger import logger
 from viscontrol.core.profiles import ProductProfile
 from viscontrol.core.state_machine import StateMachine
-from viscontrol.core.transfer_events import ClusterObservation
+from viscontrol.core.transfer_events import ClusterObservation, RowRecord
 from viscontrol.core.transfer_events import EventType as TransferEventType
-from viscontrol.core.training_data_collector import TrainingDataCollector
+from viscontrol.core.training_data_collector import RowPieceData, TrainingDataCollector
 from viscontrol.core.transfer_orchestrator import TransferOrchestrator
 from viscontrol.detection.calibration import learn_reference
 from viscontrol.detection.classical import ClassicalDetector
@@ -282,12 +282,33 @@ class MainWindow(QMainWindow):
                 return
             self._issue_stop_pulse()
 
+        # TRAINING-DATA row-lifecycle capture (additive, observer-only — see
+        # viscontrol/core/training_data_collector.py and
+        # row_capture_inspection.txt). Each callback fires synchronously,
+        # exactly once per named transition (mirrors _orchestrator_stop_sink
+        # above); none of them can affect detection/orchestrator/PLC state —
+        # every body is wrapped in try/except and no-ops entirely when
+        # self._training_collector is None (training_data.enabled=False).
+        def _on_row_tripwire_capture(row) -> None:  # noqa: ANN001
+            if self._training_collector is None:
+                return
+            try:
+                self._training_collector.on_row_tripwire(
+                    row.row_id, row.cycle_id, self._capture_cloth_image(),
+                    self._row_piece_data(row),
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "[TRAINDATA-ERROR] on_row_tripwire capture failed row={}", row.row_id,
+                )
+
         self._orchestrator = TransferOrchestrator(
             cfg=self._cfg.transfer_orchestrator,
             stop_command_sink=_orchestrator_stop_sink,
             now_fn=time.monotonic,
             logger=logger,
             cycle_idle_reset_ms=self._cfg.detection.cycle_idle_reset_ms,
+            on_row_tripwire=_on_row_tripwire_capture,
         )
         # DEBUG LOGGING (determinism analysis) — see PLC-EDGE / FRAME-GAP
         # logs. Purely observational; never read by decision logic.
@@ -896,15 +917,24 @@ class MainWindow(QMainWindow):
                     self._run_transfer_orchestrator(r, profile)
                     _t_rowgroup_ms = (time.perf_counter() - _t_r0) * 1000.0
 
-                    # TRAINING-DATA COLLECTION (additive, observer-only — see
-                    # viscontrol/core/training_data_collector.py). Runs only on
-                    # this fresh-Hough "row event" frame, never on cached-reuse
-                    # frames. Never touches detection/orchestrator/PLC state and
-                    # must never be able to affect them, hence the blanket
-                    # try/except: a training-data failure is logged and dropped,
-                    # not raised. Does NOT touch storage.defect_image_dir or
-                    # _save_defect_image (the existing Einlaufband error-image
-                    # path) — separate output tree, separate config section.
+                    # TRAINING-DATA COLLECTION — hard-case path only
+                    # (additive, observer-only — see
+                    # viscontrol/core/training_data_collector.py). Normal
+                    # per-row sampling is NOT decided here any more — it
+                    # moved to the on_row_tripwire callback wired into
+                    # TransferOrchestrator in __init__, keyed by row_id
+                    # (the "cleared" terminal-transition capture stage was
+                    # removed — see dropcleared_inspection.txt).
+                    # This call site now only ever saves the two always-on
+                    # hard cases (layout-lock faults, ambiguous row
+                    # associations) — decide() no longer has a frame-counter
+                    # branch. Never touches detection/orchestrator/PLC state
+                    # and must never be able to affect them, hence the
+                    # blanket try/except: a training-data failure is logged
+                    # and dropped, not raised. Does NOT touch
+                    # storage.defect_image_dir or _save_defect_image (the
+                    # existing Einlaufband error-image path) — separate
+                    # output tree, separate config section.
                     if self._training_collector is not None:
                         try:
                             _td_decision = self._training_collector.decide(
@@ -1746,6 +1776,26 @@ class MainWindow(QMainWindow):
                         self._counts.defects += 1
                         self._inference_view.add_recent_defect(result.verdict.value)
                         img_path = self._save_defect_image(belt_roi, result)
+
+                        # TRAINING-DATA — additive, additional save into
+                        # training_data/fault/ alongside the existing
+                        # storage.defect_image_dir save above (which is
+                        # UNCHANGED — see dropconfirmed_inspection.txt part B).
+                        # Wrapped in its own try/except so a training-data
+                        # failure can NEVER affect the fault-raising logic,
+                        # the event log, or the PLC error write below.
+                        if self._training_collector is not None:
+                            try:
+                                self._training_collector.on_einlaufband_fault(
+                                    belt_roi, self._cfg.plc.fault_error_code,
+                                    metadata={
+                                        "verdict": result.verdict.value,
+                                        "fault_reason": result.fault_reason or None,
+                                    },
+                                )
+                            except Exception:  # noqa: BLE001
+                                logger.exception("[TRAINDATA-ERROR] fault capture failed")
+
                         self._event_log.append(Event(
                             event_type=EventType.FAULT_RAISED,
                             profile_name=self._cfg.app.active_profile,
@@ -1820,6 +1870,34 @@ class MainWindow(QMainWindow):
                 self._traindata_maintenance_running.clear()
 
         threading.Thread(target=_run, name="TrainDataMaintenance", daemon=True).start()
+
+    def _capture_cloth_image(self) -> np.ndarray | None:
+        """Re-derive the cloth ROI from the most recent frame, for the
+        training-data row-lifecycle callbacks (defined in __init__, so they
+        cannot close over _on_frame's local `cloth` variable directly).
+        Same pattern already used outside _on_frame elsewhere in this file
+        (see _on_capture_bg_reference / _on_save_cloth_reference). Returns
+        None if no frame has arrived yet (e.g. a session-start cycle_restart
+        firing before the first camera frame) — callers must tolerate that.
+        """
+        if self._latest_frame is None:
+            return None
+        try:
+            _belt, cloth = self._pipeline.split_rois(self._latest_frame, self._active_profile_cache)
+            return cloth
+        except ValueError:
+            return None
+
+    def _row_piece_data(self, row: RowRecord) -> RowPieceData:
+        """Builds RowPieceData from real RowRecord fields only — see
+        row_capture_inspection.txt part C for why tangent_xs is the
+        (front_tangent, back_tangent) aggregate pair (not a per-piece
+        list) and why fused is always None. Never invents a value."""
+        return RowPieceData(
+            piece_count=row.piece_count,
+            tangent_xs=(row.front_tangent, row.back_tangent),
+            fused=None,
+        )
 
     def _save_defect_image(self, image: np.ndarray, result: PipelineResult) -> Path | None:
         defect_dir = Path(self._cfg.storage.defect_image_dir)

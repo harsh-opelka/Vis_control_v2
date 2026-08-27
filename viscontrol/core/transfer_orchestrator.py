@@ -72,12 +72,22 @@ class TransferOrchestrator:
     def __init__(
         self, cfg, stop_command_sink, now_fn=time.monotonic, logger=None,
         cycle_idle_reset_ms: int = 3000,
+        on_row_confirmed=None, on_row_tripwire=None, on_row_terminal=None,
     ) -> None:
         self._cfg = cfg
         self._stop_command_sink = stop_command_sink
         self._now = now_fn
         self._logger = logger if logger is not None else _default_logger
         self._associator = RowAssociator(cfg)
+        # Optional read-only observer callbacks (training-data row-lifecycle
+        # capture — see viscontrol/core/training_data_collector.py). Each is
+        # Callable[[RowRecord], None] | None, invoked synchronously exactly
+        # at the named transition, mirroring stop_command_sink's existing
+        # pattern. None (the default) is a no-op — every call site below
+        # tolerates that, and no association/lifecycle decision reads them.
+        self._on_row_confirmed = on_row_confirmed
+        self._on_row_tripwire = on_row_tripwire
+        self._on_row_terminal = on_row_terminal
 
         self._cycle_id: int = 0
         self._next_event_id: int = 1
@@ -218,6 +228,7 @@ class TransferOrchestrator:
                         from_state=old_state, to_state=RowState.ABANDONED,
                         action="transition", result="ok", reason="cycle_restart",
                     )
+                    self._notify(self._on_row_terminal, row)
             self._last_processed_frame_id = source_frame_id
             self._last_fresh_observation_ts = ts
             self._log(
@@ -329,6 +340,7 @@ class TransferOrchestrator:
             row.prev_front_tangent = row.front_tangent
             row.front_tangent = front
             row.back_tangent = back
+            row.piece_count = piece_count
             row.last_seen_frame = event.source_frame_id
             row.missed_frames = 0
             if front > self._transfer_x:
@@ -354,7 +366,8 @@ class TransferOrchestrator:
                     row.confirmed_upstream_frames >= self._cfg.row_arm_min_frames
                     and row.front_tangent > self._transfer_x
                 ):
-                    self._transition(row, RowState.ACTIVE, "confirmed_upstream", event)
+                    if self._transition(row, RowState.ACTIVE, "confirmed_upstream", event):
+                        self._notify(self._on_row_confirmed, row)
 
         # 7. tripwire crossing for ACTIVE rows only.
         for row in self._existing_rows_sorted():
@@ -493,6 +506,7 @@ class TransferOrchestrator:
             last_seen_frame=event.source_frame_id,
             confirmed_upstream_frames=0,
             missed_frames=0,
+            piece_count=piece_count,
             prev_front_tangent=front,
             created_at=self._now(),
         )
@@ -545,6 +559,7 @@ class TransferOrchestrator:
             action="stop_command", result="ok",
         )
         self._stop_command_sink(row.snapshot)
+        self._notify(self._on_row_tripwire, row)
 
     # ---------- transitions + invariant ----------
 
@@ -573,7 +588,23 @@ class TransferOrchestrator:
             from_state=old_state, to_state=new_state,
             action="transition", result="ok", reason=reason,
         )
+        if new_state in _TERMINAL_STATES:
+            self._notify(self._on_row_terminal, row)
         return True
+
+    def _notify(self, callback, row: RowRecord) -> None:
+        """Invoke an optional row-lifecycle observer callback. Defense in
+        depth on top of drain()'s own per-event try/except (which already
+        protects stop_command_sink today) — a broken callback must never
+        block or corrupt orchestrator state."""
+        if callback is None:
+            return
+        try:
+            callback(row)
+        except Exception:  # noqa: BLE001
+            self._logger.exception(
+                "[ORCH] row-lifecycle observer callback failed row={}", row.row_id,
+            )
 
     def _assert_invariants(self) -> None:
         owning = [
