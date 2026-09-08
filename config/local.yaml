@@ -1,5 +1,5 @@
 app:
-  mode: demo
+  mode: production
   language: en
   active_profile: Default
   auto_start_detection: false
@@ -168,21 +168,22 @@ storage:
   app_log_keep_files: 7
   csv_log_keep_days: 90
 training_data:
-  enabled: True
+  enabled: true
   output_dir: training_data
   jpeg_quality: 88
-  normal_sample_every_n_rows: 1
   min_free_space_gb: 10.0
   low_disk_warning_cooldown_s: 300.0
   max_total_size_gb: 50.0
   maintenance_interval_minutes: 60
+  max_tracked_row_ids: 500
+  capture_every_n_rows: 5
 plc:
-  url: opc.tcp://192.168.178.120:4840
+  url: opc.tcp://192.168.224.100:4840
   node_ext_tuchabzug_stop: ns=6;s=::TUA:fromext_stop_Tuchabzug
   node_ext_tuchabzug_status: ns=6;s=::TUA:toext_Tuchabzug_running
-  node_ext_error: ns=6;s=::AsGlobalPV:fromext_Error_idx
-  node_ext_viscontrol_alive: ns=6;s=::panel:fromext_viscontrol_alive
-  node_ext_error_quit: ns=6;s=::panel:toext_Error_quit
+  node_ext_error: ns=7;s=::AsGlobalPV:fromext_Error_idx
+  node_ext_viscontrol_alive: ns=6;s=::Panel:fromext_viscontrol_alive
+  node_ext_error_quit: ns=6;s=::Panel:toext_Error_quit
   node_ext_einlaufband_running: ns=6;s=::Einlauf:toext_Einlaufband_running
   poll_interval_s: 0.1
   stop_pulse_ms: 100

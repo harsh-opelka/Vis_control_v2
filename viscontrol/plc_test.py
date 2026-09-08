@@ -21,10 +21,11 @@
 # to find the node ids
 from opcua import Client
 
-PLC_URL = "opc.tcp://192.168.178.120:4840"
+PLC_URL = "opc.tcp://192.168.224.100:4840"
 
 # Sections Tim mentioned in UA Expert. Add more if you see others.
-SECTIONS = ["TUA", "Einlauf", "Signal", "Global", "PV"]
+# SECTIONS = ["TUA", "Einlauf", "Signal", "Global", "PV"]
+SECTIONS = ["TUA", "Einlauf", "Signal", "Global", "PV", "Tuchabzug", "Panel"]
 
 
 def browse_recursive(node, depth=0, max_depth=8, seen=None):
@@ -75,3 +76,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
