@@ -31,6 +31,10 @@ class _AppSection(BaseModel):
     language: Language = "en"
     active_profile: str = "Default"
     auto_start_detection: bool = False
+    # Defaults used until the first PLC format read (and when the PLC is
+    # unreachable). Only meaningful when ``products``/``cloths`` are configured.
+    active_product: str = ""
+    active_cloth: str = ""
 
 
 class _CameraSection(BaseModel):
@@ -688,6 +692,29 @@ class _TrainingDataSection(BaseModel):
     )
 
 
+class ProductSettings(BaseModel):
+    """Per-product runtime settings, applied when the PLC selects the product.
+
+    Profile fields (expected_*, fused_threshold) are written into the active
+    profile; the radii go to ``detection.hough.min/max_radius_px``.
+    """
+
+    expected_width_px: int = Field(290, gt=0)
+    expected_height_px: int = Field(290, gt=0)
+    expected_area_px: int = Field(60_000, gt=0)
+    fused_threshold: float = Field(1.4, gt=0.0)
+    hough_min_radius_px: int = Field(0, ge=0)
+    hough_max_radius_px: int = Field(0, ge=0)
+
+
+class ClothSettings(BaseModel):
+    """Per-cloth runtime settings, applied when the PLC selects the cloth colour."""
+
+    dough_is_darker: bool = True
+    cloth_brightness_threshold: int = Field(120, ge=0, le=255)
+    cloth_reference_path: str = ""
+
+
 class _PlcSection(BaseModel):
     """Production PLC OPC UA client settings (only used when mode='production')."""
 
@@ -698,6 +725,8 @@ class _PlcSection(BaseModel):
     node_ext_viscontrol_alive: str = "ns=6;s=::Signal:fromext_viscontrol_alive"
     node_ext_error_quit: str = "ns=6;s=::Signal:toext_Error_quit"
     node_ext_einlaufband_running: str = "ns=6;s=::Einlauf:toext_Einlaufband_running"
+    node_ext_product_name: str = "ns=6;s=::AsGlobalPV:gFormatSet.Name"
+    node_ext_cloth_color: str = "ns=6;s=::AsGlobalPV:gFormatSet.Beschickung.ClothColor"
     poll_interval_s: float = Field(0.1, gt=0)
     stop_pulse_ms: int = Field(100, ge=10)
     fault_error_code: int = Field(2, ge=0)
@@ -721,6 +750,11 @@ class AppConfig(BaseModel):
     layout_quality: _LayoutQualitySection = Field(default_factory=_LayoutQualitySection)
     size_calibration: _SizeCalibrationSection = Field(default_factory=_SizeCalibrationSection)
     profiles: list[ProductProfile] = Field(default_factory=list)
+    # PLC-driven product/cloth switching (optional; empty = feature off, so
+    # old-style configs load and behave unchanged). Keys: product names as sent
+    # by the PLC, and "white"/"black".
+    products: dict[str, ProductSettings] = Field(default_factory=dict)
+    cloths: dict[str, ClothSettings] = Field(default_factory=dict)
     opcua: _OpcuaSection = Field(default_factory=_OpcuaSection)
     web: _WebSection = Field(default_factory=_WebSection)
     ui: _UiSection = Field(default_factory=_UiSection)

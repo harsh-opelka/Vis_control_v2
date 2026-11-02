@@ -7,6 +7,7 @@ from collections.abc import Callable
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import QFrame, QLabel, QPushButton, QVBoxLayout, QWidget
 
+from viscontrol.ui.format_info import format_info_html
 from viscontrol.ui.theme import FONT_LARGE, FONT_SMALL, SIDEBAR_WIDTH
 
 
@@ -48,6 +49,15 @@ class Sidebar(QFrame):
             layout.addWidget(btn)
             self._buttons[nav_id] = btn
 
+        # Read-only product/cloth info (plain small text, no boxes/buttons).
+        self._format_label = QLabel("")
+        self._format_label.setTextFormat(Qt.TextFormat.RichText)
+        self._format_label.setStyleSheet(
+            f"font-size: {FONT_SMALL - 1}pt; padding: 16px 20px 0 20px;"
+        )
+        self._format_label.setVisible(False)
+        layout.addWidget(self._format_label)
+
         layout.addStretch(1)
 
         self._mode_btn = QPushButton("DEMO")
@@ -62,6 +72,11 @@ class Sidebar(QFrame):
             "}"
         )
         layout.addWidget(self._mode_btn)
+
+    def set_format_info(self, lines: list[tuple[str, bool]]) -> None:
+        """Show the product/cloth info block; an empty list hides it."""
+        self._format_label.setText(format_info_html(lines))
+        self._format_label.setVisible(bool(lines))
 
     def set_active(self, nav_id: str) -> None:
         for k, btn in self._buttons.items():

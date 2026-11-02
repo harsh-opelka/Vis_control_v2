@@ -39,6 +39,8 @@ from PySide6.QtWidgets import (
 from viscontrol.core.config import AppConfig, save_config
 from viscontrol.core.event_log import Event, EventLog, EventType
 from viscontrol.core.events import Mode, PipelineResult, RowPhase, State, Verdict
+from viscontrol.core.format_switch import FormatSwitcher
+from viscontrol.ui.format_info import FormatInfo, format_info_lines
 from viscontrol.core.layout_quality import LayoutQualityMonitor, LayoutQualityResult
 from viscontrol.core.logger import logger
 from viscontrol.core.profiles import ProductProfile
@@ -106,6 +108,9 @@ class _FrameBridge(QObject):
 
 class MainWindow(QMainWindow):
     """The application's single top-level window."""
+
+    # (product_raw, cloth_raw) from the PLC worker thread -> GUI thread (queued).
+    plc_format_changed = Signal(object, object)
 
     def __init__(
         self,
@@ -430,6 +435,22 @@ class MainWindow(QMainWindow):
             self._cfg.profile_store().names(), self._cfg.app.active_profile,
         )
         self._inference_view.set_mode(Mode(self._cfg.app.mode))
+
+        # PLC-driven product/cloth switching (off when products/cloths absent).
+        self._format_switcher = FormatSwitcher(
+            cfg_fn=lambda: self._cfg,
+            apply_fn=self._apply_format,
+            is_idle_fn=self._is_format_switch_idle,
+            now_fn=time.monotonic,
+        )
+        self.plc_format_changed.connect(self._format_switcher.submit)
+        self._format_timer = QTimer(self)
+        self._format_timer.setInterval(250)
+        self._format_timer.timeout.connect(self._format_switcher.tick)
+        self._format_timer.start()
+        self._format_switcher.on_change = self._refresh_format_info
+        self._format_switcher.apply_defaults()
+        self._refresh_format_info()
         self._refresh_state(State.WAITING)
         self._sm.on_change(self._on_sm_change)
 
@@ -475,6 +496,8 @@ class MainWindow(QMainWindow):
         if plc is not None:
             plc.on_tuchabzug_change = self._on_plc_tuchabzug_change
             plc.on_error_quit_change = self._on_plc_error_quit
+            # Worker thread -> Signal.emit (queued to the GUI thread).
+            plc.on_format_change = self.plc_format_changed.emit
         self._refresh_status_bar()
 
     def attach_web_server(self, web) -> None:  # noqa: ANN001
@@ -709,6 +732,92 @@ class MainWindow(QMainWindow):
         self._belt_window_fault_latched = False
         self._clear_sticky_overlay()
         self._push_signals_to_opcua()
+
+    # ---------- PLC product / cloth switching ----------
+
+    def _is_format_switch_idle(self) -> bool:
+        """True when no transfer is in progress, no stop latch is held and the wizard is closed."""
+        if self._wizard_active:
+            return False
+        if self._plc is not None and getattr(self._plc, "stop_latch_active", False):
+            return False
+        snap = self._orchestrator.snapshot()
+        return (
+            snap.rows_stop_requested == 0
+            and snap.rows_transfer_pending == 0
+            and snap.rows_transferring == 0
+        )
+
+    def _refresh_format_info(self) -> None:
+        """Update the sidebar info block from the RUNTIME cfg (GUI thread only)."""
+        sw = self._format_switcher
+        if not sw.enabled:
+            self._sidebar.set_format_info([])
+            return
+        profile = self._cfg.active_profile()
+        hough = self._cfg.detection.hough
+        ref_str = hough.cloth_reference_path
+        info = FormatInfo(
+            product=sw.active_product,
+            product_ok=sw.product_valid and sw.active_product is not None,
+            cloth=sw.active_cloth,
+            cloth_ok=sw.cloth_valid and sw.active_cloth is not None,
+            dough_is_darker=profile.dough_is_darker,
+            fused_threshold=profile.fused_threshold,
+            width_px=profile.expected_width_px,
+            height_px=profile.expected_height_px,
+            cloth_brightness_threshold=hough.cloth_brightness_threshold,
+            ref_name=Path(ref_str).name if ref_str else "",
+            ref_exists=bool(ref_str) and self._resolve_cloth_ref_path(ref_str).exists(),
+            plc_seen=sw.plc_seen,
+            pending=sw.pending,
+        )
+        self._sidebar.set_format_info(format_info_lines(info))
+
+    def _resolve_cloth_ref_path(self, path_str: str) -> Path:
+        """Relative cloth reference paths are relative to the project root (config_dir's parent)."""
+        path = Path(path_str)
+        return path if path.is_absolute() else self._config_dir.parent / path
+
+    def _load_cloth_reference(self, path_str: str, cloth: str) -> None:
+        """(Re)load the cloth reference mask; a missing/unreadable file only warns."""
+        self._cloth_reference_mask = None
+        if path_str:
+            path = self._resolve_cloth_ref_path(path_str)
+            if not path.exists():
+                logger.warning("cloth reference for '{}' not found: {}", cloth, path)
+            else:
+                mask = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+                if mask is None:
+                    logger.warning("could not load cloth reference for '{}': {}", cloth, path)
+                else:
+                    self._cloth_reference_mask = mask
+        else:
+            logger.warning("no cloth reference path configured for cloth '{}'", cloth)
+        self._wizard_view.set_cloth_reference(self._cloth_reference_mask)
+
+    def _apply_format(self, product: str, cloth: str) -> None:
+        """Apply the product + cloth settings to the running config and caches."""
+        prod = self._cfg.products[product]
+        cl = self._cfg.cloths[cloth]
+        profile = self._cfg.active_profile().model_copy(update={
+            "expected_width_px": prod.expected_width_px,
+            "expected_height_px": prod.expected_height_px,
+            "expected_area_px": prod.expected_area_px,
+            "fused_threshold": prod.fused_threshold,
+            "dough_is_darker": cl.dough_is_darker,
+        })
+        store = self._cfg.profile_store()
+        store.upsert(profile)
+        self._cfg.profiles = store.as_list()
+        hough = self._cfg.detection.hough
+        hough.min_radius_px = prod.hough_min_radius_px
+        hough.max_radius_px = prod.hough_max_radius_px
+        hough.cloth_brightness_threshold = cl.cloth_brightness_threshold
+        hough.cloth_reference_path = cl.cloth_reference_path
+        self._load_cloth_reference(cl.cloth_reference_path, cloth)
+        self._refresh_profile_cache()
+        self._inference_view.set_active_format(f"{product} / {cloth}")
 
     def _refresh_profile_cache(self) -> None:
         """Rebuild the active-profile cache after any config change that affects it."""
@@ -2454,6 +2563,11 @@ class MainWindow(QMainWindow):
 
         self._cfg.detection.hough.min_radius_px = result.suggested_min_radius_px
         self._cfg.detection.hough.max_radius_px = result.suggested_max_radius_px
+        active_product = self._format_switcher.active_product
+        if active_product in self._cfg.products:
+            # Switching enabled: the ACTIVE product owns the radius entries.
+            self._cfg.products[active_product].hough_min_radius_px = result.suggested_min_radius_px
+            self._cfg.products[active_product].hough_max_radius_px = result.suggested_max_radius_px
 
         for field, old, new in (
             ("detection.hough.min_radius_px", old_min, result.suggested_min_radius_px),
@@ -2529,14 +2643,28 @@ class MainWindow(QMainWindow):
         mask = self._detector.compute_cloth_region_mask(
             cloth, brightness_threshold=brightness_threshold
         )
-        ref_path = self._config_dir / "cloth_reference_mask.png"
+        active_cloth = self._format_switcher.active_cloth
+        cloth_cfg = self._cfg.cloths.get(active_cloth) if active_cloth else None
+        if cloth_cfg is not None:
+            # Switching enabled: write to the ACTIVE cloth's reference path.
+            ref_path = self._resolve_cloth_ref_path(
+                cloth_cfg.cloth_reference_path or f"cloth_reference_{active_cloth}.png"
+            )
+            if not cloth_cfg.cloth_reference_path:
+                cloth_cfg.cloth_reference_path = str(ref_path)
+        else:
+            ref_path = self._config_dir / "cloth_reference_mask.png"
         if not cv2.imwrite(str(ref_path), mask):
             QMessageBox.warning(
                 self, self.tr("Detection"), self.tr("Failed to save the cloth reference.")
             )
             return
         self._cloth_reference_mask = mask
-        self._cfg.detection.hough.cloth_reference_path = str(ref_path)
+        if cloth_cfg is not None:
+            cloth_cfg.cloth_brightness_threshold = brightness_threshold
+            self._cfg.detection.hough.cloth_reference_path = cloth_cfg.cloth_reference_path
+        else:
+            self._cfg.detection.hough.cloth_reference_path = str(ref_path)
         self._cfg.detection.hough.cloth_brightness_threshold = brightness_threshold
         self._save_cfg()
         self._service_view.set_cloth_reference_status(

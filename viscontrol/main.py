@@ -73,16 +73,20 @@ def main() -> int:
     if cfg.app.mode == "production":
         try:
             from viscontrol.io.plc_client import PlcClient  # noqa: PLC0415
+            node_ids = {
+                "ext_tuchabzug_stop":      cfg.plc.node_ext_tuchabzug_stop,
+                "ext_tuchabzug_status":    cfg.plc.node_ext_tuchabzug_status,
+                "ext_error":               cfg.plc.node_ext_error,
+                "ext_viscontrol_alive":    cfg.plc.node_ext_viscontrol_alive,
+                "ext_error_quit":          cfg.plc.node_ext_error_quit,
+                "ext_einlaufband_running": cfg.plc.node_ext_einlaufband_running,
+            }
+            if cfg.products and cfg.cloths:  # PLC-driven product/cloth switching
+                node_ids["ext_product_name"] = cfg.plc.node_ext_product_name
+                node_ids["ext_cloth_color"] = cfg.plc.node_ext_cloth_color
             plc = PlcClient(
                 cfg.plc.url,
-                {
-                    "ext_tuchabzug_stop":      cfg.plc.node_ext_tuchabzug_stop,
-                    "ext_tuchabzug_status":    cfg.plc.node_ext_tuchabzug_status,
-                    "ext_error":               cfg.plc.node_ext_error,
-                    "ext_viscontrol_alive":    cfg.plc.node_ext_viscontrol_alive,
-                    "ext_error_quit":          cfg.plc.node_ext_error_quit,
-                    "ext_einlaufband_running": cfg.plc.node_ext_einlaufband_running,
-                },
+                node_ids,
                 poll_interval_s=cfg.plc.poll_interval_s,
                 stop_pulse_ms=cfg.plc.stop_pulse_ms,
                 reconnect_delay_s=cfg.plc.reconnect_delay_s,

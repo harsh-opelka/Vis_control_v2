@@ -149,6 +149,9 @@ class InferenceView(QWidget):
         self._profile_combo.currentTextChanged.connect(self._on_profile_changed)
         pf_layout.addWidget(pf_label)
         pf_layout.addWidget(self._profile_combo)
+        self._format_label = QLabel("")
+        self._format_label.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: {FONT_SMALL}pt;")
+        pf_layout.addWidget(self._format_label)
         bar.addWidget(profile_frame, 0)
 
         # Stat cards.
@@ -393,6 +396,10 @@ class InferenceView(QWidget):
             self.profile_changed.emit(name)
 
     # ---------- public setters used by the main window ----------
+
+    def set_active_format(self, text: str) -> None:
+        """Show the active product / cloth combination (PLC-driven)."""
+        self._format_label.setText(text)
 
     def set_profiles(self, names: list[str], active: str) -> None:
         self._profile_combo.blockSignals(True)

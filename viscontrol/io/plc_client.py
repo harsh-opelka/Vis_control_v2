@@ -13,6 +13,8 @@ Node map (all under the PLC server, grouped by section):
   ext_viscontrol_alive     Bool   WE WRITE  — ::Signal:fromext_viscontrol_alive, livebit
   ext_error_quit           Bool   WE READ   — ::Signal:toext_Error_quit, operator ack
   ext_einlaufband_running  Bool   WE READ   — ::Einlauf:toext_Einlaufband_running
+  ext_product_name         String WE READ   — gFormatSet.Name (optional node)
+  ext_cloth_color          Byte   WE READ   — gFormatSet.Beschickung.ClothColor (optional node)
 
 Thread model
 ------------
@@ -150,8 +152,16 @@ class PlcClient(PlcInterface):
         self.on_tuchabzug_change: Optional[Callable[[bool], None]] = None
         # Fired on the rising edge of ext_error_quit (operator acknowledge).
         self.on_error_quit_change: Optional[Callable[[bool], None]] = None
+        # Fired from the worker thread when (product_name, cloth_color) changes
+        # and after every (re)connect. A read error is reported as (None, None).
+        # MUST NOT touch Qt objects directly — MainWindow re-emits via a Signal.
+        self.on_format_change: Optional[Callable[[object, object], None]] = None
 
     # ── public properties ────────────────────────────────────────────────────
+
+    @property
+    def stop_latch_active(self) -> bool:
+        return self._stop_latch_active
 
     @property
     def is_running(self) -> bool:
@@ -353,6 +363,7 @@ class PlcClient(PlcInterface):
     def _thread_main(self) -> None:
         last_tuch: bool | None = None
         last_quit: bool | None = None
+        last_format: tuple | None = None
         _livebit: bool = False
         _last_livebit_time: float = 0.0  # forces immediate write after (re)connect
 
@@ -364,6 +375,7 @@ class PlcClient(PlcInterface):
                 # Re-read initial values after (re)connect to avoid spurious edges
                 last_tuch = None
                 last_quit = None
+                last_format = None
                 _last_livebit_time = 0.0
 
             # Phase 2: drain the command queue
@@ -440,6 +452,27 @@ class PlcClient(PlcInterface):
                                 self.on_error_quit_change(True)
                             except Exception:
                                 logger.exception("on_error_quit_change callback error")
+
+                # Product / cloth selection (optional nodes). Read in their own
+                # try so a bad format node never drops the connection; a failure
+                # is reported once as (None, None) and the consumer keeps its
+                # last settings.
+                if "ext_product_name" in self._nodes and "ext_cloth_color" in self._nodes:
+                    try:
+                        fmt = (
+                            self._nodes["ext_product_name"].get_value(),
+                            self._nodes["ext_cloth_color"].get_value(),
+                        )
+                    except Exception:
+                        fmt = (None, None)
+                    if fmt != last_format:
+                        last_format = fmt
+                        logger.info("PlcClient: format product={!r} cloth_color={!r}", *fmt)
+                        if self.on_format_change is not None:
+                            try:
+                                self.on_format_change(*fmt)
+                            except Exception:
+                                logger.exception("on_format_change callback error")
 
                 # Livebit: toggle every 1 second on the worker thread
                 now = time.monotonic()
