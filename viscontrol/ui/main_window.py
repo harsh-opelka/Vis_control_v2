@@ -443,7 +443,9 @@ class MainWindow(QMainWindow):
             is_idle_fn=self._is_format_switch_idle,
             now_fn=time.monotonic,
         )
-        self.plc_format_changed.connect(self._format_switcher.submit)
+        self.plc_format_changed.connect(
+            self._on_plc_format_changed, Qt.ConnectionType.QueuedConnection
+        )
         self._format_timer = QTimer(self)
         self._format_timer.setInterval(250)
         self._format_timer.timeout.connect(self._format_switcher.tick)
@@ -2827,6 +2829,11 @@ class MainWindow(QMainWindow):
             ))
         except Exception:  # noqa: BLE001
             logger.exception("[ORCH-ERROR] submit PLC_STOP_ACK failed")
+
+    @Slot(object, object)
+    def _on_plc_format_changed(self, product_raw: object, cloth_raw: object) -> None:
+        """GUI-thread slot for the PLC worker's (product, cloth) values (queued signal)."""
+        self._format_switcher.submit(product_raw, cloth_raw)
 
     def _on_plc_error_quit(self, value: bool) -> None:
         """Called from the PLC polling thread on the rising edge of ext_error_quit.
