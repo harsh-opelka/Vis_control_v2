@@ -206,3 +206,82 @@ def test_repo_local_yaml_has_both_products_and_cloths() -> None:
     assert cfg.cloths["black"].cloth_brightness_threshold == 48
     assert cfg.cloths["white"].cloth_brightness_threshold == 112
     assert cfg.plc.node_ext_product_name == "ns=6;s=::AsGlobalPV:gFormatSet.Name"
+
+
+# ---- per-product layout limit ------------------------------------------------
+
+def _layout_cfg() -> AppConfig:
+    return AppConfig.model_validate({
+        "profiles": [{"name": "Default"}],
+        "products": {
+            "Berliner": {"layout_min_separation_ratio": 1.7},
+            "Apfelschnecken": {"layout_min_separation_ratio": 1.2},
+            "Plain": {},  # no override -> global default
+        },
+        "cloths": _CLOTHS,
+        "layout_quality": {"min_separation_ratio": 1.8},
+    })
+
+
+def test_layout_limit_field_is_optional() -> None:
+    cfg = _layout_cfg()
+    assert cfg.products["Plain"].layout_min_separation_ratio is None
+    assert cfg.products["Berliner"].layout_min_separation_ratio == 1.7
+
+
+def test_layout_limit_product_with_override() -> None:
+    from viscontrol.core.format_switch import apply_layout_limit
+
+    cfg = _layout_cfg()
+    assert apply_layout_limit(cfg, "Apfelschnecken", 1.8) == 1.2
+    assert cfg.layout_quality.min_separation_ratio == 1.2
+
+
+def test_layout_limit_without_override_falls_back_to_global() -> None:
+    from viscontrol.core.format_switch import apply_layout_limit
+
+    cfg = _layout_cfg()
+    default = cfg.layout_quality.min_separation_ratio
+    apply_layout_limit(cfg, "Apfelschnecken", default)
+    assert apply_layout_limit(cfg, "Plain", default) == 1.8
+    assert cfg.layout_quality.min_separation_ratio == 1.8
+
+
+def test_layout_limit_switch_sequence_restores_values_and_monitor_sees_them() -> None:
+    from viscontrol.core.format_switch import apply_layout_limit
+    from viscontrol.core.layout_quality import LayoutQualityMonitor
+
+    cfg = _layout_cfg()
+    default = cfg.layout_quality.min_separation_ratio
+    monitor = LayoutQualityMonitor(cfg.layout_quality)
+    seen = []
+    for product, expected in [
+        ("Apfelschnecken", 1.2), ("Berliner", 1.7), ("Apfelschnecken", 1.2),
+        ("Plain", 1.8), ("Berliner", 1.7),
+    ]:
+        apply_layout_limit(cfg, product, default)
+        seen.append(monitor._cfg.min_separation_ratio)
+        assert monitor._cfg.min_separation_ratio == expected
+    assert default == 1.8  # the stored global default is never modified
+
+
+def test_monitor_rebind_after_cfg_replaced() -> None:
+    """Wizard Cancel swaps the AppConfig; rebind_cfg re-points the monitor."""
+    import copy
+
+    from viscontrol.core.format_switch import apply_layout_limit
+    from viscontrol.core.layout_quality import LayoutQualityMonitor
+
+    cfg = _layout_cfg()
+    monitor = LayoutQualityMonitor(cfg.layout_quality)
+    cfg = copy.deepcopy(cfg)                      # what Cancel does
+    apply_layout_limit(cfg, "Apfelschnecken", 1.8)
+    assert monitor._cfg.min_separation_ratio == 1.8   # stale without rebind
+    monitor.rebind_cfg(cfg.layout_quality)
+    assert monitor._cfg.min_separation_ratio == 1.2
+
+
+def test_repo_local_yaml_layout_limits() -> None:
+    cfg = load_config(CONFIG_DIR)
+    assert cfg.products["Berliner"].layout_min_separation_ratio == 1.7
+    assert cfg.products["Apfelschnecken"].layout_min_separation_ratio == 1.2

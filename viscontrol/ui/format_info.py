@@ -21,7 +21,8 @@ class FormatInfo:
     width_px: int
     height_px: int
     cloth_brightness_threshold: int
-    ref_name: str                # file name only ("" = none configured)
+    layout_limit: float          # layout_quality.min_separation_ratio as applied
+    ref_name: str               # file name only ("" = none configured)
     ref_exists: bool
     plc_seen: bool               # a PLC value has been received
     pending: bool                # a different valid target is waiting to be applied
@@ -62,6 +63,7 @@ def format_info_lines(info: FormatInfo) -> list[tuple[str, bool]]:
         (f"Fused thr.: {info.fused_threshold:g}", False),
         (f"Size: {info.width_px} x {info.height_px}", False),
         (f"Cloth thr.: {info.cloth_brightness_threshold}", False),
+        (f"Layout limit: {info.layout_limit:g}", False),
         ref_line,
         (f"Source: {source}", info.pending),
     ]

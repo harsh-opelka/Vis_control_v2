@@ -45,6 +45,18 @@ def match_cloth(raw: Any, known: list[str]) -> Optional[str]:
     return cloth if cloth in known else None
 
 
+def apply_layout_limit(cfg: AppConfig, product: str, default_ratio: float) -> float:
+    """Set ``layout_quality.min_separation_ratio`` for ``product``.
+
+    Uses the product's ``layout_min_separation_ratio`` if set, else the global
+    ``default_ratio`` loaded at startup. Returns the value applied.
+    """
+    override = cfg.products[product].layout_min_separation_ratio
+    ratio = override if override is not None else default_ratio
+    cfg.layout_quality.min_separation_ratio = ratio
+    return ratio
+
+
 class FormatSwitcher:
     def __init__(
         self,

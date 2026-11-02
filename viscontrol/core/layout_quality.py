@@ -108,6 +108,11 @@ class LayoutQualityMonitor:
         self._max_ratio_seen: float = float("-inf")
         self._frames_evaluated: int = 0
 
+    def rebind_cfg(self, cfg: LayoutQualityConfig) -> None:
+        """Point the monitor at a new config object (e.g. after the wizard's
+        Cancel replaced the app config). Thresholds are read live from it."""
+        self._cfg = cfg
+
     # ---------- properties ----------
 
     @property

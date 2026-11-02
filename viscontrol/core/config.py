@@ -705,6 +705,9 @@ class ProductSettings(BaseModel):
     fused_threshold: float = Field(1.4, gt=0.0)
     hough_min_radius_px: int = Field(0, ge=0)
     hough_max_radius_px: int = Field(0, ge=0)
+    # Optional per-product override of layout_quality.min_separation_ratio;
+    # None = use the global value.
+    layout_min_separation_ratio: float | None = Field(None, gt=0.0)
 
 
 class ClothSettings(BaseModel):

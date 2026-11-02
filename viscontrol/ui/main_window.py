@@ -39,7 +39,7 @@ from PySide6.QtWidgets import (
 from viscontrol.core.config import AppConfig, save_config
 from viscontrol.core.event_log import Event, EventLog, EventType
 from viscontrol.core.events import Mode, PipelineResult, RowPhase, State, Verdict
-from viscontrol.core.format_switch import FormatSwitcher
+from viscontrol.core.format_switch import FormatSwitcher, apply_layout_limit
 from viscontrol.ui.format_info import FormatInfo, format_info_lines
 from viscontrol.core.layout_quality import LayoutQualityMonitor, LayoutQualityResult
 from viscontrol.core.logger import logger
@@ -436,6 +436,9 @@ class MainWindow(QMainWindow):
         )
         self._inference_view.set_mode(Mode(self._cfg.app.mode))
 
+        # Global layout limit as loaded from the config file; restored when the
+        # active product has no layout_min_separation_ratio override.
+        self._layout_default_ratio: float = self._cfg.layout_quality.min_separation_ratio
         # PLC-driven product/cloth switching (off when products/cloths absent).
         self._format_switcher = FormatSwitcher(
             cfg_fn=lambda: self._cfg,
@@ -769,6 +772,7 @@ class MainWindow(QMainWindow):
             width_px=profile.expected_width_px,
             height_px=profile.expected_height_px,
             cloth_brightness_threshold=hough.cloth_brightness_threshold,
+            layout_limit=self._cfg.layout_quality.min_separation_ratio,
             ref_name=Path(ref_str).name if ref_str else "",
             ref_exists=bool(ref_str) and self._resolve_cloth_ref_path(ref_str).exists(),
             plc_seen=sw.plc_seen,
@@ -817,6 +821,11 @@ class MainWindow(QMainWindow):
         hough.max_radius_px = prod.hough_max_radius_px
         hough.cloth_brightness_threshold = cl.cloth_brightness_threshold
         hough.cloth_reference_path = cl.cloth_reference_path
+        apply_layout_limit(self._cfg, product, self._layout_default_ratio)
+        if self._layout_monitor is not None:
+            # The monitor reads thresholds live, but Cancel in the wizard replaces
+            # self._cfg, so re-point it at the current config object.
+            self._layout_monitor.rebind_cfg(self._cfg.layout_quality)
         self._load_cloth_reference(cl.cloth_reference_path, cloth)
         self._refresh_profile_cache()
         self._inference_view.set_active_format(f"{product} / {cloth}")

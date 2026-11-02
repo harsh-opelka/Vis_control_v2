@@ -9,7 +9,7 @@ from viscontrol.ui.format_info import WARN_COLOR, FormatInfo, format_info_html, 
 _OK = FormatInfo(
     product="Apfelschnecken", product_ok=True, cloth="black", cloth_ok=True,
     dough_is_darker=False, fused_threshold=1.8, width_px=318, height_px=318,
-    cloth_brightness_threshold=48, ref_name="cloth_reference_black.png",
+    cloth_brightness_threshold=48, layout_limit=1.2, ref_name="cloth_reference_black.png",
     ref_exists=True, plc_seen=True, pending=False,
 )
 
@@ -26,6 +26,7 @@ def test_known_values() -> None:
         "Fused thr.: 1.8",
         "Size: 318 x 318",
         "Cloth thr.: 48",
+        "Layout limit: 1.2",
         "Ref: cloth_reference_black.png",
         "Source: PLC",
     ]
